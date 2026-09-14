@@ -1,0 +1,37 @@
+{
+  "models": [
+    {
+      "name": "whisper-base.en",
+      "purpose": "transcription",
+      "upstream": "ggerganov/whisper.cpp",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin",
+      "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+      "license": "MIT",
+      "filename": "ggml-base.en.bin",
+      "size": 147964211,
+      "sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+    },
+    {
+      "name": "pyannote-segmentation-3.0-onnx",
+      "purpose": "diarization-segmentation",
+      "upstream": "pyannote/segmentation-3.0 converted by k2-fsa/sherpa-onnx",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2",
+      "revision": "sherpa-onnx speaker-segmentation-models release; ONNX metadata version 1",
+      "license": "MIT",
+      "filename": "model.onnx",
+      "size": 5992913,
+      "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079"
+    },
+    {
+      "name": "nemo-en-titanet-small",
+      "purpose": "speaker-embedding",
+      "upstream": "NVIDIA NeMo TitaNet-S converted by k2-fsa/sherpa-onnx",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx",
+      "revision": "NVIDIA NGC TitaNet-S 1.19.0; sherpa-onnx ONNX export",
+      "license": "CC-BY-4.0 (NVIDIA states NeMo NGC pretrained checkpoints use CC-BY-4.0 unless otherwise specified)",
+      "filename": "nemo_en_titanet_small.onnx",
+      "size": 40257283,
+      "sha256": "ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e"
+    }
+  ]
+}

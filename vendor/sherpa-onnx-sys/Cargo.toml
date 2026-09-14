@@ -1,0 +1,25 @@
+# Local copy of sherpa-onnx-sys 1.13.8 (Apache-2.0) from crates.io with its
+# build script replaced. The upstream build script downloads prebuilt native
+# libraries from GitHub at build time without checksum verification and pulls
+# ureq/rustls/zip/tar/bzip2 (~140 crates) into the build closure to do so.
+# This copy only links libraries from SHERPA_ONNX_LIB_DIR, which must be
+# populated with verified artifacts (see scripts/fetch-sherpa-onnx.sh).
+# src/ is byte-for-byte upstream; see vendor/sherpa-onnx-sys/UPSTREAM.md.
+[package]
+name = "sherpa-onnx-sys"
+version = "1.13.8"
+edition = "2021"
+license = "Apache-2.0"
+description = "FFI bindings for sherpa-onnx (local build-script-free copy)"
+repository = "https://github.com/k2-fsa/sherpa-onnx"
+links = "sherpa-onnx"
+build = "build.rs"
+
+[features]
+default = ["static"]
+static = []
+shared = []
+
+[lib]
+name = "sherpa_onnx_sys"
+path = "src/lib.rs"

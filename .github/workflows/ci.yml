@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    name: fmt, clippy, tests, supply-chain policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev libpipewire-0.3-dev libspa-0.2-dev \
+            pipewire pipewire-bin wireplumber pipewire-audio-client-libraries
+
+      - name: Cache cargo registry and tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            ~/.cargo/advisory-db
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache sherpa-onnx native libraries
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: sherpa-onnx-${{ hashFiles('scripts/fetch-sherpa-onnx.sh') }}
+
+      - name: Fetch and verify sherpa-onnx libraries
+        run: scripts/fetch-sherpa-onnx.sh
+
+      - name: Install cargo policy tools
+        run: |
+          for t in cargo-audit cargo-deny cargo-vet; do
+            command -v "$t" >/dev/null || cargo install --locked "$t"
+          done
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+      - name: PipeWire integration tests (headless daemon)
+        run: |
+          source scripts/pw-headless.sh
+          SINGSTONE_PW_TEST=1 cargo test --locked --test record_pipewire -- --test-threads=1
+
+      - run: cargo audit
+      - run: cargo deny check
+      - run: cargo vet --locked
+
+  offline-build:
+    name: offline build with vendored dependencies
+    runs-on: ubuntu-24.04
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev libpipewire-0.3-dev libspa-0.2-dev
+
+      - name: Cache sherpa-onnx native libraries
+        uses: actions/cache@v4
+        with:
+          path: third_party
+          key: sherpa-onnx-${{ hashFiles('scripts/fetch-sherpa-onnx.sh') }}
+
+      - name: Fetch and verify sherpa-onnx libraries
+        run: scripts/fetch-sherpa-onnx.sh
+
+      - name: Vendor crates
+        run: |
+          mkdir -p .cargo
+          cargo vendor --locked vendor/crates > vendor-config.toml
+          cat vendor-config.toml >> .cargo/config.toml
+
+      - name: Build with networking disabled
+        run: |
+          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
+            unshare --net bash -c 'cargo build --locked --offline'

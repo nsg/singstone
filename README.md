@@ -166,34 +166,7 @@ The split commands expose the same work performed by `process`. They are useful
 when one result looks wrong, because each intermediate artifact can be inspected
 and regenerated without rerunning unrelated models.
 
-```mermaid
-flowchart LR
-    M[manifest.json]
-    A[mic.f32le and system.f32le]
-    E[enrolled speakers DB]
-    X["transcribe / Whisper"]
-    Y["diarize / pyannote + speaker embeddings"]
-    R["recognize / speaker embeddings + cosine similarity"]
-    Z["render / no model"]
-    W[words.jsonl]
-    D[diarization.jsonl]
-    S[speaker-assignments.json]
-    T[transcript.jsonl and transcript.txt]
-
-    A --> X --> W
-    A --> Y --> D
-    A --> R
-    D --> R
-    E --> R --> S
-    M --> X
-    M --> Y
-    M --> R
-    M --> Z
-    W --> Z
-    D --> Z
-    S -.->|optional names| Z
-    Z --> T
-```
+![Top-to-bottom diagram of the Singstone processing pipeline](docs/processing-pipeline.svg)
 
 `transcribe` and `diarize` are independent: neither consumes the other's
 output. `recognize` needs diarization, while `render` needs transcription and

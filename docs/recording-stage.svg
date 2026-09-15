@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="1130" viewBox="0 0 720 1130" role="img" aria-labelledby="title description">
+  <title id="title">Singstone recording stage</title>
+  <desc id="description">A vertical flow showing session setup, parallel microphone and system audio capture, writer threads, screenshot watching, timeline alignment, and clean finalization.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <rect width="720" height="1130" rx="20" fill="#f8fafc"/>
+  <text x="360" y="45" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="26" font-weight="700" fill="#0f172a">Recording stage</text>
+  <text x="360" y="70" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Capture stays lightweight; file I/O and timing repair happen off the audio callback</text>
+
+  <!-- Setup -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="100" width="580" height="132" rx="16" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  </g>
+  <circle cx="105" cy="136" r="20" fill="#475569"/>
+  <text x="105" y="142" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">1</text>
+  <text x="140" y="133" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="700" fill="#0f172a">Create the session</text>
+  <text x="140" y="157" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Resolve sources, create private files, and establish one monotonic start time</text>
+  <rect x="95" y="180" width="530" height="35" rx="8" fill="#e2e8f0"/>
+  <text x="360" y="202" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="600" fill="#334155">manifest.json · state: recording · common t0</text>
+
+  <path d="M 360 232 L 360 267" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Capture callbacks -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="277" width="580" height="190" rx="16" fill="#ffffff" stroke="#ef4444" stroke-width="2"/>
+  </g>
+  <circle cx="105" cy="313" r="20" fill="#dc2626"/>
+  <text x="105" y="319" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">2</text>
+  <text x="140" y="310" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="700" fill="#0f172a">Capture both PipeWire streams</text>
+  <text x="140" y="334" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Callbacks copy samples and timing into separate bounded queues</text>
+
+  <rect x="95" y="357" width="250" height="91" rx="11" fill="#fee2e2"/>
+  <text x="220" y="382" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700" fill="#991b1b">MICROPHONE SOURCE</text>
+  <text x="220" y="407" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#7f1d1d">callback → lock-free queue</text>
+  <text x="220" y="429" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" fill="#7f1d1d">2048-sample blocks</text>
+
+  <rect x="375" y="357" width="250" height="91" rx="11" fill="#fee2e2"/>
+  <text x="500" y="382" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" font-weight="700" fill="#991b1b">SYSTEM SINK MONITOR</text>
+  <text x="500" y="407" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#7f1d1d">callback → lock-free queue</text>
+  <text x="500" y="429" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" fill="#7f1d1d">2048-sample blocks</text>
+
+  <path d="M 220 467 L 220 502" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M 500 467 L 500 502" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Writers -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="512" width="580" height="173" rx="16" fill="#ffffff" stroke="#0284c7" stroke-width="2"/>
+  </g>
+  <circle cx="105" cy="548" r="20" fill="#0284c7"/>
+  <text x="105" y="554" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">3</text>
+  <text x="140" y="545" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="700" fill="#0f172a">Align and persist off-thread</text>
+  <text x="140" y="569" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">One writer thread per source places blocks by PipeWire time (now − delay)</text>
+  <text x="95" y="606" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#334155">Late starts, confirmed gaps, xruns, and dropped blocks become silence</text>
+  <text x="95" y="629" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#334155">Overlaps are trimmed; every adjustment is recorded as a timeline event</text>
+  <rect x="95" y="644" width="530" height="25" rx="7" fill="#e0f2fe"/>
+  <text x="360" y="661" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="600" fill="#075985">mic/system.f32le + mic/system.timeline.jsonl</text>
+
+  <path d="M 360 685 L 360 720" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Screenshots -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="730" width="580" height="137" rx="16" fill="#ffffff" stroke="#a78bfa" stroke-width="2" stroke-dasharray="7 5"/>
+  </g>
+  <circle cx="105" cy="766" r="20" fill="#7c3aed"/>
+  <text x="105" y="772" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">+</text>
+  <text x="140" y="763" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="700" fill="#0f172a">Watch screenshots in parallel</text>
+  <text x="140" y="787" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Optional inotify watcher timestamps and copies completed files</text>
+  <rect x="95" y="814" width="530" height="35" rx="8" fill="#ede9fe"/>
+  <text x="360" y="836" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="600" fill="#5b21b6">screenshots/ + screenshots.jsonl</text>
+
+  <path d="M 360 867 L 360 902" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Finalize -->
+  <g filter="url(#shadow)">
+    <rect x="70" y="912" width="580" height="140" rx="16" fill="#ffffff" stroke="#10b981" stroke-width="2"/>
+  </g>
+  <circle cx="105" cy="948" r="20" fill="#059669"/>
+  <text x="105" y="954" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">4</text>
+  <text x="140" y="945" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="700" fill="#0f172a">Stop and finalize</text>
+  <text x="140" y="969" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Ctrl-C, SIGTERM, or duration limit stops capture and joins every writer</text>
+  <text x="95" y="1005" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#334155">Flush and sync audio · append stop events · preserve per-stream errors</text>
+  <rect x="95" y="1018" width="530" height="20" rx="7" fill="#d1fae5"/>
+  <text x="360" y="1033" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" font-weight="600" fill="#065f46">manifest.json · state: stopped</text>
+
+  <path d="M 360 1052 L 360 1080" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="170" y="1088" width="380" height="30" rx="15" fill="#0f172a"/>
+  <text x="360" y="1108" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" font-weight="700" fill="#ffffff">CRASH-RESILIENT, MEETING-ALIGNED SESSION</text>
+</svg>

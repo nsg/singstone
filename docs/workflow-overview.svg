@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="820" viewBox="0 0 720 820" role="img" aria-labelledby="title description">
+  <title id="title">Singstone workflow overview</title>
+  <desc id="description">A vertical overview from choosing PipeWire devices, through recording and offline processing, to transcript and screenshot outputs.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.12"/>
+    </filter>
+  </defs>
+
+  <rect width="720" height="820" rx="20" fill="#f8fafc"/>
+  <text x="360" y="45" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="26" font-weight="700" fill="#0f172a">Singstone workflow</text>
+  <rect x="267" y="60" width="186" height="27" rx="13" fill="#dcfce7"/>
+  <text x="360" y="78" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" font-weight="700" fill="#166534">LOCAL-ONLY · NO NETWORK</text>
+
+  <!-- Discover -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="115" width="560" height="115" rx="16" fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  </g>
+  <circle cx="115" cy="151" r="20" fill="#475569"/>
+  <text x="115" y="157" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">1</text>
+  <text x="150" y="148" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" font-weight="700" fill="#0f172a">devices</text>
+  <text x="150" y="172" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Choose a microphone and the monitor of a system-audio sink</text>
+  <rect x="105" y="190" width="510" height="25" rx="7" fill="#e2e8f0"/>
+  <text x="360" y="207" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#334155">PipeWire node IDs or names</text>
+
+  <path d="M 360 230 L 360 265" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Record -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="275" width="560" height="130" rx="16" fill="#ffffff" stroke="#ef4444" stroke-width="2"/>
+  </g>
+  <circle cx="115" cy="311" r="20" fill="#dc2626"/>
+  <text x="115" y="317" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">2</text>
+  <text x="150" y="308" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" font-weight="700" fill="#0f172a">record</text>
+  <text x="150" y="332" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Capture live audio and optionally file new screenshots</text>
+  <rect x="105" y="352" width="510" height="36" rx="8" fill="#fee2e2"/>
+  <text x="360" y="375" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="600" fill="#991b1b">session/ · raw audio · timelines · screenshots</text>
+
+  <path d="M 360 405 L 360 440" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="235" y="416" width="250" height="25" rx="12" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="360" y="433" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#475569">Stop recording before processing</text>
+
+  <!-- Process -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="450" width="560" height="165" rx="16" fill="#ffffff" stroke="#0284c7" stroke-width="2"/>
+  </g>
+  <circle cx="115" cy="486" r="20" fill="#0284c7"/>
+  <text x="115" y="492" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">3</text>
+  <text x="150" y="483" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" font-weight="700" fill="#0f172a">process offline</text>
+  <text x="150" y="507" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Run once as process, or inspect and repeat individual stages</text>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="600">
+    <rect x="105" y="530" width="242" height="28" rx="7" fill="#e0f2fe"/>
+    <text x="226" y="549" text-anchor="middle" fill="#075985">transcribe · Whisper</text>
+    <rect x="373" y="530" width="242" height="28" rx="7" fill="#ede9fe"/>
+    <text x="494" y="549" text-anchor="middle" fill="#5b21b6">diarize · speakers</text>
+    <rect x="105" y="569" width="242" height="28" rx="7" fill="#fef3c7"/>
+    <text x="226" y="588" text-anchor="middle" fill="#92400e">recognize · optional</text>
+    <rect x="373" y="569" width="242" height="28" rx="7" fill="#d1fae5"/>
+    <text x="494" y="588" text-anchor="middle" fill="#065f46">render · no model</text>
+  </g>
+
+  <path d="M 360 615 L 360 650" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Results -->
+  <g filter="url(#shadow)">
+    <rect x="80" y="660" width="560" height="125" rx="16" fill="#0f172a"/>
+  </g>
+  <circle cx="115" cy="696" r="20" fill="#10b981"/>
+  <text x="115" y="702" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">4</text>
+  <text x="150" y="693" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="19" font-weight="700" fill="#ffffff">Use the meeting record</text>
+  <text x="150" y="717" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#cbd5e1">Read it directly or pass it to your own downstream tools</text>
+  <text x="360" y="758" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#6ee7b7">transcript.jsonl · transcript.txt · screenshots.jsonl</text>
+</svg>

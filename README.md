@@ -5,6 +5,8 @@
 [![AI usage: mostly](https://nsg.github.io/aibadge/mostly.svg)](https://nsg.github.io/aibadge/#mostly)
 </div>
 
+![Top-to-bottom overview of the Singstone workflow](docs/workflow-overview.svg)
+
 ## About
 
 singstone records a meeting from two PipeWire sources at once, the microphone
@@ -159,6 +161,16 @@ convenience command that runs the complete pipeline.
 use `--diarize-mic` or `--diarize-mic=false` only to make the policy explicit.
 Standalone stages fail without replacing a prior good artifact when a required
 model, audio track or upstream artifact is unavailable.
+
+### Recording stage
+
+`record` performs no transcription or other model inference. Its real-time
+PipeWire callbacks only copy audio blocks and timing information into bounded,
+lock-free queues. Separate writer threads align and persist each source, keeping
+filesystem work away from the callbacks. The optional screenshot watcher runs
+alongside audio capture and uses the same meeting clock.
+
+![Top-to-bottom diagram of the Singstone recording stage](docs/recording-stage.svg)
 
 ### Processing pipeline
 

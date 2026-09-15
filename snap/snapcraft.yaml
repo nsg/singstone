@@ -127,10 +127,10 @@ parts:
     source-checksum: sha256/24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488
     organize:
       sherpa-onnx-pyannote-segmentation-3-0/model.onnx: usr/share/singstone/models/segmentation.onnx
-      sherpa-onnx-pyannote-segmentation-3-0/LICENSE: usr/share/doc/singstone/pyannote-segmentation-LICENSE
+      sherpa-onnx-pyannote-segmentation-3-0/LICENSE: usr/share/singstone/licenses/pyannote-segmentation.LICENSE
     prime:
       - usr/share/singstone/models/segmentation.onnx
-      - usr/share/doc/singstone/pyannote-segmentation-LICENSE
+      - usr/share/singstone/licenses/pyannote-segmentation.LICENSE
 
   embedding-model:
     plugin: dump

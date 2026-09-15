@@ -9,7 +9,7 @@ without network access:
   [pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0)
   model converted to ONNX by
   [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), MIT. Its license text
-  is installed as `pyannote-segmentation-LICENSE`.
+  is installed as `licenses/pyannote-segmentation.LICENSE`.
 - `nemo_en_titanet_small.onnx`, derived from NVIDIA NeMo TitaNet-S and
   distributed by
   [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx), CC BY 4.0.

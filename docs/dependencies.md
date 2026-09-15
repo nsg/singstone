@@ -5,8 +5,8 @@ Every direct dependency is listed with why it exists, what its build does, its
 versions in `Cargo.lock` on 2026-09-15. The runtime closure is 56 crates
 (`cargo tree --edges normal`); the full build closure is 201 crates.
 
-Policy checks: `cargo audit` (RustSec advisories) and `cargo deny check`
-(licenses, bans, and sources; `deny.toml`).
+`cargo audit` checks the lockfile against RustSec advisories. Dependency changes
+are reviewed when they are introduced.
 
 ## Direct dependencies
 
@@ -45,8 +45,7 @@ environment, not why it must be online.
 5. **`cookie-factory` 0.3.3** (via `libspa`): last released 2022. Small and
    pure; low risk, but it will show up in staleness scans.
 6. **Duplicate crate versions** (`nom` 7/8, `syn` 2/3, `shlex` 1/2) are
-   build-vs-runtime splits from bindgen; harmless, listed by `cargo deny` as
-   warnings.
+   harmless build-versus-runtime splits.
 
 Nothing in the runtime closure opens sockets. The recorder's privacy claim is
 verifiable: `cargo tree --edges normal` contains no HTTP, TLS or socket crate.

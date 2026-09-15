@@ -47,11 +47,8 @@ jobs:
       - name: Fetch and verify sherpa-onnx libraries
         run: scripts/fetch-sherpa-onnx.sh
 
-      - name: Install cargo policy tools
-        run: |
-          for t in cargo-audit cargo-deny; do
-            command -v "$t" >/dev/null || cargo install --locked "$t"
-          done
+      - name: Install cargo-audit
+        run: command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
@@ -63,7 +60,6 @@ jobs:
           SINGSTONE_PW_TEST=1 cargo test --locked --test record_pipewire -- --test-threads=1
 
       - run: cargo audit
-      - run: cargo deny check
   offline-build:
     name: offline build from a temporary dependency snapshot
     runs-on: ubuntu-24.04

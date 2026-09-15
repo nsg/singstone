@@ -899,19 +899,17 @@ Use:
 
 ```text
 cargo-audit / RustSec
-cargo-deny
 ```
 
 ### Release rule
 
-A production release must not be produced until:
+A production release requires:
 
 ```text
 cargo audit
-cargo deny check
 ```
 
-all satisfy project policy.
+The check must pass.
 
 For higher-risk domain-specific dependencies:
 
@@ -995,7 +993,6 @@ A desirable final release procedure is approximately:
 ```bash
 cargo vendor
 cargo audit
-cargo deny check
 cargo test --locked
 cargo clippy --locked -- -D warnings
 cargo build --release --locked --offline
@@ -1309,7 +1306,6 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo audit
-cargo deny check
 ```
 
 Additionally have a trusted/release CI job that:

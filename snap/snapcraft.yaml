@@ -23,7 +23,9 @@ apps:
   singstone:
     command: bin/singstone
     environment:
-      LD_LIBRARY_PATH: $SNAP/lib:$LD_LIBRARY_PATH
+      LD_LIBRARY_PATH: $SNAP/lib:$SNAP/usr/lib/x86_64-linux-gnu
+      SPA_PLUGIN_DIR: $SNAP/usr/lib/x86_64-linux-gnu/spa-0.2
+      PIPEWIRE_CONFIG_DIR: $SNAP/usr/share/pipewire
       SINGSTONE_WHISPER_MODEL: $SNAP/usr/share/singstone/models/ggml-base.en.bin
       SINGSTONE_SEGMENTATION_MODEL: $SNAP/usr/share/singstone/models/segmentation.onnx
       SINGSTONE_EMBEDDING_MODEL: $SNAP/usr/share/singstone/models/nemo_en_titanet_small.onnx
@@ -58,10 +60,19 @@ parts:
         --compile_no_warning_as_error \
         --parallel "$CRAFT_PARALLEL_BUILD_COUNT" \
         --skip_tests \
+        --target onnxruntime \
         --cmake_extra_defines \
           CMAKE_INSTALL_PREFIX="$CRAFT_PART_INSTALL" \
           CMAKE_INSTALL_LIBDIR=lib
-      cmake --install build/Linux/Release
+      install -Dm755 build/Linux/Release/libonnxruntime.so.1.28.2 \
+        "$CRAFT_PART_INSTALL/lib/libonnxruntime.so.1.28.2"
+      ln -s libonnxruntime.so.1.28.2 "$CRAFT_PART_INSTALL/lib/libonnxruntime.so.1"
+      ln -s libonnxruntime.so.1 "$CRAFT_PART_INSTALL/lib/libonnxruntime.so"
+      mkdir -p "$CRAFT_PART_INSTALL/include/onnxruntime"
+      cp include/onnxruntime/core/session/onnxruntime_*.h \
+        "$CRAFT_PART_INSTALL/include/onnxruntime/"
+      cp include/onnxruntime/core/session/onnxruntime_*.inc \
+        "$CRAFT_PART_INSTALL/include/onnxruntime/"
       install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/singstone/onnxruntime-LICENSE"
       install -Dm644 ThirdPartyNotices.txt \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/onnxruntime-ThirdPartyNotices.txt"
@@ -80,7 +91,7 @@ parts:
     build-environment:
       - SHERPA_ONNXRUNTIME_INCLUDE_DIR: $CRAFT_STAGE/include/onnxruntime
       - SHERPA_ONNXRUNTIME_LIB_DIR: $CRAFT_STAGE/lib
-      - LD_LIBRARY_PATH: $CRAFT_STAGE/lib:$LD_LIBRARY_PATH
+      - LD_LIBRARY_PATH: $CRAFT_STAGE/lib
     cmake-parameters:
       - -DBUILD_SHARED_LIBS=ON
       - -DSHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF
@@ -150,7 +161,7 @@ parts:
       - libspa-0.2-modules
     build-environment:
       - SHERPA_ONNX_LIB_DIR: $CRAFT_STAGE/lib
-      - LD_LIBRARY_PATH: $CRAFT_STAGE/lib:$LD_LIBRARY_PATH
+      - LD_LIBRARY_PATH: $CRAFT_STAGE/lib
     override-build: |
       cargo clippy --release --all-targets --locked -- -D warnings
       cargo test --release --locked

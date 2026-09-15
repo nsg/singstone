@@ -5,14 +5,14 @@
 [![AI usage: mostly](https://nsg.github.io/aibadge/mostly.svg)](https://nsg.github.io/aibadge/#mostly)
 </div>
 
-![Top-to-bottom overview of the Singstone workflow](docs/workflow-overview.svg)
-
 ## About
 
 singstone records microphone and system audio on one meeting clock, optionally
 files screenshots, then builds a timestamped, speaker-attributed transcript.
 Capture, Whisper transcription, sherpa-onnx diarization, and voice recognition
 all run locally. The binary contains no network code.
+
+![Top-to-bottom overview of the Singstone workflow](docs/workflow-overview.svg)
 
 ## Features
 

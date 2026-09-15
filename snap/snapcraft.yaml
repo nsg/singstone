@@ -135,15 +135,6 @@ parts:
       - whisper-model
     plugin: rust
     source: .
-    source-ignore:
-      - .git
-      - .snapcraft
-      - parts
-      - prime
-      - stage
-      - target
-      - third_party
-      - "*.snap"
     rust-channel: "1.98.1"
     rust-cargo-parameters:
       - --locked

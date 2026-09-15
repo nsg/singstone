@@ -197,7 +197,7 @@ Build on Ubuntu 24.04 x86-64 in Snapcraft's isolated LXD environment:
 
 ```bash
 sudo snap install snapcraft --classic
-snapcraft --use-lxd
+snapcraft pack --use-lxd
 ```
 
 The finished Snap uses `strict` confinement. `home` lets commands read and

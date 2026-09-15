@@ -39,7 +39,7 @@ jobs:
 
       - name: Build source-pinned snap
         run: |
-          sudo snapcraft --destructive-mode
+          sudo snapcraft pack --destructive-mode
           sudo chown "$USER:$USER" ./*.snap
 
       - name: Verify confinement declaration

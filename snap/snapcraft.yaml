@@ -126,7 +126,7 @@ parts:
     source: https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
     source-checksum: sha256/24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488
     organize:
-      sherpa-onnx-pyannote-segmentation-3-0/model.onnx: usr/share/singstone/models/segmentation.onnx
+      model.onnx: usr/share/singstone/models/segmentation.onnx
     prime:
       - usr/share/singstone/models/segmentation.onnx
 

@@ -86,8 +86,17 @@ impl Session {
     pub fn words_path(&self) -> PathBuf {
         self.dir.join("words.jsonl")
     }
+    pub fn words_metadata_path(&self) -> PathBuf {
+        self.dir.join("words.meta.json")
+    }
     pub fn diarization_path(&self) -> PathBuf {
         self.dir.join("diarization.jsonl")
+    }
+    pub fn diarization_metadata_path(&self) -> PathBuf {
+        self.dir.join("diarization.meta.json")
+    }
+    pub fn speaker_assignments_path(&self) -> PathBuf {
+        self.dir.join("speaker-assignments.json")
     }
     pub fn transcript_path(&self) -> PathBuf {
         self.dir.join("transcript.jsonl")

@@ -50,6 +50,39 @@ pub struct SpeakerSegment {
     pub cluster: u32,
 }
 
+/// One cluster's recognition diagnostics in `speaker-assignments.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerAssignment {
+    pub source: AudioSource,
+    pub cluster: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub best_candidate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+}
+
+/// Inputs and settings used to produce `speaker-assignments.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerAssignmentProvenance {
+    pub diarization_file: String,
+    pub diarization_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_model_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speakers_database_sha256: Option<String>,
+    pub speaker_threshold: f32,
+}
+
+/// Versioned speaker recognition artifact consumed by the render stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeakerAssignments {
+    pub format_version: u32,
+    pub provenance: SpeakerAssignmentProvenance,
+    pub assignments: Vec<SpeakerAssignment>,
+}
+
 /// One line of `transcript.jsonl`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Utterance {

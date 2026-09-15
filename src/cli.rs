@@ -20,6 +20,14 @@ pub enum Command {
     Record(RecordArgs),
     /// Transcribe, diarize and merge a recorded session offline.
     Process(ProcessArgs),
+    /// Transcribe a recorded session into words.jsonl.
+    Transcribe(TranscribeArgs),
+    /// Diarize a recorded session into diarization.jsonl.
+    Diarize(DiarizeArgs),
+    /// Match diarized clusters and write speaker-assignments.json.
+    Recognize(RecognizeArgs),
+    /// Render persistent processing artifacts into transcript files.
+    Render(RenderArgs),
     /// Enroll a known speaker from audio samples (raw f32le or WAV).
     Enroll(EnrollArgs),
     /// List enrolled speakers.
@@ -102,6 +110,95 @@ pub struct ProcessArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct TranscribeArgs {
+    /// Session directory.
+    pub session: PathBuf,
+    /// Path to a whisper.cpp GGML model.
+    #[arg(long, env = "SINGSTONE_WHISPER_MODEL")]
+    pub whisper_model: PathBuf,
+    /// Trusted model manifest with SHA-256 hashes.
+    #[arg(long, env = "SINGSTONE_MODELS_LOCK")]
+    pub models_lock: Option<PathBuf>,
+    /// Skip model hash verification (development only).
+    #[arg(long)]
+    pub allow_unverified_models: bool,
+    /// Whisper language code (`auto` to detect).
+    #[arg(long, default_value = "en")]
+    pub language: String,
+    /// Inference threads (defaults to available parallelism).
+    #[arg(long)]
+    pub threads: Option<usize>,
+}
+
+#[derive(Args, Debug)]
+pub struct DiarizeArgs {
+    /// Session directory.
+    pub session: PathBuf,
+    /// Path to the sherpa-onnx pyannote segmentation model (model.onnx).
+    #[arg(long, env = "SINGSTONE_SEGMENTATION_MODEL")]
+    pub segmentation_model: PathBuf,
+    /// Path to the sherpa-onnx speaker embedding model.
+    #[arg(long, env = "SINGSTONE_EMBEDDING_MODEL")]
+    pub embedding_model: PathBuf,
+    /// Trusted model manifest with SHA-256 hashes.
+    #[arg(long, env = "SINGSTONE_MODELS_LOCK")]
+    pub models_lock: Option<PathBuf>,
+    /// Skip model hash verification (development only).
+    #[arg(long)]
+    pub allow_unverified_models: bool,
+    /// Also diarize the microphone track (several people in the room).
+    #[arg(long)]
+    pub diarize_mic: bool,
+    /// Inference threads (defaults to available parallelism).
+    #[arg(long)]
+    pub threads: Option<usize>,
+    /// Sherpa agglomerative clustering distance threshold.
+    #[arg(long, default_value_t = 1.0)]
+    pub cluster_threshold: f32,
+    /// Fix the number of speakers instead of estimating it.
+    #[arg(long)]
+    pub num_speakers: Option<u32>,
+}
+
+#[derive(Args, Debug)]
+pub struct RecognizeArgs {
+    /// Session directory.
+    pub session: PathBuf,
+    /// Path to the sherpa-onnx speaker embedding model.
+    #[arg(long, env = "SINGSTONE_EMBEDDING_MODEL")]
+    pub embedding_model: PathBuf,
+    /// Trusted model manifest with SHA-256 hashes.
+    #[arg(long, env = "SINGSTONE_MODELS_LOCK")]
+    pub models_lock: Option<PathBuf>,
+    /// Skip model hash verification (development only).
+    #[arg(long)]
+    pub allow_unverified_models: bool,
+    /// Inference threads (defaults to available parallelism).
+    #[arg(long)]
+    pub threads: Option<usize>,
+    /// Enrolled-speaker database (default: $XDG_DATA_HOME/singstone/speakers.json).
+    #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
+    pub speakers_db: Option<PathBuf>,
+    /// Minimum cosine similarity to name a diarized cluster after an enrolled speaker.
+    #[arg(long, default_value_t = 0.6)]
+    pub speaker_threshold: f32,
+}
+
+#[derive(Args, Debug)]
+pub struct RenderArgs {
+    /// Session directory.
+    pub session: PathBuf,
+    /// Override whether microphone words are diarized (`--diarize-mic=false` to disable).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true
+    )]
+    pub diarize_mic: Option<bool>,
+}
+
+#[derive(Args, Debug)]
 pub struct EnrollArgs {
     /// Speaker name.
     pub name: String,
@@ -125,4 +222,63 @@ pub struct EnrollArgs {
 pub struct SpeakersArgs {
     #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
     pub speakers_db: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_each_processing_stage_command() {
+        let transcribe = Cli::try_parse_from([
+            "singstone",
+            "transcribe",
+            "session",
+            "--whisper-model",
+            "whisper.bin",
+        ])
+        .expect("parse transcribe");
+        assert!(matches!(transcribe.command, Command::Transcribe(_)));
+
+        let diarize = Cli::try_parse_from([
+            "singstone",
+            "diarize",
+            "session",
+            "--segmentation-model",
+            "seg.onnx",
+            "--embedding-model",
+            "embed.onnx",
+        ])
+        .expect("parse diarize");
+        assert!(matches!(diarize.command, Command::Diarize(_)));
+
+        let recognize = Cli::try_parse_from([
+            "singstone",
+            "recognize",
+            "session",
+            "--embedding-model",
+            "embed.onnx",
+        ])
+        .expect("parse recognize");
+        assert!(matches!(recognize.command, Command::Recognize(_)));
+
+        let render = Cli::try_parse_from(["singstone", "render", "session", "--diarize-mic"])
+            .expect("parse render");
+        assert!(matches!(
+            render.command,
+            Command::Render(RenderArgs {
+                diarize_mic: Some(true),
+                ..
+            })
+        ));
+        let inferred =
+            Cli::try_parse_from(["singstone", "render", "session"]).expect("parse inferred render");
+        assert!(matches!(
+            inferred.command,
+            Command::Render(RenderArgs {
+                diarize_mic: None,
+                ..
+            })
+        ));
+    }
 }

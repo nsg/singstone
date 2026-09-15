@@ -1,4 +1,9 @@
 /target
 /third_party/
+/.snapcraft/
+/parts/
+/prime/
+/stage/
+/*.snap
 /session-*/
 *.f32le

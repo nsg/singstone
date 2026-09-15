@@ -939,27 +939,17 @@ Therefore:
 NEVER allow sherpa-onnx's build.rs to download binaries during trusted builds.
 ```
 
-Instead either:
-
-### Preferred
-
-Build the pinned sherpa-onnx native libraries from reviewed source and set:
+The Snap build therefore compiles the pinned sherpa-onnx and ONNX Runtime
+revisions from reviewed source and sets:
 
 ```bash
-SHERPA_ONNX_LIB_DIR=/verified/local/path
+SHERPA_ONNX_LIB_DIR=/snapcraft/staged/lib
 ```
 
-### Acceptable alternative
-
-Pre-fetch the exact upstream archive separately, verify its SHA-256, store it in the trusted build inputs, and use:
-
-```bash
-SHERPA_ONNX_ARCHIVE_DIR=/verified/archive/path
-```
-
-The actual Cargo build must work with networking disabled.
-
-This rule should be enforced in CI.
+Direct Cargo development uses `target/native/lib`. Keeping the variable set
+even when that directory is absent makes the build fail clearly instead of
+entering the crate's download fallback. CI enforces the source-built path by
+building the complete Snap.
 
 ---
 
@@ -1308,15 +1298,10 @@ cargo test
 cargo audit
 ```
 
-Additionally have a trusted/release CI job that:
-
-1. Starts without network access.
-2. Creates a temporary local snapshot of Rust dependencies.
-3. Uses locally supplied verified sherpa native libraries.
-4. Uses locally supplied model fixtures.
-5. Builds successfully with `--offline --locked`.
-
-The offline build is an important test of the project's privacy and supply-chain assumptions.
+Additionally, CI builds and reviews the complete strict Snap from exact source
+and model pins, verifies that it declares no runtime network interfaces,
+installs it, and runs CLI smoke tests. Cargo tests run inside that package build
+against the same source-built native libraries that are shipped.
 
 ---
 

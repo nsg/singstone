@@ -29,41 +29,17 @@ all run locally. The binary contains no network code.
 
 ## Quick start
 
-This quick start targets Ubuntu 24.04 on x86-64 and requires Rust 1.88 or newer.
-Use headphones when capturing both sources so remote speech does not leak into
-the microphone track. The native inference libraries are not stored in Git;
-from the repository root, fetch them before building:
+Download the `singstone-snap` artifact from a successful CI run, then install
+the unsigned build and connect its PipeWire interface:
 
 ```bash
-sudo apt install bzip2 clang cmake curl jq libclang-dev libpipewire-0.3-dev libspa-0.2-dev pkg-config
-scripts/fetch-sherpa-onnx.sh
-cargo build --locked
-export PATH="$PWD/target/debug:$PATH"
+sudo snap install --dangerous ./singstone_0.1.0_amd64.snap
+sudo snap connect singstone:pipewire
 ```
 
-The fetch script creates the gitignored `third_party/` directory and a
-`third_party/sherpa-onnx` symlink whose `lib/` directory is used by local
-builds. Their absence in a fresh clone is expected. Keep them in place when
-running `target/debug/singstone`. To install elsewhere, copy that binary plus
-`third_party/sherpa-onnx/lib/libsherpa-onnx-c-api.so` and
-`third_party/sherpa-onnx/lib/libonnxruntime.so` into one directory. Another
-Ubuntu system also needs the `libpipewire-0.3-0` runtime package.
-
-Download the models pinned by [`docs/models.lock`](docs/models.lock):
-
-```bash
-model_dir="${XDG_DATA_HOME:-$HOME/.local/share}/singstone/models"
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/singstone"
-mkdir -p "$model_dir" "$config_dir"
-
-curl -fL https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin \
-  -o "$model_dir/ggml-base.en.bin"
-curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 \
-  | tar -xj -C "$model_dir"
-curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx \
-  -o "$model_dir/nemo_en_titanet_small.onnx"
-cp docs/models.lock "$config_dir/models.lock"
-```
+The package already contains the Whisper, pyannote, and TitaNet models pinned
+by [`docs/models.lock`](docs/models.lock). Use headphones when capturing both
+sources so remote speech does not leak into the microphone track.
 
 Record a meeting, stop with Ctrl-C, then process the session:
 
@@ -71,12 +47,7 @@ Record a meeting, stop with Ctrl-C, then process the session:
 singstone devices
 singstone record --mic default --system default \
   --screenshots ~/Pictures/Screenshots --local-speaker "Me"
-
-model_dir="${XDG_DATA_HOME:-$HOME/.local/share}/singstone/models"
-singstone process session-20260914-103000 \
-  --whisper-model "$model_dir/ggml-base.en.bin" \
-  --segmentation-model "$model_dir/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" \
-  --embedding-model "$model_dir/nemo_en_titanet_small.onnx"
+singstone process session-20260914-103000
 ```
 
 The results are `SESSION/transcript.jsonl` for programs and
@@ -93,6 +64,10 @@ Model paths and the speaker database accept flags or environment variables:
 | `SINGSTONE_EMBEDDING_MODEL` | `--embedding-model` | sherpa-onnx speaker embedding model |
 | `SINGSTONE_MODELS_LOCK` | `--models-lock` | trusted model manifest; `$XDG_CONFIG_HOME/singstone/models.lock`, falling back to `~/.config/singstone/models.lock` |
 | `SINGSTONE_SPEAKERS_DB` | `--speakers-db` | enrolled speakers; `$XDG_DATA_HOME/singstone/speakers.json`, falling back to `~/.local/share/singstone/speakers.json` |
+
+The Snap sets all five variables to its bundled models, manifest, and persistent
+speaker database. Flags and environment variables remain useful for source
+builds or intentionally testing another model.
 
 Model-backed commands reject models whose purpose, size, and SHA-256 do not
 match `models.lock`. A missing lock file is also an error. Use
@@ -205,7 +180,40 @@ ffmpeg installed, convert raw audio when another tool needs WAV:
 ffmpeg -f f32le -ar 16000 -ac 1 -i SESSION/audio/system.f32le system.wav
 ```
 
+## Snap package
+
+[`snap/snapcraft.yaml`](snap/snapcraft.yaml) is the complete distribution
+recipe. It builds each native component from reviewed source instead of
+fetching opaque shared libraries:
+
+| Part | Pinned input | Packaged output |
+|---|---|---|
+| ONNX Runtime | upstream commit `33ca962…` (`v1.28.2`) | CPU `libonnxruntime.so` |
+| sherpa-onnx | upstream commit `11afbd0…` (`v1.13.8`) | `libsherpa-onnx-c-api.so`, linked to the source-built ONNX Runtime |
+| Singstone | this checkout plus `Cargo.lock`, Rust 1.98.1 | release executable and whisper.cpp compiled by `whisper-rs` |
+| Models | immutable URLs and SHA-256 checksums | Whisper, pyannote segmentation, TitaNet, and `models.lock` |
+
+Build on Ubuntu 24.04 x86-64 in Snapcraft's isolated LXD environment:
+
+```bash
+sudo snap install snapcraft --classic
+snapcraft --use-lxd
+```
+
+The finished Snap uses `strict` confinement. `home` lets commands read and
+write ordinary files in your home directory. `pipewire` lets the recorder use
+the PipeWire socket and must be connected once after installation. The package
+declares neither `network` nor `network-bind`, so snapd denies runtime network
+access. Network access is used only while Snapcraft retrieves the pinned source
+and model inputs.
+
 ## Development
+
+The Snap is the supported complete build. For a direct Cargo workflow, first
+build ONNX Runtime 1.28.2 and sherpa-onnx 1.13.8 from source and put their shared
+libraries in `target/native/lib`. The checked-in Cargo configuration deliberately
+sets that local path so `sherpa-onnx-sys` cannot silently download a prebuilt
+archive.
 
 ```bash
 sudo apt install pipewire pipewire-bin wireplumber pipewire-audio-client-libraries
@@ -220,8 +228,9 @@ cargo audit
 ```
 
 Optional Cargo features `vulkan`, `intel-sycl`, and `openblas` accelerate
-whisper.cpp. Diarization runs on CPU. CI also creates a temporary dependency
-snapshot and verifies an offline build.
+whisper.cpp. Diarization runs on CPU. CI builds the complete Snap from the
+pinned sources, runs the Rust tests during that build, reviews the package,
+checks its interfaces, installs it, and runs CLI smoke tests.
 
 ## Documentation
 

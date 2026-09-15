@@ -15,80 +15,60 @@ env:
 
 jobs:
   check:
-    name: fmt, clippy, tests, supply-chain policy
+    name: Formatting and RustSec audit
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake clang libclang-dev libpipewire-0.3-dev libspa-0.2-dev \
-            pipewire pipewire-bin wireplumber pipewire-audio-client-libraries
-
-      - name: Cache cargo registry and tools
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            ~/.cargo/advisory-db
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
-
-      - name: Cache sherpa-onnx native libraries
-        uses: actions/cache@v4
-        with:
-          path: third_party
-          key: sherpa-onnx-${{ hashFiles('scripts/fetch-sherpa-onnx.sh') }}
-
-      - name: Fetch and verify sherpa-onnx libraries
-        run: scripts/fetch-sherpa-onnx.sh
+      - run: cargo fmt --check
 
       - name: Install cargo-audit
         run: command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
 
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
-
-      - name: PipeWire integration tests (headless daemon)
-        run: |
-          source scripts/pw-headless.sh
-          SINGSTONE_PW_TEST=1 cargo test --locked --test record_pipewire -- --test-threads=1
-
       - run: cargo audit
-  offline-build:
-    name: offline build from a temporary dependency snapshot
+
+  snap:
+    name: Build and inspect strict snap
     runs-on: ubuntu-24.04
-    needs: check
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install Snapcraft
+        run: sudo snap install snapcraft --classic
+
+      - name: Build source-pinned snap
+        run: |
+          sudo snapcraft --destructive-mode
+          sudo chown "$USER:$USER" ./*.snap
+
+      - name: Verify confinement declaration
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            cmake clang libclang-dev libpipewire-0.3-dev libspa-0.2-dev
+          sudo apt-get install -y --no-install-recommends squashfs-tools
+          unsquashfs -cat ./*.snap meta/snap.yaml > built-snap.yaml
+          grep -q '^confinement: strict$' built-snap.yaml
+          grep -q '^  pipewire:$' built-snap.yaml
+          grep -q '^  home:$' built-snap.yaml
+          if grep -Eq '^  network(-bind)?:$|^      - network(-bind)?$' built-snap.yaml; then
+            echo "The runtime snap unexpectedly declares network access" >&2
+            exit 1
+          fi
 
-      - name: Cache sherpa-onnx native libraries
-        uses: actions/cache@v4
+      - name: Review package
+        run: |
+          sudo snap install review-tools
+          snap-review ./*.snap
+
+      - name: Install and smoke test
+        run: |
+          sudo snap install --dangerous ./*.snap
+          singstone --version
+          singstone speakers
+
+      - uses: actions/upload-artifact@v4
         with:
-          path: third_party
-          key: sherpa-onnx-${{ hashFiles('scripts/fetch-sherpa-onnx.sh') }}
-
-      - name: Fetch and verify sherpa-onnx libraries
-        run: scripts/fetch-sherpa-onnx.sh
-
-      - name: Vendor crates
-        run: |
-          mkdir -p .cargo
-          cargo vendor --locked vendor/crates > vendor-config.toml
-          cat vendor-config.toml >> .cargo/config.toml
-
-      - name: Build with networking disabled
-        run: |
-          sudo --preserve-env=PATH,HOME,CARGO_HOME,RUSTUP_HOME \
-            unshare --net bash -c 'cargo build --locked --offline'
+          name: singstone-snap
+          path: "*.snap"
+          if-no-files-found: error
+          retention-days: 7

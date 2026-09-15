@@ -1,0 +1,171 @@
+name: singstone
+title: Singstone
+version: "0.1.0"
+base: core24
+grade: stable
+confinement: strict
+assumes:
+  - snapd2.68
+platforms:
+  amd64:
+
+website: https://github.com/nsg/singstone
+source-code: https://github.com/nsg/singstone
+issues: https://github.com/nsg/singstone/issues
+license: MIT
+summary: Local meeting recorder, transcriber, and speaker diarizer
+description: |
+  Singstone records microphone and system audio through PipeWire, optionally
+  collects screenshots, and creates timestamped, speaker-attributed
+  transcripts. Recording and machine-learning inference run locally.
+
+apps:
+  singstone:
+    command: bin/singstone
+    environment:
+      LD_LIBRARY_PATH: $SNAP/lib:$LD_LIBRARY_PATH
+      SINGSTONE_WHISPER_MODEL: $SNAP/usr/share/singstone/models/ggml-base.en.bin
+      SINGSTONE_SEGMENTATION_MODEL: $SNAP/usr/share/singstone/models/segmentation.onnx
+      SINGSTONE_EMBEDDING_MODEL: $SNAP/usr/share/singstone/models/nemo_en_titanet_small.onnx
+      SINGSTONE_MODELS_LOCK: $SNAP/usr/share/singstone/models/models.lock
+      SINGSTONE_SPEAKERS_DB: $SNAP_USER_COMMON/speakers.json
+    plugs:
+      - home
+      - pipewire
+
+parts:
+  onnxruntime:
+    plugin: nil
+    source: https://github.com/microsoft/onnxruntime.git
+    source-type: git
+    source-commit: 33ca9628233dc8f002435e868d4c2e9f82766ca1
+    build-packages:
+      - build-essential
+      - ca-certificates
+      - cmake
+      - git
+      - ninja-build
+      - python3
+      - python3-dev
+      - python3-pip
+    build-environment:
+      - PIP_BREAK_SYSTEM_PACKAGES: "1"
+    override-build: |
+      ./build.sh \
+        --config Release \
+        --build_shared_lib \
+        --allow_running_as_root \
+        --compile_no_warning_as_error \
+        --parallel "$CRAFT_PARALLEL_BUILD_COUNT" \
+        --skip_tests \
+        --cmake_extra_defines \
+          CMAKE_INSTALL_PREFIX="$CRAFT_PART_INSTALL" \
+          CMAKE_INSTALL_LIBDIR=lib
+      cmake --install build/Linux/Release
+      install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/singstone/onnxruntime-LICENSE"
+      install -Dm644 ThirdPartyNotices.txt \
+        "$CRAFT_PART_INSTALL/usr/share/doc/singstone/onnxruntime-ThirdPartyNotices.txt"
+
+  sherpa-onnx:
+    after:
+      - onnxruntime
+    plugin: cmake
+    source: https://github.com/k2-fsa/sherpa-onnx.git
+    source-type: git
+    source-commit: 11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf
+    build-packages:
+      - build-essential
+      - ca-certificates
+      - git
+    build-environment:
+      - SHERPA_ONNXRUNTIME_INCLUDE_DIR: $CRAFT_STAGE/include/onnxruntime
+      - SHERPA_ONNXRUNTIME_LIB_DIR: $CRAFT_STAGE/lib
+      - LD_LIBRARY_PATH: $CRAFT_STAGE/lib:$LD_LIBRARY_PATH
+    cmake-parameters:
+      - -DBUILD_SHARED_LIBS=ON
+      - -DSHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF
+      - -DSHERPA_ONNX_ENABLE_BINARY=OFF
+      - -DSHERPA_ONNX_ENABLE_C_API=ON
+      - -DSHERPA_ONNX_ENABLE_CHECK=OFF
+      - -DSHERPA_ONNX_ENABLE_JNI=OFF
+      - -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF
+      - -DSHERPA_ONNX_ENABLE_PYTHON=OFF
+      - -DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=ON
+      - -DSHERPA_ONNX_ENABLE_TESTS=OFF
+      - -DSHERPA_ONNX_ENABLE_TTS=OFF
+      - -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF
+      - -DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=ON
+    override-build: |
+      craftctl default
+      install -Dm644 "$CRAFT_PART_SRC/LICENSE" \
+        "$CRAFT_PART_INSTALL/usr/share/doc/singstone/sherpa-onnx-LICENSE"
+
+  whisper-model:
+    plugin: dump
+    source: https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin
+    source-type: file
+    source-checksum: sha256/a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002
+    organize:
+      ggml-base.en.bin: usr/share/singstone/models/ggml-base.en.bin
+
+  segmentation-model:
+    plugin: dump
+    source: https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
+    source-checksum: sha256/24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488
+    organize:
+      sherpa-onnx-pyannote-segmentation-3-0/model.onnx: usr/share/singstone/models/segmentation.onnx
+      sherpa-onnx-pyannote-segmentation-3-0/LICENSE: usr/share/doc/singstone/pyannote-segmentation-LICENSE
+    prime:
+      - usr/share/singstone/models/segmentation.onnx
+      - usr/share/doc/singstone/pyannote-segmentation-LICENSE
+
+  embedding-model:
+    plugin: dump
+    source: https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
+    source-type: file
+    source-checksum: sha256/ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e
+    organize:
+      nemo_en_titanet_small.onnx: usr/share/singstone/models/nemo_en_titanet_small.onnx
+
+  singstone:
+    after:
+      - embedding-model
+      - segmentation-model
+      - sherpa-onnx
+      - whisper-model
+    plugin: rust
+    source: .
+    source-ignore:
+      - .git
+      - .snapcraft
+      - parts
+      - prime
+      - stage
+      - target
+      - third_party
+      - "*.snap"
+    rust-channel: "1.98.1"
+    rust-cargo-parameters:
+      - --locked
+    build-packages:
+      - clang
+      - cmake
+      - libclang-dev
+      - libpipewire-0.3-dev
+      - libspa-0.2-dev
+      - pkg-config
+    stage-packages:
+      - libpipewire-0.3-0t64
+      - libspa-0.2-modules
+    build-environment:
+      - SHERPA_ONNX_LIB_DIR: $CRAFT_STAGE/lib
+      - LD_LIBRARY_PATH: $CRAFT_STAGE/lib:$LD_LIBRARY_PATH
+    override-build: |
+      cargo clippy --release --all-targets --locked -- -D warnings
+      cargo test --release --locked
+      craftctl default
+      install -Dm644 docs/models.lock \
+        "$CRAFT_PART_INSTALL/usr/share/singstone/models/models.lock"
+      install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/singstone/LICENSE"
+      install -Dm644 snap/local/THIRD_PARTY.md \
+        "$CRAFT_PART_INSTALL/usr/share/doc/singstone/THIRD_PARTY.md"

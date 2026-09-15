@@ -1,5 +1,5 @@
-# Native sherpa-onnx libraries must be supplied locally; the sherpa-onnx-sys
-# build script would otherwise download unverified binaries at build time.
-# Populate third_party/sherpa-onnx/lib with scripts/fetch-sherpa-onnx.sh.
+# Native sherpa-onnx libraries must be supplied locally; setting this variable
+# prevents sherpa-onnx-sys from downloading a prebuilt archive during a Cargo
+# build. Snapcraft overrides the path with its source-built staging directory.
 [env]
-SHERPA_ONNX_LIB_DIR = { value = "third_party/sherpa-onnx/lib", relative = true }
+SHERPA_ONNX_LIB_DIR = { value = "target/native/lib", relative = true }

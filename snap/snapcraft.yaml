@@ -93,6 +93,7 @@ parts:
       - SHERPA_ONNXRUNTIME_LIB_DIR: $CRAFT_STAGE/lib
       - LD_LIBRARY_PATH: $CRAFT_STAGE/lib
     cmake-parameters:
+      - -DCMAKE_INSTALL_PREFIX=/
       - -DBUILD_SHARED_LIBS=ON
       - -DSHERPA_ONNX_BUILD_C_API_EXAMPLES=OFF
       - -DSHERPA_ONNX_ENABLE_BINARY=OFF
@@ -108,6 +109,7 @@ parts:
       - -DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=ON
     override-build: |
       craftctl default
+      rm -f "$CRAFT_PART_INSTALL"/lib/libonnxruntime.so*
       install -Dm644 "$CRAFT_PART_SRC/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/sherpa-onnx-LICENSE"
 

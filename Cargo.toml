@@ -26,6 +26,3 @@ openblas = ["whisper-rs/openblas"]
 # but build dependencies (whisper.cpp, ggml, bindings) optimized.
 [profile.dev.package."*"]
 opt-level = 3
-
-[patch.crates-io]
-sherpa-onnx-sys = { path = "vendor/sherpa-onnx-sys" }

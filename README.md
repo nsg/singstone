@@ -209,19 +209,19 @@ ffmpeg -f f32le -ar 16000 -ac 1 -i SESSION/audio/system.f32le system.wav
 
 ```bash
 sudo apt install pipewire pipewire-bin wireplumber pipewire-audio-client-libraries
-cargo install --locked cargo-audit cargo-deny cargo-vet
+cargo install --locked cargo-audit cargo-deny
 
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 source scripts/pw-headless.sh
 SINGSTONE_PW_TEST=1 cargo test --test record_pipewire -- --test-threads=1
 SINGSTONE_TEST_MODELS=/path/to/models SINGSTONE_TEST_SAMPLES=/path/to/samples \
   cargo test --test process_ami
-cargo audit && cargo deny check && cargo vet
+cargo audit && cargo deny check
 ```
 
 Optional Cargo features `vulkan`, `intel-sycl`, and `openblas` accelerate
-whisper.cpp. Diarization runs on CPU. CI also verifies a separately vendored
-offline build.
+whisper.cpp. Diarization runs on CPU. CI also creates a temporary dependency
+snapshot and verifies an offline build.
 
 ## Documentation
 

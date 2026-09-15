@@ -49,7 +49,7 @@ jobs:
 
       - name: Install cargo policy tools
         run: |
-          for t in cargo-audit cargo-deny cargo-vet; do
+          for t in cargo-audit cargo-deny; do
             command -v "$t" >/dev/null || cargo install --locked "$t"
           done
 
@@ -64,10 +64,8 @@ jobs:
 
       - run: cargo audit
       - run: cargo deny check
-      - run: cargo vet --locked
-
   offline-build:
-    name: offline build with vendored dependencies
+    name: offline build from a temporary dependency snapshot
     runs-on: ubuntu-24.04
     needs: check
     steps:

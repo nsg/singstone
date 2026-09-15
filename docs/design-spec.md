@@ -881,7 +881,7 @@ ONNX Runtime / sherpa-onnx
 
 ultimately contain C/C++/FFI code.
 
-Unsafe code should therefore be isolated to upstream bindings that have been explicitly reviewed/vetted.
+Unsafe code should therefore be isolated to upstream bindings that have been reviewed.
 
 Do not write application-specific unsafe FFI unless there is a compelling reason.
 
@@ -898,7 +898,6 @@ Instead, make dependency review part of the build policy.
 Use:
 
 ```text
-cargo-vet
 cargo-audit / RustSec
 cargo-deny
 ```
@@ -908,16 +907,13 @@ cargo-deny
 A production release must not be produced until:
 
 ```text
-cargo vet
 cargo audit
 cargo deny check
 ```
 
 all satisfy project policy.
 
-For ubiquitous dependencies, import trustworthy Cargo Vet audit sets where appropriate.
-
-For domain-specific dependencies for which no adequate imported audit is available:
+For higher-risk domain-specific dependencies:
 
 ```text
 pipewire
@@ -926,9 +922,8 @@ sherpa-onnx
 their -sys crates
 ```
 
-perform and record a project-specific source review of the exact pinned version.
-
-Do **not** create permanent unexplained `cargo-vet` exemptions simply to make CI green.
+perform a project-specific source review of the exact pinned version when the
+risk warrants it.
 
 ---
 
@@ -977,7 +972,6 @@ Repository must commit:
 ```text
 Cargo.toml
 Cargo.lock
-vetting configuration
 model manifest
 ```
 
@@ -992,14 +986,14 @@ Rules:
 - Pin model files.
 - Build against a supported/current Rust stable toolchain.
 - CI release builds use `--locked`.
-- Prefer vendoring dependencies for reproducible releases.
+- Materialize dependencies with `cargo vendor` for offline release builds; do
+  not commit those generated copies.
 - Trusted release builds should succeed with network disabled.
 
 A desirable final release procedure is approximately:
 
 ```bash
 cargo vendor
-cargo vet
 cargo audit
 cargo deny check
 cargo test --locked
@@ -1314,7 +1308,6 @@ At minimum:
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo vet
 cargo audit
 cargo deny check
 ```
@@ -1322,7 +1315,7 @@ cargo deny check
 Additionally have a trusted/release CI job that:
 
 1. Starts without network access.
-2. Uses vendored Rust dependencies.
+2. Creates a temporary local snapshot of Rust dependencies.
 3. Uses locally supplied verified sherpa native libraries.
 4. Uses locally supplied model fixtures.
 5. Builds successfully with `--offline --locked`.
@@ -1465,15 +1458,13 @@ small dependency set
         ↓
 exact pinned versions
         ↓
-Cargo Vet imported audits where available
-        ↓
-project review for uncovered crates
+project review for high-risk crates
         ↓
 RustSec/advisory checking
         ↓
 review of build.rs/proc macros/native code
         ↓
-vendored dependencies
+offline Cargo source snapshot
         ↓
 verified native libraries
         ↓

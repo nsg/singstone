@@ -29,32 +29,40 @@ all run locally. The binary contains no network code.
 
 ## Quick start
 
-Requires Ubuntu 24.04, PipeWire, and stable Rust. Use headphones when capturing
-both sources so remote speech does not leak into the microphone track.
+This quick start targets Ubuntu 24.04 on x86-64 and requires Rust 1.88 or newer.
+Use headphones when capturing both sources so remote speech does not leak into
+the microphone track. The native inference libraries are not stored in Git;
+from the repository root, fetch them before building:
 
 ```bash
-sudo apt install cmake clang libclang-dev libpipewire-0.3-dev libspa-0.2-dev pkg-config
+sudo apt install bzip2 clang cmake curl jq libclang-dev libpipewire-0.3-dev libspa-0.2-dev pkg-config
 scripts/fetch-sherpa-onnx.sh
-cargo build
+cargo build --locked
 export PATH="$PWD/target/debug:$PATH"
 ```
 
-The binary loads `libsherpa-onnx-c-api.so` and `libonnxruntime.so` from
-`third_party/sherpa-onnx/lib` or its own directory. Copy both libraries beside
-an installed binary.
+The fetch script creates the gitignored `third_party/` directory and a
+`third_party/sherpa-onnx` symlink whose `lib/` directory is used by local
+builds. Their absence in a fresh clone is expected. Keep them in place when
+running `target/debug/singstone`. To install elsewhere, copy that binary plus
+`third_party/sherpa-onnx/lib/libsherpa-onnx-c-api.so` and
+`third_party/sherpa-onnx/lib/libonnxruntime.so` into one directory. Another
+Ubuntu system also needs the `libpipewire-0.3-0` runtime package.
 
 Download the models pinned by [`docs/models.lock`](docs/models.lock):
 
 ```bash
-mkdir -p ~/.local/share/singstone/models ~/.config/singstone
+model_dir="${XDG_DATA_HOME:-$HOME/.local/share}/singstone/models"
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/singstone"
+mkdir -p "$model_dir" "$config_dir"
 
 curl -fL https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin \
-  -o ~/.local/share/singstone/models/ggml-base.en.bin
+  -o "$model_dir/ggml-base.en.bin"
 curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2 \
-  | tar -xj -C ~/.local/share/singstone/models
+  | tar -xj -C "$model_dir"
 curl -fL https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx \
-  -o ~/.local/share/singstone/models/nemo_en_titanet_small.onnx
-cp docs/models.lock ~/.config/singstone/models.lock
+  -o "$model_dir/nemo_en_titanet_small.onnx"
+cp docs/models.lock "$config_dir/models.lock"
 ```
 
 Record a meeting, stop with Ctrl-C, then process the session:
@@ -64,13 +72,15 @@ singstone devices
 singstone record --mic default --system default \
   --screenshots ~/Pictures/Screenshots --local-speaker "Me"
 
+model_dir="${XDG_DATA_HOME:-$HOME/.local/share}/singstone/models"
 singstone process session-20260914-103000 \
-  --whisper-model ~/.local/share/singstone/models/ggml-base.en.bin \
-  --segmentation-model ~/.local/share/singstone/models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx \
-  --embedding-model ~/.local/share/singstone/models/nemo_en_titanet_small.onnx
+  --whisper-model "$model_dir/ggml-base.en.bin" \
+  --segmentation-model "$model_dir/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" \
+  --embedding-model "$model_dir/nemo_en_titanet_small.onnx"
 ```
 
-The result is `transcript.jsonl` for programs and `transcript.txt` for people.
+The results are `SESSION/transcript.jsonl` for programs and
+`SESSION/transcript.txt` for people.
 
 ## Configuration
 
@@ -81,13 +91,15 @@ Model paths and the speaker database accept flags or environment variables:
 | `SINGSTONE_WHISPER_MODEL` | `--whisper-model` | whisper.cpp GGML model |
 | `SINGSTONE_SEGMENTATION_MODEL` | `--segmentation-model` | pyannote segmentation ONNX model |
 | `SINGSTONE_EMBEDDING_MODEL` | `--embedding-model` | sherpa-onnx speaker embedding model |
-| `SINGSTONE_MODELS_LOCK` | `--models-lock` | trusted model manifest; defaults to `$XDG_CONFIG_HOME/singstone/models.lock` |
-| `SINGSTONE_SPEAKERS_DB` | `--speakers-db` | enrolled speakers; defaults to `$XDG_DATA_HOME/singstone/speakers.json` |
+| `SINGSTONE_MODELS_LOCK` | `--models-lock` | trusted model manifest; `$XDG_CONFIG_HOME/singstone/models.lock`, falling back to `~/.config/singstone/models.lock` |
+| `SINGSTONE_SPEAKERS_DB` | `--speakers-db` | enrolled speakers; `$XDG_DATA_HOME/singstone/speakers.json`, falling back to `~/.local/share/singstone/speakers.json` |
 
-Model-backed commands reject files missing from `models.lock`. Use
+Model-backed commands reject models whose purpose, size, and SHA-256 do not
+match `models.lock`. A missing lock file is also an error. Use
 `--allow-unverified-models` only when intentionally testing an unlisted model.
-Add a model skeleton with `scripts/models-lock-add.sh FILE`, then review and
-complete its metadata before use.
+Add an entry to the configured copy with
+`scripts/models-lock-add.sh FILE "${XDG_CONFIG_HOME:-$HOME/.config}/singstone/models.lock"`,
+then review and complete its metadata before use.
 
 ## CLI
 
@@ -95,7 +107,7 @@ complete its metadata before use.
 |---|---|
 | `devices` | List selectable PipeWire sources and sinks |
 | `record` | Capture audio and optional screenshots into a new session |
-| `process` | Run the complete offline pipeline |
+| `process` | Run all configured offline processing stages |
 | `transcribe` | Produce word-level text and timestamps |
 | `diarize` | Produce anonymous speaker intervals |
 | `recognize` | Match speaker clusters to enrolled voices |
@@ -186,11 +198,11 @@ and render rules.
 | `speaker-assignments.json` | Optional recognized names and provenance |
 | `transcript.jsonl`, `transcript.txt` | Final machine-readable and text transcripts |
 
-All meeting-relative timestamps are milliseconds from the meeting start.
-Convert raw audio when another tool needs WAV:
+All meeting-relative timestamps are milliseconds from the meeting start. With
+ffmpeg installed, convert raw audio when another tool needs WAV:
 
 ```bash
-ffmpeg -f f32le -ar 16000 -ac 1 -i audio/system.f32le system.wav
+ffmpeg -f f32le -ar 16000 -ac 1 -i SESSION/audio/system.f32le system.wav
 ```
 
 ## Development
@@ -202,7 +214,8 @@ cargo install --locked cargo-audit cargo-deny cargo-vet
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 source scripts/pw-headless.sh
 SINGSTONE_PW_TEST=1 cargo test --test record_pipewire -- --test-threads=1
-SINGSTONE_TEST_MODELS=... SINGSTONE_TEST_SAMPLES=... cargo test --test process_ami
+SINGSTONE_TEST_MODELS=/path/to/models SINGSTONE_TEST_SAMPLES=/path/to/samples \
+  cargo test --test process_ami
 cargo audit && cargo deny check && cargo vet
 ```
 

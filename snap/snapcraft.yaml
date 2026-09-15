@@ -149,8 +149,6 @@ parts:
     plugin: rust
     source: .
     rust-channel: "1.98.1"
-    rust-cargo-parameters:
-      - --locked
     build-snaps:
       - rustup/latest/stable
     build-packages:

@@ -12,6 +12,7 @@ platforms:
 website: https://github.com/nsg/singstone
 source-code: https://github.com/nsg/singstone
 issues: https://github.com/nsg/singstone/issues
+contact: https://github.com/nsg/singstone/issues
 license: MIT
 summary: Local meeting recorder, transcriber, and speaker diarizer
 description: |
@@ -110,6 +111,7 @@ parts:
     override-build: |
       craftctl default
       rm -f "$CRAFT_PART_INSTALL"/lib/libonnxruntime.so*
+      rm -f "$CRAFT_PART_INSTALL"/lib/libsherpa-onnx-cxx-api.so*
       install -Dm644 "$CRAFT_PART_SRC/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/sherpa-onnx-LICENSE"
 

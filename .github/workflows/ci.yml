@@ -53,28 +53,30 @@ jobs:
           sudo snapcraft pack --destructive-mode
           sudo chown "$USER:$USER" ./*.snap
 
-      - name: Verify confinement declaration
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends squashfs-tools
-          unsquashfs -cat ./*.snap meta/snap.yaml > built-snap.yaml
-          grep -q '^confinement: strict$' built-snap.yaml
-          grep -q '^  pipewire:$' built-snap.yaml
-          grep -q '^  home:$' built-snap.yaml
-          if grep -Eq '^  network(-bind)?:$|^      - network(-bind)?$' built-snap.yaml; then
-            echo "The runtime snap unexpectedly declares network access" >&2
-            exit 1
-          fi
-
-      - name: Install and smoke test
-        run: |
-          sudo snap install --dangerous ./*.snap
-          singstone --version
-          singstone speakers
-
       - uses: actions/upload-artifact@v4
         with:
           name: singstone-snap
           path: "*.snap"
           if-no-files-found: error
           retention-days: 7
+
+      - name: Verify confinement declaration
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools
+          unsquashfs -cat ./*.snap meta/snap.yaml > built-snap.yaml
+          ruby -ryaml -e '
+            metadata = YAML.safe_load_file("built-snap.yaml", aliases: true)
+            abort "snap is not strictly confined" unless metadata["confinement"] == "strict"
+            plugs = Array(metadata.dig("apps", "singstone", "plugs"))
+            abort "home plug is missing" unless plugs.include?("home")
+            abort "pipewire plug is missing" unless plugs.include?("pipewire")
+            forbidden = plugs & %w[network network-bind]
+            abort "runtime network plug declared: #{forbidden.join(", ")}" unless forbidden.empty?
+          '
+
+      - name: Install and smoke test
+        run: |
+          sudo snap install --dangerous ./*.snap
+          singstone --version
+          singstone speakers

@@ -14,12 +14,16 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: Formatting and RustSec audit
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - run: cargo fmt --check
 
@@ -33,7 +37,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Snapcraft
         run: |
@@ -53,7 +57,7 @@ jobs:
           sudo snapcraft pack --destructive-mode
           sudo chown "$USER:$USER" ./*.snap
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: singstone-snap
           path: "*.snap"
@@ -91,3 +95,73 @@ jobs:
           sudo snap install --dangerous ./*.snap
           singstone --version
           singstone speakers
+
+  release:
+    name: Publish latest main build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - check
+      - snap
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: singstone-snap
+          path: dist
+
+      - name: Prepare stable asset name
+        run: |
+          snap_path=$(find dist -maxdepth 1 -type f -name '*.snap' -print -quit)
+          test -n "$snap_path"
+          mv "$snap_path" dist/singstone_amd64.snap
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          current_main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [[ "$current_main" != "$GITHUB_SHA" ]]; then
+            echo "A newer main commit exists; skipping this release."
+            exit 0
+          fi
+
+          cat > release-notes.md <<EOF
+          Automated AMD64 Snap built from [\`${GITHUB_SHA::7}\`](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) on \`main\`.
+
+          This rolling release is replaced after every successful \`main\` build. Install it with the commands in the README.
+          EOF
+
+          # GitHub Releases require a tag. Reuse one fixed implementation tag;
+          # the project does not create version tags or retain older releases.
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest dist/singstone_amd64.snap --clobber
+            gh api --method PATCH \
+              "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" \
+              -f sha="$GITHUB_SHA" \
+              -F force=true >/dev/null
+            gh release edit latest \
+              --target "$GITHUB_SHA" \
+              --title "Latest" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/latest" >/dev/null 2>&1; then
+              gh api --method PATCH \
+                "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" \
+                -f sha="$GITHUB_SHA" \
+                -F force=true >/dev/null
+            else
+              gh api --method POST \
+                "repos/$GITHUB_REPOSITORY/git/refs" \
+                -f ref="refs/tags/latest" \
+                -f sha="$GITHUB_SHA" >/dev/null
+            fi
+            gh release create latest dist/singstone_amd64.snap \
+              --verify-tag \
+              --title "Latest" \
+              --notes-file release-notes.md \
+              --latest
+          fi

@@ -34,19 +34,20 @@ Requirements:
 - snapd 2.68 or newer
 - PipeWire
 
-Download the `singstone-snap` artifact from a
-[successful CI run](https://github.com/nsg/singstone/actions/workflows/ci.yml),
-then install the unsigned development build:
+Download the `.snap` directly from the rolling
+[Latest release](https://github.com/nsg/singstone/releases/latest), then install
+the unsigned build:
 
 ```bash
-unzip singstone-snap.zip
-sudo snap install --dangerous ./singstone_0.1.0_amd64.snap
+curl -fLO https://github.com/nsg/singstone/releases/latest/download/singstone_amd64.snap
+sudo snap install --dangerous ./singstone_amd64.snap
 sudo snap connect singstone:pipewire
 ```
 
-The package is not currently published in the Snap Store. `--dangerous` tells
-snapd to accept the locally downloaded, unsigned artifact; strict confinement
-still applies.
+The release is replaced after every successful `main` build; there are no
+versioned releases. The package is not currently published in the Snap Store.
+`--dangerous` tells snapd to accept the unsigned file; strict confinement still
+applies.
 
 ### Record and process a meeting
 
@@ -140,7 +141,8 @@ snapcraft pack --use-lxd
 
 CI builds the same Snap, runs release Clippy and tests against the packaged
 native libraries, checks the per-app interfaces, confirms that model weights
-are absent, installs the result, and runs CLI smoke tests.
+are absent, installs the result, runs CLI smoke tests, and replaces the rolling
+Latest release with the `.snap` binary.
 
 ## Documentation
 

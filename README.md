@@ -40,6 +40,7 @@ the unsigned build:
 
 ```bash
 curl -fLO https://github.com/nsg/singstone/releases/latest/download/singstone_amd64.snap
+sudo snap set system experimental.user-daemons=true
 sudo snap install --dangerous ./singstone_amd64.snap
 sudo snap connect singstone:pipewire
 ```
@@ -47,7 +48,8 @@ sudo snap connect singstone:pipewire
 The release is replaced after every successful `main` build; there are no
 versioned releases. The package is not currently published in the Snap Store.
 `--dangerous` tells snapd to accept the unsigned file; strict confinement still
-applies.
+applies. The snapd user-daemon feature is required for the per-user model setup
+service.
 
 ### Record and process a meeting
 

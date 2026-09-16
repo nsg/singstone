@@ -92,6 +92,7 @@ jobs:
 
       - name: Install and smoke test
         run: |
+          sudo snap set system experimental.user-daemons=true
           sudo snap install --dangerous ./*.snap
           singstone --version
           singstone speakers

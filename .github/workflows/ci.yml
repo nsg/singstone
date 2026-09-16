@@ -130,11 +130,29 @@ jobs:
             exit 0
           fi
 
-          cat > release-notes.md <<EOF
-          Automated AMD64 Snap built from [\`${GITHUB_SHA::7}\`](https://github.com/$GITHUB_REPOSITORY/commit/$GITHUB_SHA) on \`main\`.
+          {
+            printf 'Automated AMD64 Snap built from [`%s`](https://github.com/%s/commit/%s) on `main`.\n' \
+              "${GITHUB_SHA::7}" "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+            cat <<'EOF'
 
-          This rolling release is replaced after every successful \`main\` build. Install it with the commands in the README.
+          This rolling release is replaced after every successful `main` build.
+
+          ## Install
+
+          Requirements: AMD64 Linux, snapd 2.68 or newer, and PipeWire.
+
+          ```bash
+          curl -fLO https://github.com/nsg/singstone/releases/latest/download/singstone_amd64.snap
+          sudo snap set system experimental.user-daemons=true
+          sudo snap install --dangerous ./singstone_amd64.snap
+          sudo snap connect singstone:pipewire
+          ```
+
+          The package is unsigned, so local installation requires `--dangerous`.
+          Singstone remains strictly confined. Model weights download and are
+          verified automatically when you first run a model-backed command.
           EOF
+          } > release-notes.md
 
           # GitHub Releases require a tag. Reuse one fixed implementation tag;
           # the project does not create version tags or retain older releases.

@@ -5,6 +5,7 @@ mod cli;
 mod diarization;
 mod format;
 mod merge;
+mod model_setup;
 mod models;
 mod screenshot;
 mod session;
@@ -17,7 +18,14 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let cli = cli::Cli::parse();
+    if !matches!(cli.command, cli::Command::ModelSetup)
+        && let Err(e) = model_setup::ensure_available(&cli.command)
+    {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
     let result = match cli.command {
+        cli::Command::ModelSetup => model_setup::download().map_err(Into::into),
         cli::Command::Devices => audio::devices::list(),
         cli::Command::Record(args) => audio::record::run(args),
         cli::Command::Process(args) => merge::process::run(args),

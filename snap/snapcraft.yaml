@@ -27,14 +27,29 @@ apps:
       LD_LIBRARY_PATH: $SNAP/lib:$SNAP/usr/lib/x86_64-linux-gnu
       SPA_PLUGIN_DIR: $SNAP/usr/lib/x86_64-linux-gnu/spa-0.2
       PIPEWIRE_CONFIG_DIR: $SNAP/usr/share/pipewire
-      SINGSTONE_WHISPER_MODEL: $SNAP/usr/share/singstone/models/ggml-base.en.bin
-      SINGSTONE_SEGMENTATION_MODEL: $SNAP/usr/share/singstone/models/segmentation.onnx
-      SINGSTONE_EMBEDDING_MODEL: $SNAP/usr/share/singstone/models/nemo_en_titanet_small.onnx
-      SINGSTONE_MODELS_LOCK: $SNAP/usr/share/singstone/models/models.lock
+      SINGSTONE_WHISPER_MODEL: $SNAP_USER_COMMON/models/ggml-base.en.bin
+      SINGSTONE_SEGMENTATION_MODEL: $SNAP_USER_COMMON/models/model.onnx
+      SINGSTONE_EMBEDDING_MODEL: $SNAP_USER_COMMON/models/nemo_en_titanet_small.onnx
+      SINGSTONE_MODELS_LOCK: $SNAP/usr/share/singstone/models.lock
+      SINGSTONE_MODELS_DIR: $SNAP_USER_COMMON/models
+      SINGSTONE_MODEL_SETUP_SERVICE: $SNAP_INSTANCE_NAME.model-setup
       SINGSTONE_SPEAKERS_DB: $SNAP_USER_COMMON/speakers.json
     plugs:
       - home
       - pipewire
+  model-setup:
+    command: bin/singstone model-setup
+    daemon: simple
+    daemon-scope: user
+    install-mode: disable
+    restart-condition: never
+    refresh-mode: endure
+    environment:
+      LD_LIBRARY_PATH: $SNAP/lib:$SNAP/usr/lib/x86_64-linux-gnu
+      SINGSTONE_MODELS_LOCK: $SNAP/usr/share/singstone/models.lock
+      SINGSTONE_MODELS_DIR: $SNAP_USER_COMMON/models
+    plugs:
+      - network
 
 parts:
   onnxruntime:
@@ -115,37 +130,9 @@ parts:
       install -Dm644 "$CRAFT_PART_SRC/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/sherpa-onnx-LICENSE"
 
-  whisper-model:
-    plugin: dump
-    source: https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin
-    source-type: file
-    source-checksum: sha256/a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002
-    organize:
-      ggml-base.en.bin: usr/share/singstone/models/ggml-base.en.bin
-
-  segmentation-model:
-    plugin: dump
-    source: https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2
-    source-checksum: sha256/24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488
-    organize:
-      model.onnx: usr/share/singstone/models/segmentation.onnx
-    prime:
-      - usr/share/singstone/models/segmentation.onnx
-
-  embedding-model:
-    plugin: dump
-    source: https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
-    source-type: file
-    source-checksum: sha256/ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e
-    organize:
-      nemo_en_titanet_small.onnx: usr/share/singstone/models/nemo_en_titanet_small.onnx
-
   singstone:
     after:
-      - embedding-model
-      - segmentation-model
       - sherpa-onnx
-      - whisper-model
     plugin: rust
     source: .
     rust-channel: "1.98.1"
@@ -159,8 +146,12 @@ parts:
       - libspa-0.2-dev
       - pkg-config
     stage-packages:
+      - bzip2
+      - ca-certificates
+      - curl
       - libpipewire-0.3-0t64
       - libspa-0.2-modules
+      - tar
     build-environment:
       - SHERPA_ONNX_LIB_DIR: $CRAFT_STAGE/lib
       - LD_LIBRARY_PATH: $CRAFT_STAGE/lib
@@ -169,7 +160,7 @@ parts:
       cargo test --release --locked
       craftctl default
       install -Dm644 docs/models.lock \
-        "$CRAFT_PART_INSTALL/usr/share/singstone/models/models.lock"
+        "$CRAFT_PART_INSTALL/usr/share/singstone/models.lock"
       install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/singstone/LICENSE"
       install -Dm644 snap/local/THIRD_PARTY.md \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/THIRD_PARTY.md"

@@ -11,6 +11,10 @@ output. `recognize` needs diarization, while `render` needs transcription and
 diarization and can use recognition when it is available. All timestamps remain
 relative to the meeting clock established by `record`.
 
+In the Snap, the first model-backed stage starts the confined model setup
+service and waits with a progress bar until the verified per-user cache is
+ready. Later stages reuse that cache.
+
 Before a model-backed stage starts, singstone checks the model's file size,
 SHA-256 digest and declared purpose against `models.lock`. `--allow-unverified-models`
 can explicitly relax that check. Standalone commands generally treat a missing

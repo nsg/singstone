@@ -20,7 +20,10 @@
       "license": "MIT",
       "filename": "model.onnx",
       "size": 5992913,
-      "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079"
+      "sha256": "220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079",
+      "download_size": 6958444,
+      "download_sha256": "24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488",
+      "archive_member": "sherpa-onnx-pyannote-segmentation-3-0/model.onnx"
     },
     {
       "name": "nemo-en-titanet-small",

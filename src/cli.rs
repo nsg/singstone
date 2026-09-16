@@ -14,6 +14,9 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Download and verify the Snap's pinned model cache.
+    #[command(hide = true)]
+    ModelSetup,
     /// List PipeWire audio sources and sinks usable for recording.
     Devices,
     /// Record microphone and/or system audio into a new session directory.
@@ -280,5 +283,11 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_internal_model_setup_command() {
+        let setup = Cli::try_parse_from(["singstone", "model-setup"]).expect("parse setup");
+        assert!(matches!(setup.command, Command::ModelSetup));
     }
 }

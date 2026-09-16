@@ -10,7 +10,8 @@
 singstone records microphone and system audio on one meeting clock, optionally
 files screenshots, then builds a timestamped, speaker-attributed transcript.
 Capture, Whisper transcription, sherpa-onnx diarization, and voice recognition
-all run locally. The binary contains no network code.
+all run locally. The Snap gives network access only to a separate model setup
+service used for the initial download.
 
 ![Top-to-bottom overview of the Singstone workflow](docs/workflow-overview.svg)
 
@@ -37,9 +38,15 @@ sudo snap install --dangerous ./singstone_0.1.0_amd64.snap
 sudo snap connect singstone:pipewire
 ```
 
-The package already contains the Whisper, pyannote, and TitaNet models pinned
-by [`docs/models.lock`](docs/models.lock). Use headphones when capturing both
-sources so remote speech does not leak into the microphone track.
+The first model-backed command downloads about 186 MiB of pinned Whisper,
+pyannote, and TitaNet data. The command starts the per-user setup service,
+shows percentage and byte progress, verifies every SHA-256 digest, and then
+continues automatically. The verified cache survives Snap updates. Commands
+such as `devices`, `record`, `render`, and `speakers` need no models and start
+immediately.
+
+Use headphones when capturing both sources so remote speech does not leak into
+the microphone track.
 
 Record a meeting, stop with Ctrl-C, then process the session:
 
@@ -65,9 +72,10 @@ Model paths and the speaker database accept flags or environment variables:
 | `SINGSTONE_MODELS_LOCK` | `--models-lock` | trusted model manifest; `$XDG_CONFIG_HOME/singstone/models.lock`, falling back to `~/.config/singstone/models.lock` |
 | `SINGSTONE_SPEAKERS_DB` | `--speakers-db` | enrolled speakers; `$XDG_DATA_HOME/singstone/speakers.json`, falling back to `~/.local/share/singstone/speakers.json` |
 
-The Snap sets all five variables to its bundled models, manifest, and persistent
-speaker database. Flags and environment variables remain useful for source
-builds or intentionally testing another model.
+The Snap points model variables at its persistent per-user cache, installs the
+trusted manifest read-only, and stores the speaker database persistently. Flags
+and environment variables remain useful for source builds or intentionally
+testing another model.
 
 Model-backed commands reject models whose purpose, size, and SHA-256 do not
 match `models.lock`. A missing lock file is also an error. Use
@@ -191,7 +199,7 @@ fetching opaque shared libraries:
 | ONNX Runtime | upstream commit `33ca962…` (`v1.28.2`) | CPU `libonnxruntime.so` |
 | sherpa-onnx | upstream commit `11afbd0…` (`v1.13.8`) | `libsherpa-onnx-c-api.so`, linked to the source-built ONNX Runtime |
 | Singstone | this checkout plus `Cargo.lock`, Rust 1.98.1 | release executable and whisper.cpp compiled by `whisper-rs` |
-| Models | immutable URLs and SHA-256 checksums | Whisper, pyannote segmentation, TitaNet, and `models.lock` |
+| Model setup | immutable URLs and SHA-256 checksums | trusted `models.lock`; weights enter the per-user cache on first use |
 
 Build on Ubuntu 24.04 x86-64 in Snapcraft's isolated LXD environment:
 
@@ -200,12 +208,12 @@ sudo snap install snapcraft --classic
 snapcraft pack --use-lxd
 ```
 
-The finished Snap uses `strict` confinement. `home` lets commands read and
-write ordinary files in your home directory. `pipewire` lets the recorder use
-the PipeWire socket and must be connected once after installation. The package
-declares neither `network` nor `network-bind`, so snapd denies runtime network
-access. Network access is used only while Snapcraft retrieves the pinned source
-and model inputs.
+The finished Snap uses `strict` confinement. The main `singstone` app has
+`home` and `pipewire`, but no network interface. A disabled per-user setup
+service has outbound `network` access and nothing else. A model-backed command
+starts that service only when its cache is incomplete, waits with a progress
+bar, and resumes after verification. Snapcraft also uses network access while
+building the package from pinned sources.
 
 ## Development
 

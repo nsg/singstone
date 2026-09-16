@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="720" height="820" viewBox="0 0 720 820" role="img" aria-labelledby="title description">
   <title id="title">Singstone workflow overview</title>
-  <desc id="description">A vertical overview from choosing PipeWire devices, through recording and offline processing, to transcript and screenshot outputs.</desc>
+  <desc id="description">A vertical overview from choosing PipeWire devices, through recording and local processing, to transcript and screenshot outputs. A separate service downloads verified models on first use.</desc>
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
@@ -12,8 +12,8 @@
 
   <rect width="720" height="820" rx="20" fill="#f8fafc"/>
   <text x="360" y="45" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="26" font-weight="700" fill="#0f172a">Singstone workflow</text>
-  <rect x="267" y="60" width="186" height="27" rx="13" fill="#dcfce7"/>
-  <text x="360" y="78" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" font-weight="700" fill="#166534">LOCAL-ONLY · NO NETWORK</text>
+  <rect x="224" y="60" width="272" height="27" rx="13" fill="#dcfce7"/>
+  <text x="360" y="78" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="12" font-weight="700" fill="#166534">RECORDING + INFERENCE STAY LOCAL</text>
 
   <!-- Discover -->
   <g filter="url(#shadow)">

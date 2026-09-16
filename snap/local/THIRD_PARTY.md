@@ -1,7 +1,7 @@
 # Third-party models
 
-The Snap includes these checksum-pinned model files so Singstone can run
-without network access:
+The Snap's model setup service downloads and verifies these checksum-pinned
+files. The Snap itself contains their trusted manifest and notices:
 
 - `ggml-base.en.bin`, from
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp), MIT.

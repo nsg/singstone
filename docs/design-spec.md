@@ -992,9 +992,10 @@ cargo build --release --locked --offline
 
 # 27. Model supply-chain policy
 
-The application itself should **never download models**.
-
-Models are external installation artifacts.
+The Snap downloads models through a separate, per-user setup service. The main
+recording and processing app has no network interface. Its first model-backed
+command starts the service, waits on an atomic progress file, and continues
+after setup succeeds.
 
 Maintain something such as:
 
@@ -1032,7 +1033,10 @@ purpose: speaker-embedding
 sha256: ...
 ```
 
-On startup, verify model hashes against the configured trusted manifest.
+The service downloads only URLs in the installed manifest. It checks the
+download artifact and final model size and SHA-256, then atomically publishes
+the verified file under `$SNAP_USER_COMMON/models`. The cache survives Snap
+updates. Processing verifies models again before passing them to native code.
 
 Native ML parsers are a significant attack surface.
 
@@ -1042,7 +1046,8 @@ Treat arbitrary model files as untrusted executable-like inputs rather than harm
 
 # 28. Runtime privacy guarantees
 
-The core binary should have no networking functionality.
+Recording and inference should have no network interface. Only the confined
+model setup service receives outbound network access.
 
 In particular:
 
@@ -1051,11 +1056,11 @@ do not depend on reqwest
 do not open TCP/UDP sockets
 do not implement telemetry
 do not implement update checks
-do not download models
 do not report crashes remotely
 ```
 
-That makes the privacy claim architectural rather than merely a preference setting.
+The Snap's per-app interfaces make the privacy claim enforceable: `singstone`
+has `home` and `pipewire`, while `model-setup` has only `network`.
 
 The user's later summarization application may communicate with another trusted machine, but that is a separate process and a separate security boundary.
 
@@ -1298,10 +1303,11 @@ cargo test
 cargo audit
 ```
 
-Additionally, CI builds and reviews the complete strict Snap from exact source
-and model pins, verifies that it declares no runtime network interfaces,
-installs it, and runs CLI smoke tests. Cargo tests run inside that package build
-against the same source-built native libraries that are shipped.
+Additionally, CI builds and reviews the strict Snap from exact source pins and
+the pinned model manifest. It verifies that only the model setup service has a
+network interface, confirms weights are absent, installs the package, and runs
+CLI smoke tests. Cargo tests run inside that package build against the same
+source-built native libraries that are shipped.
 
 ---
 
@@ -1409,9 +1415,8 @@ Yeah, I agree.
 I'll update the issue after this meeting.
 ```
 
-Everything involved in recording, transcription, diarization and speaker recognition happens locally.
-
-No network connection is necessary.
+Recording, transcription, diarization and speaker recognition happen locally.
+A network connection is needed once to fill the verified model cache.
 
 ---
 
@@ -1449,11 +1454,11 @@ offline Cargo source snapshot
         ↓
 verified native libraries
         ↓
-SHA-256-pinned models
+reviewed model manifest
         ↓
-offline reproducible release build
+SHA-256-verified per-user cache
         ↓
-no runtime network implementation
+network isolated to the setup service
 ```
 
 That gives substantially stronger assurance than choosing dependencies merely because they have many downloads.

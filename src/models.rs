@@ -22,6 +22,25 @@ pub struct ModelEntry {
     pub filename: String,
     pub size: u64,
     pub sha256: String,
+    /// Size of the downloaded artifact. Defaults to `size` for direct files.
+    #[serde(default)]
+    pub download_size: Option<u64>,
+    /// SHA-256 of the downloaded artifact. Defaults to `sha256` for direct files.
+    #[serde(default)]
+    pub download_sha256: Option<String>,
+    /// Exact member to extract when the download is a tar archive.
+    #[serde(default)]
+    pub archive_member: Option<String>,
+}
+
+impl ModelEntry {
+    pub fn artifact_size(&self) -> u64 {
+        self.download_size.unwrap_or(self.size)
+    }
+
+    pub fn artifact_sha256(&self) -> &str {
+        self.download_sha256.as_deref().unwrap_or(&self.sha256)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -222,6 +241,9 @@ mod tests {
                 filename: "model.bin".into(),
                 size: 3,
                 sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+                download_size: None,
+                download_sha256: None,
+                archive_member: None,
             }],
         };
         let lock_path = dir.join("models.lock");

@@ -60,7 +60,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Verify confinement declaration
+      - name: Verify package contents and confinement
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends squashfs-tools
@@ -68,12 +68,23 @@ jobs:
           ruby -ryaml -e '
             metadata = YAML.safe_load_file("built-snap.yaml", aliases: true)
             abort "snap is not strictly confined" unless metadata["confinement"] == "strict"
-            plugs = Array(metadata.dig("apps", "singstone", "plugs"))
+            main = metadata.dig("apps", "singstone") || abort("main app missing")
+            setup = metadata.dig("apps", "model-setup") || abort("model setup service missing")
+            plugs = Array(main["plugs"])
             abort "home plug is missing" unless plugs.include?("home")
             abort "pipewire plug is missing" unless plugs.include?("pipewire")
             forbidden = plugs & %w[network network-bind]
             abort "runtime network plug declared: #{forbidden.join(", ")}" unless forbidden.empty?
+            abort "setup is not a simple user service" unless setup["daemon"] == "simple" && setup["daemon-scope"] == "user"
+            abort "setup must start on demand" unless setup["install-mode"] == "disable"
+            abort "setup must have only outbound network" unless Array(setup["plugs"]) == ["network"]
           '
+          unsquashfs -l ./*.snap > snap-files.txt
+          grep -q 'usr/share/singstone/models.lock$' snap-files.txt
+          if grep -Eq '/(ggml-base\.en\.bin|model\.onnx|nemo_en_titanet_small\.onnx)$' snap-files.txt; then
+            echo "model weights must not be bundled in the snap" >&2
+            exit 1
+          fi
 
       - name: Install and smoke test
         run: |

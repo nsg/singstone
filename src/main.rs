@@ -4,6 +4,7 @@ mod audio;
 mod cli;
 mod diarization;
 mod format;
+mod gui;
 mod merge;
 mod model_setup;
 mod models;
@@ -17,6 +18,9 @@ use clap::Parser;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if std::env::args_os().len() == 1 {
+        return gui::run();
+    }
     let cli = cli::Cli::parse();
     if !matches!(cli.command, cli::Command::ModelSetup)
         && let Err(e) = model_setup::ensure_available(&cli.command)
@@ -25,6 +29,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let result = match cli.command {
+        cli::Command::Gui => return gui::run(),
         cli::Command::ModelSetup => model_setup::download().map_err(Into::into),
         cli::Command::Devices => audio::devices::list(),
         cli::Command::Record(args) => audio::record::run(args),

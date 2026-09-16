@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Singstone
+Comment=Record and transcribe meetings locally
+Exec=singstone gui
+Icon=audio-input-microphone-symbolic
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=meeting;recording;transcription;diarization;
+StartupNotify=true

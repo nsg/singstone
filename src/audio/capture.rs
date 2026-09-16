@@ -1,6 +1,6 @@
 use crossbeam_queue::ArrayQueue;
 use pipewire as pw;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const BLOCK_SAMPLES: usize = 2_048;
@@ -32,6 +32,9 @@ pub struct CaptureData {
     pub dropped: Arc<AtomicU64>,
     pub format_ok: Arc<AtomicBool>,
     pub error: Arc<Mutex<Option<String>>>,
+    /// Peak amplitude of the most recently captured buffer, encoded with
+    /// `f32::to_bits` so the GUI can read it without touching the RT thread.
+    pub level: Arc<AtomicU32>,
     next_seq: u64,
 }
 
@@ -41,12 +44,14 @@ impl CaptureData {
         dropped: Arc<AtomicU64>,
         format_ok: Arc<AtomicBool>,
         error: Arc<Mutex<Option<String>>>,
+        level: Arc<AtomicU32>,
     ) -> Self {
         Self {
             queue,
             dropped,
             format_ok,
             error,
+            level,
             next_seq: 0,
         }
     }
@@ -148,6 +153,7 @@ pub fn listener(
                     continue;
                 }
                 let mut sample_offset = 0;
+                let mut peak = 0.0f32;
                 while sample_offset < total_samples {
                     let count = (total_samples - sample_offset).min(BLOCK_SAMPLES);
                     let mut block = Block {
@@ -163,6 +169,7 @@ pub fn listener(
                     };
                     for (index, output) in block.samples[..count].iter_mut().enumerate() {
                         *output = wrapped_f32(bytes, offset, sample_offset + index);
+                        peak = peak.max(output.abs());
                     }
                     data.next_seq = data.next_seq.wrapping_add(1);
                     if data.queue.push(block).is_err() {
@@ -171,6 +178,8 @@ pub fn listener(
                     sample_offset += count;
                     consumed_samples = consumed_samples.saturating_add(count as u64);
                 }
+                data.level
+                    .store(peak.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
             }
         })
         .register()

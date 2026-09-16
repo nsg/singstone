@@ -3,15 +3,29 @@ use pw::properties::properties;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Device {
-    id: u32,
-    media_class: String,
-    name: String,
-    description: String,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeviceInfo {
+    pub id: u32,
+    pub media_class: String,
+    pub name: String,
+    pub description: String,
 }
 
-pub fn list() -> Result<(), Box<dyn std::error::Error>> {
+impl DeviceInfo {
+    /// Human-friendly label for UI lists.
+    pub fn label(&self) -> String {
+        if self.description.is_empty() || self.description == self.name {
+            self.name.clone()
+        } else {
+            format!("{} ({})", self.description, self.name)
+        }
+    }
+}
+
+/// Enumerate usable PipeWire sources and sinks. Blocks briefly while the
+/// registry round-trip completes; callers on a UI thread should run this on a
+/// worker.
+pub fn enumerate() -> Result<Vec<DeviceInfo>, Box<dyn std::error::Error>> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -72,9 +86,13 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut devices = devices.borrow_mut();
-    devices.sort();
-    for device in devices.iter() {
+    let mut result = devices.borrow().clone();
+    result.sort();
+    Ok(result)
+}
+
+pub fn list() -> Result<(), Box<dyn std::error::Error>> {
+    for device in enumerate()? {
         println!(
             "{}  {}  {}  \"{}\"",
             device.id, device.media_class, device.name, device.description
@@ -86,7 +104,7 @@ pub fn list() -> Result<(), Box<dyn std::error::Error>> {
 
 fn collect_device(
     global: &pw::registry::GlobalObject<&pw::spa::utils::dict::DictRef>,
-    devices: &RefCell<Vec<Device>>,
+    devices: &RefCell<Vec<DeviceInfo>>,
 ) {
     if global.type_ != pw::types::ObjectType::Node {
         return;
@@ -108,7 +126,7 @@ fn collect_device(
         .get(*pw::keys::NODE_DESCRIPTION)
         .or_else(|| props.get(*pw::keys::NODE_NICK))
         .unwrap_or(name);
-    devices.borrow_mut().push(Device {
+    devices.borrow_mut().push(DeviceInfo {
         id: global.id,
         media_class: media_class.to_owned(),
         name: name.to_owned(),

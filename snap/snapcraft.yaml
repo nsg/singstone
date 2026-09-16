@@ -23,6 +23,9 @@ description: |
 apps:
   singstone:
     command: bin/singstone
+    desktop: usr/share/applications/io.github.nsg.Singstone.desktop
+    extensions:
+      - gnome
     environment:
       LD_LIBRARY_PATH: $SNAP/lib:$SNAP/usr/lib/x86_64-linux-gnu
       SPA_PLUGIN_DIR: $SNAP/usr/lib/x86_64-linux-gnu/spa-0.2
@@ -161,6 +164,8 @@ parts:
       craftctl default
       install -Dm644 docs/models.lock \
         "$CRAFT_PART_INSTALL/usr/share/singstone/models.lock"
+      install -Dm644 snap/gui/io.github.nsg.Singstone.desktop \
+        "$CRAFT_PART_INSTALL/usr/share/applications/io.github.nsg.Singstone.desktop"
       install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/singstone/LICENSE"
       install -Dm644 snap/local/THIRD_PARTY.md \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/THIRD_PARTY.md"

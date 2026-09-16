@@ -11,7 +11,7 @@ use std::mem::MaybeUninit;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub struct Watch {
     fd: rustix::fd::OwnedFd,
@@ -20,6 +20,7 @@ pub struct Watch {
     index: JsonlAppender,
     extensions: Vec<String>,
     t0_ns: u64,
+    filed: Arc<AtomicU64>,
 }
 
 impl Watch {
@@ -29,6 +30,7 @@ impl Watch {
         index_path: &Path,
         extensions: Vec<String>,
         t0_ns: u64,
+        filed: Arc<AtomicU64>,
     ) -> io::Result<Self> {
         let input_dir = input_dir.canonicalize()?;
         if !input_dir.is_dir() {
@@ -53,6 +55,7 @@ impl Watch {
                 .map(|extension| extension.trim_start_matches('.').to_ascii_lowercase())
                 .collect(),
             t0_ns,
+            filed,
         })
     }
 
@@ -137,7 +140,9 @@ impl Watch {
                 .to_string_lossy()
                 .into_owned(),
             original: source.to_string_lossy().into_owned(),
-        })
+        })?;
+        self.filed.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 

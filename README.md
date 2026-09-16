@@ -17,12 +17,29 @@ weights download on first use and remain in a persistent per-user cache.
 
 ![Top-to-bottom overview of the Singstone workflow](docs/workflow-overview.svg)
 
+## Application
+
+Browse processed meetings, review speaker-attributed transcripts, and assign
+names to speakers directly from the session view.
+
+![Singstone showing a processed speaker-attributed transcript](docs/images/singstone-transcript.png)
+
+Run the local processing pipeline without leaving the meeting window. The
+dialog reports each stage and can be cancelled while work is in progress.
+
+![Singstone processing a meeting in an in-window dialog](docs/images/singstone-processing.png)
+
 ## Features
 
 - Records a microphone, a PipeWire sink monitor, or both as aligned 16 kHz audio.
 - Files screenshots against the same meeting clock.
 - Transcribes with Whisper and separates speakers with pyannote and TitaNet.
 - Recognizes enrolled voices while leaving uncertain matches anonymous.
+- Provides a native GTK interface with live capture meters, screenshot counts,
+  explicit processing stages, transcript-side speaker assignment, and editable
+  storage folders.
+- Learns an anonymous diarized voice when it is named in the transcript, or
+  enrolls voices from clean WAV/raw samples on the Speakers page.
 - Keeps recording and inference offline under Snap confinement.
 - Verifies every model's size, purpose, and SHA-256 before native code loads it.
 
@@ -50,6 +67,17 @@ versioned releases. The package is not currently published in the Snap Store.
 `--dangerous` tells snapd to accept the unsigned file; strict confinement still
 applies. The snapd user-daemon feature is required for the per-user model setup
 service.
+
+Launch Singstone from the desktop application menu, or run it directly:
+
+```bash
+singstone
+```
+
+The GTK4 interface records meetings, browses existing sessions, displays
+transcripts and timestamped screenshots, manages the local speaker list, and
+runs the offline processing pipeline. The command-line interface remains
+available for scripting and advanced processing.
 
 ### Record and process a meeting
 
@@ -115,6 +143,7 @@ snap logs -n=100 singstone.model-setup
 
 | Command | Purpose |
 |---|---|
+| `gui` | Launch the GTK4 interface (also the default with no command) |
 | `devices` | List selectable PipeWire sources and sinks |
 | `record` | Capture audio and optional screenshots into a session |
 | `process` | Run the complete processing pipeline |

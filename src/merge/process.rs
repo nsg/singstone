@@ -18,10 +18,70 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const SPEAKER_ASSIGNMENTS_FORMAT_VERSION: u32 = 1;
 const STAGE_METADATA_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessingStage {
+    Preparing,
+    TranscribingMic,
+    TranscribingSystem,
+    Diarizing,
+    Recognizing,
+    Merging,
+    Writing,
+    Finished,
+}
+
+impl ProcessingStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "Checking session and local models",
+            Self::TranscribingMic => "Transcribing microphone audio",
+            Self::TranscribingSystem => "Transcribing system audio",
+            Self::Diarizing => "Separating speakers",
+            Self::Recognizing => "Recognizing enrolled voices",
+            Self::Merging => "Merging the meeting timeline",
+            Self::Writing => "Writing transcript files",
+            Self::Finished => "Processing complete",
+        }
+    }
+
+    pub fn fraction(self) -> f64 {
+        match self {
+            Self::Preparing => 0.05,
+            Self::TranscribingMic => 0.12,
+            Self::TranscribingSystem => 0.3,
+            Self::Diarizing => 0.55,
+            Self::Recognizing => 0.78,
+            Self::Merging => 0.88,
+            Self::Writing => 0.95,
+            Self::Finished => 1.0,
+        }
+    }
+
+    pub const ALL: [Self; 8] = [
+        Self::Preparing,
+        Self::TranscribingMic,
+        Self::TranscribingSystem,
+        Self::Diarizing,
+        Self::Recognizing,
+        Self::Merging,
+        Self::Writing,
+        Self::Finished,
+    ];
+
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|stage| *stage == self)
+            .unwrap_or(0)
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TranscriptionMetadata {
@@ -51,6 +111,23 @@ struct DiarizationMetadata {
 }
 
 pub fn run(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_progress(args, |_| {})
+}
+
+pub fn run_with_progress(
+    args: ProcessArgs,
+    progress: impl Fn(ProcessingStage),
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_control(args, progress, Arc::new(AtomicBool::new(false)))
+}
+
+pub fn run_with_control(
+    args: ProcessArgs,
+    progress: impl Fn(ProcessingStage),
+    cancelled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    progress(ProcessingStage::Preparing);
+    ensure_not_cancelled(&cancelled)?;
     let (session, manifest) = open_session(&args.session)?;
     let threads = thread_count(args.threads);
     if args.skip_transcription {
@@ -58,9 +135,20 @@ pub fn run(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("transcribe: reusing {} words from words.jsonl", words.len());
     } else {
         let mut words = Vec::new();
-        transcribe_sources(&args, &session, &manifest, threads, &mut words, false)?;
+        transcribe_sources(
+            &args,
+            &session,
+            &manifest,
+            threads,
+            &mut words,
+            false,
+            Some(&progress),
+            Some(&cancelled),
+        )?;
     }
 
+    ensure_not_cancelled(&cancelled)?;
+    progress(ProcessingStage::Diarizing);
     let diarization_started = Instant::now();
     let mut segments = diarize_sources(&args, &session, &manifest, threads, false)?;
     sort_segments(&mut segments);
@@ -72,6 +160,8 @@ pub fn run(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
         diarization_started.elapsed().as_secs_f64()
     );
 
+    ensure_not_cancelled(&cancelled)?;
+    progress(ProcessingStage::Recognizing);
     let recognition_started = Instant::now();
     let recognition = recognize_speakers(&args, &session, &segments, threads, false)?;
     write_speaker_assignments(&args, &session, &segments, &recognition)?;
@@ -80,7 +170,25 @@ pub fn run(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
         recognition_started.elapsed().as_secs_f64()
     );
 
-    render_artifacts(&session, &manifest, args.diarize_mic)
+    ensure_not_cancelled(&cancelled)?;
+    progress(ProcessingStage::Merging);
+    render_artifacts_with_hook(&session, &manifest, args.diarize_mic, || {
+        progress(ProcessingStage::Writing);
+    })?;
+    ensure_not_cancelled(&cancelled)?;
+    progress(ProcessingStage::Finished);
+    Ok(())
+}
+
+fn ensure_not_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "processing cancelled",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn run_transcribe(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -106,6 +214,8 @@ pub fn run_transcribe(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Er
         thread_count(process.threads),
         &mut words,
         true,
+        None,
+        None,
     )
 }
 
@@ -179,6 +289,144 @@ pub fn run_render(args: RenderArgs) -> Result<(), Box<dyn std::error::Error>> {
     render_artifacts_with_segments(&session, &manifest, diarize_mic, segments)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssignmentOutcome {
+    /// Whether the cluster embedding was also added to the persistent speaker
+    /// database, allowing later sessions to recognize the voice.
+    pub learned: bool,
+}
+
+/// Assign a diarized cluster from the transcript and, when the embedding model
+/// is available, use that cluster as a new local enrollment sample.
+pub fn assign_speaker(
+    args: ProcessArgs,
+    speaker_id: &str,
+    name: &str,
+) -> Result<AssignmentOutcome, Box<dyn std::error::Error>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "speaker name cannot be empty").into(),
+        );
+    }
+    let (source, cluster) = parse_speaker_id(speaker_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{speaker_id:?} is not an assignable diarized speaker"),
+        )
+    })?;
+    let (session, _) = open_session(&args.session)?;
+    let mut artifact: SpeakerAssignments = read_json(&session.speaker_assignments_path())?;
+    if artifact.format_version != SPEAKER_ASSIGNMENTS_FORMAT_VERSION
+        || artifact.provenance.diarization_file != "diarization.jsonl"
+        || !artifact
+            .provenance
+            .diarization_sha256
+            .eq_ignore_ascii_case(&models::sha256_file(&session.diarization_path())?)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "speaker assignments are stale; process the session again before assigning a name",
+        )
+        .into());
+    }
+    let assignment = artifact
+        .assignments
+        .iter_mut()
+        .find(|value| value.source == source && value.cluster == cluster)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("speaker cluster {speaker_id} is not in this session"),
+            )
+        })?;
+    assignment.speaker = Some(name.to_owned());
+
+    let learned = match learn_cluster(&args, &session, source, cluster, name) {
+        Ok(learned) => learned,
+        Err(error) => {
+            eprintln!("warning: assigned {speaker_id} but could not learn its voice: {error}");
+            false
+        }
+    };
+    if learned {
+        assignment.best_candidate = Some(name.to_owned());
+        assignment.score = Some(1.0);
+        let database_path = args
+            .speakers_db
+            .clone()
+            .unwrap_or_else(database::default_path);
+        artifact.provenance.speakers_database_sha256 = Some(models::sha256_file(&database_path)?);
+    }
+    write_json_atomic(&session.speaker_assignments_path(), &artifact)?;
+    run_render(RenderArgs {
+        session: session.dir,
+        diarize_mic: None,
+    })?;
+    Ok(AssignmentOutcome { learned })
+}
+
+fn parse_speaker_id(value: &str) -> Option<(AudioSource, u32)> {
+    if let Some(cluster) = value.strip_prefix("speaker-") {
+        return Some((AudioSource::System, cluster.parse().ok()?));
+    }
+    let (prefix, cluster) = value.rsplit_once('_')?;
+    let source = match prefix {
+        "mic" => AudioSource::Mic,
+        "spk" => AudioSource::System,
+        _ => return None,
+    };
+    Some((source, cluster.parse().ok()?))
+}
+
+fn learn_cluster(
+    args: &ProcessArgs,
+    session: &Session,
+    source: AudioSource,
+    cluster: u32,
+    name: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(model) = args.embedding_model.as_deref() else {
+        return Ok(false);
+    };
+    models::verify_model(
+        model,
+        "speaker-embedding",
+        args.models_lock.as_deref(),
+        args.allow_unverified_models,
+    )?;
+    let extractor = EmbeddingExtractor::new(model, thread_count(args.threads))?;
+    let segments: Vec<SpeakerSegment> =
+        read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
+    let source_segments = segments
+        .iter()
+        .filter(|segment| segment.source == source && segment.cluster == cluster)
+        .collect::<Vec<_>>();
+    let samples = session.read_audio(source)?;
+    let Some(embedding) = embed_clusters(&extractor, &samples, &source_segments).remove(&cluster)
+    else {
+        return Ok(false);
+    };
+    let identity = database::identity(model, extractor.dimension())?;
+    let path = args
+        .speakers_db
+        .clone()
+        .unwrap_or_else(database::default_path);
+    let mut database = match SpeakerDatabase::load_checked(&path, &identity) {
+        Ok(database) => database,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => SpeakerDatabase::empty(identity),
+        Err(error) => return Err(error.into()),
+    };
+    database
+        .speakers
+        .entry(name.to_owned())
+        .or_default()
+        .embeddings
+        .push(embedding);
+    database.save(&path)?;
+    Ok(true)
+}
+
 fn stage_process_args(session: PathBuf) -> ProcessArgs {
     ProcessArgs {
         session,
@@ -229,6 +477,7 @@ fn thread_count(configured: Option<usize>) -> usize {
         .max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transcribe_sources(
     args: &ProcessArgs,
     session: &Session,
@@ -236,6 +485,8 @@ fn transcribe_sources(
     threads: usize,
     words: &mut Vec<TimedWord>,
     strict_audio: bool,
+    progress: Option<&dyn Fn(ProcessingStage)>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let model = args.whisper_model.as_deref().ok_or_else(|| {
         io::Error::new(
@@ -255,9 +506,18 @@ fn transcribe_sources(
         (AudioSource::Mic, manifest.mic.enabled),
         (AudioSource::System, manifest.system.enabled),
     ] {
+        if let Some(cancelled) = cancelled {
+            ensure_not_cancelled(cancelled)?;
+        }
         let samples = read_enabled_audio(session, source, enabled, strict_audio)?;
         if samples.is_empty() {
             continue;
+        }
+        if let Some(progress) = progress {
+            progress(match source {
+                AudioSource::Mic => ProcessingStage::TranscribingMic,
+                AudioSource::System => ProcessingStage::TranscribingSystem,
+            });
         }
         let started = Instant::now();
         transcriber.set_source(source);
@@ -693,13 +953,14 @@ fn write_speaker_assignments(
     Ok(())
 }
 
-fn render_artifacts(
+fn render_artifacts_with_hook(
     session: &Session,
     manifest: &Manifest,
     diarize_mic: bool,
+    before_write: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let segments = read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
-    render_artifacts_with_segments(session, manifest, diarize_mic, segments)
+    render_artifacts_with_segments_and_hook(session, manifest, diarize_mic, segments, before_write)
 }
 
 fn render_artifacts_with_segments(
@@ -707,6 +968,16 @@ fn render_artifacts_with_segments(
     manifest: &Manifest,
     diarize_mic: bool,
     segments: Vec<SpeakerSegment>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    render_artifacts_with_segments_and_hook(session, manifest, diarize_mic, segments, || {})
+}
+
+fn render_artifacts_with_segments_and_hook(
+    session: &Session,
+    manifest: &Manifest,
+    diarize_mic: bool,
+    segments: Vec<SpeakerSegment>,
+    before_write: impl FnOnce(),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let merge_started = Instant::now();
     let words: Vec<TimedWord> = read_jsonl_artifact(&session.words_path(), "word input")?;
@@ -721,6 +992,7 @@ fn render_artifacts_with_segments(
         diarize_mic,
         DEFAULT_NEAREST_TOLERANCE_MS,
     );
+    before_write();
     jsonl::write_all_atomic(&session.transcript_path(), &utterances)?;
     write_transcript_text(&session.transcript_text_path(), &utterances)?;
     eprintln!(
@@ -1399,6 +1671,68 @@ mod tests {
     }
 
     #[test]
+    fn manual_assignment_rerenders_without_a_voice_model() {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-manual-assignment-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        jsonl::write_all_atomic(
+            &session.words_path(),
+            &[TimedWord {
+                source: AudioSource::System,
+                start_ms: 10,
+                end_ms: 20,
+                text: "hello".into(),
+            }],
+        )
+        .expect("write words");
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 30,
+                cluster: 7,
+            }],
+        )
+        .expect("write diarization");
+        write_json_atomic(
+            &session.speaker_assignments_path(),
+            &SpeakerAssignments {
+                format_version: SPEAKER_ASSIGNMENTS_FORMAT_VERSION,
+                provenance: SpeakerAssignmentProvenance {
+                    diarization_file: "diarization.jsonl".into(),
+                    diarization_sha256: models::sha256_file(&session.diarization_path())
+                        .expect("hash diarization"),
+                    embedding_model_sha256: None,
+                    speakers_database_sha256: None,
+                    speaker_threshold: 0.6,
+                },
+                assignments: vec![SpeakerAssignment {
+                    source: AudioSource::System,
+                    cluster: 7,
+                    best_candidate: None,
+                    score: None,
+                    speaker: None,
+                }],
+            },
+        )
+        .expect("write assignments");
+        let outcome = assign_speaker(stage_process_args(session.dir.clone()), "spk_7", "Carol")
+            .expect("assign speaker");
+        assert!(!outcome.learned);
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read transcript");
+        assert_eq!(transcript[0].speaker, "Carol");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn render_resolves_diarize_mic_policy_and_rejects_conflicts() {
         let root = std::env::temp_dir().join(format!(
             "singstone-render-policy-{}-{}",
@@ -1612,4 +1946,15 @@ mod tests {
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }
+}
+#[test]
+fn parses_assignable_transcript_speaker_ids() {
+    assert_eq!(parse_speaker_id("mic_3"), Some((AudioSource::Mic, 3)));
+    assert_eq!(parse_speaker_id("spk_42"), Some((AudioSource::System, 42)));
+    assert_eq!(parse_speaker_id("unknown"), None);
+    assert_eq!(
+        parse_speaker_id("speaker-2"),
+        Some((AudioSource::System, 2))
+    );
+    assert_eq!(parse_speaker_id("spk_nope"), None);
 }

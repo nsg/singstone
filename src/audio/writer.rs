@@ -6,7 +6,7 @@ use crate::types::{AudioSource, TimelineEvent, samples_to_ms};
 use crossbeam_queue::ArrayQueue;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,6 +17,7 @@ pub struct WriterHandle {
     pub samples: Arc<AtomicU64>,
     pub format_ok: Arc<AtomicBool>,
     pub error: Arc<Mutex<Option<String>>>,
+    pub level: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<io::Result<()>>>,
 }
@@ -32,6 +33,7 @@ impl WriterHandle {
         let samples = Arc::new(AtomicU64::new(0));
         let format_ok = Arc::new(AtomicBool::new(false));
         let error = Arc::new(Mutex::new(None));
+        let level = Arc::new(AtomicU32::new(0.0f32.to_bits()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let thread_queue = Arc::clone(&queue);
@@ -64,17 +66,19 @@ impl WriterHandle {
             samples,
             format_ok,
             error,
+            level,
             stop,
             join: Some(join),
         })
     }
 
-    pub fn capture_data(&self) -> CaptureData {
+    pub fn capture_data_with_level(&self, level: Arc<AtomicU32>) -> CaptureData {
         CaptureData::new(
             Arc::clone(&self.queue),
             Arc::clone(&self.dropped),
             Arc::clone(&self.format_ok),
             Arc::clone(&self.error),
+            level,
         )
     }
 

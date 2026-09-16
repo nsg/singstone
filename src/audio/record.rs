@@ -8,8 +8,10 @@ use pipewire as pw;
 use pw::properties::properties;
 use std::cell::RefCell;
 use std::io;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type StreamStats = (
@@ -23,6 +25,37 @@ type StreamStartup = (
 );
 
 pub fn run(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner(args, None, None).map(|_| ())
+}
+
+/// Lock-free capture health read by the GUI while PipeWire owns the RT path.
+#[derive(Clone, Default)]
+pub struct RecordingTelemetry {
+    pub mic_level: Arc<AtomicU32>,
+    pub system_level: Arc<AtomicU32>,
+    pub screenshots: Arc<AtomicU64>,
+    pub session_dir: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl RecordingTelemetry {
+    pub fn level(value: &AtomicU32) -> f32 {
+        f32::from_bits(value.load(Ordering::Relaxed)).clamp(0.0, 1.0)
+    }
+}
+
+pub fn run_with_telemetry(
+    args: RecordArgs,
+    stop: Arc<AtomicBool>,
+    telemetry: RecordingTelemetry,
+) -> Result<Session, Box<dyn std::error::Error>> {
+    run_inner(args, Some(stop), Some(telemetry))
+}
+
+fn run_inner(
+    args: RecordArgs,
+    stop: Option<Arc<AtomicBool>>,
+    telemetry: Option<RecordingTelemetry>,
+) -> Result<Session, Box<dyn std::error::Error>> {
     if args.mic == "none" && args.system == "none" {
         return Err("--mic and --system cannot both be `none`".into());
     }
@@ -34,6 +67,11 @@ pub fn run(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let local_time = local_now()?;
     let session = Session::create(args.output_dir.join(session_dir_name(&local_time)))?;
+    if let Some(telemetry) = &telemetry
+        && let Ok(mut path) = telemetry.session_dir.lock()
+    {
+        *path = Some(session.dir.clone());
+    }
     let mut manifest = Manifest {
         format_version: FORMAT_VERSION,
         state: SessionState::Recording,
@@ -85,13 +123,21 @@ pub fn run(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         name: "singstone-microphone",
         target: args.mic.clone(),
         capture_sink: false,
-        data: writer.capture_data(),
+        data: writer.capture_data_with_level(
+            telemetry
+                .as_ref()
+                .map_or_else(|| writer.level.clone(), |value| value.mic_level.clone()),
+        ),
     });
     let system_start = system_writer.as_ref().map(|writer| StreamStart {
         name: "singstone-system",
         target: args.system.clone(),
         capture_sink: true,
-        data: writer.capture_data(),
+        data: writer.capture_data_with_level(
+            telemetry
+                .as_ref()
+                .map_or_else(|| writer.level.clone(), |value| value.system_level.clone()),
+        ),
     });
     let connect_core = core.clone();
     let connect_mic_slot = Rc::clone(&mic_slot);
@@ -103,7 +149,16 @@ pub fn run(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let _ = connect_timer.update_timer(Some(Duration::from_millis(10)), None);
 
     let mut screenshot_watcher = match args.screenshots.as_deref() {
-        Some(path) => match WatcherHandle::start(path, &session, args.screenshot_ext, t0_ns) {
+        Some(path) => match WatcherHandle::start_with_counter(
+            path,
+            &session,
+            args.screenshot_ext,
+            t0_ns,
+            telemetry.as_ref().map_or_else(
+                || Arc::new(AtomicU64::new(0)),
+                |value| value.screenshots.clone(),
+            ),
+        ) {
             Ok(watcher) => Some(watcher),
             Err(error) => {
                 eprintln!("warning: screenshot watcher could not start: {error}");
@@ -138,6 +193,21 @@ pub fn run(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
         let _ = timer.update_timer(Some(Duration::from_secs_f64(seconds)), None);
+        timer
+    });
+    let stop_timer = stop.map(|stop| {
+        let loop_for_stop = mainloop.downgrade();
+        let timer = mainloop.loop_().add_timer(move |_| {
+            if stop.load(Ordering::Acquire)
+                && let Some(mainloop) = loop_for_stop.upgrade()
+            {
+                mainloop.quit();
+            }
+        });
+        let _ = timer.update_timer(
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(100)),
+        );
         timer
     });
 
@@ -201,6 +271,7 @@ pub fn run(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     if mic_writer.is_some() || system_writer.is_some() {
         mainloop.run();
     }
+    drop(stop_timer);
     drop(duration_timer);
     drop(status_timer);
     drop(health_timer);
@@ -257,7 +328,7 @@ pub fn run(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         finish_errors.push("all enabled streams failed or recorded zero samples".to_owned());
     }
     if finish_errors.is_empty() {
-        Ok(())
+        Ok(session)
     } else {
         Err(io::Error::other(finish_errors.join("; ")).into())
     }
@@ -303,6 +374,7 @@ fn start_stream(
                 start.data.dropped.clone(),
                 start.data.format_ok.clone(),
                 start.data.error.clone(),
+                start.data.level.clone(),
             ),
         )?;
         pw_helpers::connect(&stream)?;

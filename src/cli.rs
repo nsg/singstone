@@ -14,6 +14,8 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Launch the graphical application.
+    Gui,
     /// Download and verify the Snap's pinned model cache.
     #[command(hide = true)]
     ModelSetup,
@@ -110,6 +112,28 @@ pub struct ProcessArgs {
     /// Fix the number of speakers instead of estimating it.
     #[arg(long)]
     pub num_speakers: Option<u32>,
+}
+
+impl ProcessArgs {
+    pub fn for_session(session: PathBuf) -> Self {
+        Self {
+            session,
+            whisper_model: std::env::var_os("SINGSTONE_WHISPER_MODEL").map(PathBuf::from),
+            segmentation_model: std::env::var_os("SINGSTONE_SEGMENTATION_MODEL").map(PathBuf::from),
+            embedding_model: std::env::var_os("SINGSTONE_EMBEDDING_MODEL").map(PathBuf::from),
+            models_lock: std::env::var_os("SINGSTONE_MODELS_LOCK").map(PathBuf::from),
+            allow_unverified_models: false,
+            diarize_mic: false,
+            no_diarize: false,
+            skip_transcription: false,
+            language: "en".into(),
+            threads: None,
+            speakers_db: std::env::var_os("SINGSTONE_SPEAKERS_DB").map(PathBuf::from),
+            speaker_threshold: 0.6,
+            cluster_threshold: 1.0,
+            num_speakers: None,
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -289,5 +313,11 @@ mod tests {
     fn parses_internal_model_setup_command() {
         let setup = Cli::try_parse_from(["singstone", "model-setup"]).expect("parse setup");
         assert!(matches!(setup.command, Command::ModelSetup));
+    }
+
+    #[test]
+    fn parses_gui_command() {
+        let gui = Cli::try_parse_from(["singstone", "gui"]).expect("parse gui");
+        assert!(matches!(gui.command, Command::Gui));
     }
 }

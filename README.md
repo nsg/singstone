@@ -1,251 +1,153 @@
 <div align="center">
   <h1>singstone</h1>
-  <p>Local-only meeting recorder, transcriber and speaker diarizer for Linux and PipeWire.</p>
+  <p>Local meeting recording, transcription, and speaker diarization for Linux and PipeWire.</p>
 
-[![AI usage: mostly](https://nsg.github.io/aibadge/mostly.svg)](https://nsg.github.io/aibadge/#mostly)
+[![AI usage: vibe](https://nsg.github.io/aibadge/vibe.svg)](https://nsg.github.io/aibadge/#vibe)
 </div>
 
 ## About
 
-singstone records microphone and system audio on one meeting clock, optionally
-files screenshots, then builds a timestamped, speaker-attributed transcript.
-Capture, Whisper transcription, sherpa-onnx diarization, and voice recognition
-all run locally. The Snap gives network access only to a separate model setup
-service used for the initial download.
+Singstone records microphone and system audio on one clock, optionally collects
+screenshots, and produces a timestamped, speaker-attributed transcript. Recording
+and machine-learning inference run locally.
+
+The supported distribution is a strictly confined core24 Snap for AMD64 Linux.
+It contains the application and source-built native runtimes. Model
+weights download on first use and remain in a persistent per-user cache.
 
 ![Top-to-bottom overview of the Singstone workflow](docs/workflow-overview.svg)
 
 ## Features
 
-- Captures a microphone, a PipeWire sink monitor, or both as aligned 16 kHz mono
-  `f32le` audio.
-- Keeps filesystem work outside the real-time callback; fills gaps with silence
-  and logs capture problems.
-- Copies new screenshots into the session with meeting-relative timestamps.
-- Transcribes with whisper.cpp and diarizes with pyannote segmentation plus
-  speaker embeddings through sherpa-onnx.
-- Matches diarized clusters to enrolled voices; uncertain matches remain
-  anonymous.
-- Verifies model size, purpose, and SHA-256 before loading native parsers.
+- Records a microphone, a PipeWire sink monitor, or both as aligned 16 kHz audio.
+- Files screenshots against the same meeting clock.
+- Transcribes with Whisper and separates speakers with pyannote and TitaNet.
+- Recognizes enrolled voices while leaving uncertain matches anonymous.
+- Keeps recording and inference offline under Snap confinement.
+- Verifies every model's size, purpose, and SHA-256 before native code loads it.
 
 ## Quick start
 
-Download the `singstone-snap` artifact from a successful CI run, then install
-the unsigned build and connect its PipeWire interface:
+Requirements:
+
+- AMD64 Linux
+- snapd 2.68 or newer
+- PipeWire
+
+Download the `singstone-snap` artifact from a
+[successful CI run](https://github.com/nsg/singstone/actions/workflows/ci.yml),
+then install the unsigned development build:
 
 ```bash
+unzip singstone-snap.zip
 sudo snap install --dangerous ./singstone_0.1.0_amd64.snap
 sudo snap connect singstone:pipewire
 ```
 
-The first model-backed command downloads about 186 MiB of pinned Whisper,
-pyannote, and TitaNet data. The command starts the per-user setup service,
-shows percentage and byte progress, verifies every SHA-256 digest, and then
-continues automatically. The verified cache survives Snap updates. Commands
-such as `devices`, `record`, `render`, and `speakers` need no models and start
-immediately.
+The package is not currently published in the Snap Store. `--dangerous` tells
+snapd to accept the locally downloaded, unsigned artifact; strict confinement
+still applies.
 
-Use headphones when capturing both sources so remote speech does not leak into
-the microphone track.
+### Record and process a meeting
 
-Record a meeting, stop with Ctrl-C, then process the session:
+List the available PipeWire sources and sinks:
 
 ```bash
 singstone devices
-singstone record --mic default --system default \
-  --screenshots ~/Pictures/Screenshots --local-speaker "Me"
-singstone process session-20260914-103000
 ```
 
-The results are `SESSION/transcript.jsonl` for programs and
-`SESSION/transcript.txt` for people.
+Record microphone audio, system audio, and new screenshots. Stop with Ctrl-C:
 
-## Configuration
+```bash
+singstone record --mic default --system default \
+  --screenshots ~/Pictures/Screenshots \
+  --local-speaker "Me" \
+  --output-dir ~/Meetings
+```
 
-Model paths and the speaker database accept flags or environment variables:
+Process the created session directory:
 
-| Variable | Flag | Meaning |
+```bash
+singstone process ~/Meetings/session-20260914-103000
+```
+
+The first model-backed command downloads all three pinned models, about
+186 MiB in total. Singstone displays percentage and byte progress, blocks until
+the files pass verification, and then continues the command automatically:
+
+```text
+Downloading models [=========               ] 38% 71/186 MiB — whisper-base.en
+```
+
+Later commands reuse the cache. It survives Snap refreshes. The final outputs
+are `transcript.jsonl` for programs and `transcript.txt` for people.
+
+## Snap behavior
+
+| Component | Access | Purpose |
 |---|---|---|
-| `SINGSTONE_WHISPER_MODEL` | `--whisper-model` | whisper.cpp GGML model |
-| `SINGSTONE_SEGMENTATION_MODEL` | `--segmentation-model` | pyannote segmentation ONNX model |
-| `SINGSTONE_EMBEDDING_MODEL` | `--embedding-model` | sherpa-onnx speaker embedding model |
-| `SINGSTONE_MODELS_LOCK` | `--models-lock` | trusted model manifest; `$XDG_CONFIG_HOME/singstone/models.lock`, falling back to `~/.config/singstone/models.lock` |
-| `SINGSTONE_SPEAKERS_DB` | `--speakers-db` | enrolled speakers; `$XDG_DATA_HOME/singstone/speakers.json`, falling back to `~/.local/share/singstone/speakers.json` |
+| `singstone` | `home`, `pipewire`; no network | Recording, processing, and transcript output |
+| `model-setup` | outbound network only | On-demand, per-user download of pinned models |
 
-The Snap points model variables at its persistent per-user cache, installs the
-trusted manifest read-only, and stores the speaker database persistently. Flags
-and environment variables remain useful for source builds or intentionally
-testing another model.
+Model weights are not bundled in the Snap. The setup service downloads the
+exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the
+downloaded artifacts and final files, then publishes them atomically under
+`$SNAP_USER_COMMON/models`—normally `~/snap/singstone/common/models`.
 
-Model-backed commands reject models whose purpose, size, and SHA-256 do not
-match `models.lock`. A missing lock file is also an error. Use
-`--allow-unverified-models` only when intentionally testing an unlisted model.
-Add an entry to the configured copy with
-`scripts/models-lock-add.sh FILE "${XDG_CONFIG_HOME:-$HOME/.config}/singstone/models.lock"`,
-then review and complete its metadata before use.
+`devices`, `record`, `render`, and `speakers` never start the download service.
+`process`, `transcribe`, `diarize`, `recognize`, and `enroll` wait for setup
+when they use a missing default Snap model. Interrupted downloads resume on the
+next attempt.
 
-## CLI
+If setup fails, correct the network problem and rerun the original command. For
+diagnostics:
+
+```bash
+snap connections singstone
+snap services singstone
+snap logs -n=100 singstone.model-setup
+```
+
+## Commands
 
 | Command | Purpose |
 |---|---|
 | `devices` | List selectable PipeWire sources and sinks |
-| `record` | Capture audio and optional screenshots into a new session |
-| `process` | Run all configured offline processing stages |
+| `record` | Capture audio and optional screenshots into a session |
+| `process` | Run the complete processing pipeline |
 | `transcribe` | Produce word-level text and timestamps |
 | `diarize` | Produce anonymous speaker intervals |
 | `recognize` | Match speaker clusters to enrolled voices |
-| `render` | Build final transcript files from intermediate artifacts |
+| `render` | Build transcripts from persistent intermediate artifacts |
 | `enroll` | Add voice samples to the speaker database |
 | `speakers` | List enrolled speakers |
 
-Run `singstone COMMAND --help` for every flag. Device arguments accept
-`default`, `none`, a PipeWire node ID, or a node name printed by `devices`.
-System audio uses the selected sink's monitor.
+Run `singstone COMMAND --help` for command-specific flags. Use `process` for the
+normal path; use the split processing commands when tuning or debugging one
+stage without repeating the others.
 
-### Recording
+## Build the Snap
 
-![Top-to-bottom diagram of the Singstone recording stage](docs/recording-stage.svg)
-
-`record` creates a private session and a common monotonic start time. PipeWire
-callbacks copy samples and timing into bounded queues; writer threads align and
-append each audio track. Confirmed gaps and dropped blocks become silence so the
-tracks stay synchronized, with every correction logged in `*.timeline.jsonl`.
-The optional inotify watcher copies completed screenshots on the same clock.
-
-Stop with Ctrl-C, SIGTERM, or `--duration`. One failed source does not stop a
-healthy source. See [Recording](docs/recording.md) for timing, failure handling,
-screenshot behavior, and the complete artifact contract.
-
-### Processing
-
-![Top-to-bottom diagram of the Singstone processing pipeline](docs/processing-pipeline.svg)
-
-Use `process` for the normal one-command path. Use the split stages to inspect an
-intermediate artifact or tune one model without repeating unrelated work:
-
-```bash
-singstone transcribe SESSION --whisper-model /path/to/whisper.bin
-singstone diarize SESSION --segmentation-model /path/to/segmentation.onnx \
-  --embedding-model /path/to/embedding.onnx
-singstone recognize SESSION --embedding-model /path/to/embedding.onnx \
-  --speakers-db /path/to/speakers.json
-singstone render SESSION
-```
-
-| Stage | Contract |
-|---|---|
-| `transcribe` | Enabled audio → energy VAD → Whisper → `words.jsonl` + metadata |
-| `diarize` | System audio and optional mic → pyannote segmentation, embeddings, clustering → `diarization.jsonl` + metadata |
-| `recognize` | Diarization, source audio, and matching model/database → cosine comparison → `speaker-assignments.json` |
-| `render` | Words, diarization, and optional current assignments → `transcript.jsonl` and `transcript.txt`; no model |
-
-`--cluster-threshold` controls cluster merging; lower values usually produce
-more speakers. `--speaker-threshold` controls how confident a voice match must
-be. The microphone uses `--local-speaker` unless `--diarize-mic` is enabled.
-
-| Problem | Rerun |
-|---|---|
-| Incorrect words or language | `transcribe`, `render` |
-| Incorrect speaker boundaries or count | `diarize`, `recognize`, `render` |
-| Correct clusters but incorrect names | `recognize`, `render` |
-| Manually edited words | `render` |
-| Several people share the microphone | `diarize --diarize-mic`, `recognize`, `render` |
-
-Keep these boundaries in mind:
-
-- Stop recording before processing. `transcribe` and `diarize` may run in
-  parallel; same-stage writers and downstream/upstream overlap are unsupported.
-- Standalone stages preserve the previous output when a required input fails.
-  `process` may skip missing enabled audio and recover from diarization or
-  recognition failures, so a partial run can replace tuned artifacts.
-- Metadata hashes warn when audio or intermediate files change. If assignments
-  refer to different diarization, `render` discards all stored names.
-- Enrollment samples must be at least two seconds of 16 kHz mono WAV or raw
-  `f32le`. Recognition requires the enrolled model's exact SHA-256 and embedding
-  dimension.
-
-See [Processing stages](docs/processing.md) for the VAD and chunking algorithm,
-model roles, clustering and recognition details, artifact schemas, provenance,
-and render rules.
-
-### Session artifacts
-
-| Path | Purpose |
-|---|---|
-| `manifest.json` | Session state, clock, format, sources, and local speaker |
-| `audio/*.f32le` | Meeting-aligned raw audio |
-| `audio/*.timeline.jsonl` | Capture timing and error diagnostics |
-| `screenshots/`, `screenshots.jsonl` | Timestamped screenshot copies and index |
-| `words.jsonl`, `words.meta.json` | Timed transcription and provenance |
-| `diarization.jsonl`, `diarization.meta.json` | Speaker intervals and provenance |
-| `speaker-assignments.json` | Optional recognized names and provenance |
-| `transcript.jsonl`, `transcript.txt` | Final machine-readable and text transcripts |
-
-All meeting-relative timestamps are milliseconds from the meeting start. With
-ffmpeg installed, convert raw audio when another tool needs WAV:
-
-```bash
-ffmpeg -f f32le -ar 16000 -ac 1 -i SESSION/audio/system.f32le system.wav
-```
-
-## Snap package
-
-[`snap/snapcraft.yaml`](snap/snapcraft.yaml) is the complete distribution
-recipe. It builds each native component from reviewed source instead of
-fetching opaque shared libraries:
-
-| Part | Pinned input | Packaged output |
-|---|---|---|
-| ONNX Runtime | upstream commit `33ca962…` (`v1.28.2`) | CPU `libonnxruntime.so` |
-| sherpa-onnx | upstream commit `11afbd0…` (`v1.13.8`) | `libsherpa-onnx-c-api.so`, linked to the source-built ONNX Runtime |
-| Singstone | this checkout plus `Cargo.lock`, Rust 1.98.1 | release executable and whisper.cpp compiled by `whisper-rs` |
-| Model setup | immutable URLs and SHA-256 checksums | trusted `models.lock`; weights enter the per-user cache on first use |
-
-Build on Ubuntu 24.04 x86-64 in Snapcraft's isolated LXD environment:
+[`snap/snapcraft.yaml`](snap/snapcraft.yaml) is the complete build recipe. It
+builds ONNX Runtime and sherpa-onnx from pinned upstream commits and builds
+Singstone with its locked Rust dependencies. The package contains the trusted
+model manifest and notices, but not the model weights.
 
 ```bash
 sudo snap install snapcraft --classic
 snapcraft pack --use-lxd
 ```
 
-The finished Snap uses `strict` confinement. The main `singstone` app has
-`home` and `pipewire`, but no network interface. A disabled per-user setup
-service has outbound `network` access and nothing else. A model-backed command
-starts that service only when its cache is incomplete, waits with a progress
-bar, and resumes after verification. Snapcraft also uses network access while
-building the package from pinned sources.
-
-## Development
-
-The Snap is the supported complete build. For a direct Cargo workflow, first
-build ONNX Runtime 1.28.2 and sherpa-onnx 1.13.8 from source and put their shared
-libraries in `target/native/lib`. The checked-in Cargo configuration deliberately
-sets that local path so `sherpa-onnx-sys` cannot silently download a prebuilt
-archive.
-
-```bash
-sudo apt install pipewire pipewire-bin wireplumber pipewire-audio-client-libraries
-cargo install --locked cargo-audit
-
-cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
-source scripts/pw-headless.sh
-SINGSTONE_PW_TEST=1 cargo test --test record_pipewire -- --test-threads=1
-SINGSTONE_TEST_MODELS=/path/to/models SINGSTONE_TEST_SAMPLES=/path/to/samples \
-  cargo test --test process_ami
-cargo audit
-```
-
-Optional Cargo features `vulkan`, `intel-sycl`, and `openblas` accelerate
-whisper.cpp. Diarization runs on CPU. CI builds the complete Snap from the
-pinned sources, runs the Rust tests during that build, reviews the package,
-checks its interfaces, installs it, and runs CLI smoke tests.
+CI builds the same Snap, runs release Clippy and tests against the packaged
+native libraries, checks the per-app interfaces, confirms that model weights
+are absent, installs the result, and runs CLI smoke tests.
 
 ## Documentation
 
 - [Recording internals](docs/recording.md)
 - [Processing stages](docs/processing.md)
-- [Dependency review and supply-chain policy](docs/dependencies.md)
-- [Original design specification](docs/design-spec.md)
+- [Dependency and supply-chain review](docs/dependencies.md)
+- [Design specification](docs/design-spec.md)
 
 ## License
 

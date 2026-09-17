@@ -64,6 +64,47 @@ fn run_inner(
     {
         return Err("--duration must be a finite positive number".into());
     }
+    let duration = args
+        .duration
+        .map(Duration::try_from_secs_f64)
+        .transpose()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("--duration is outside the supported range: {error}"),
+            )
+        })?;
+    if duration.is_some_and(|duration| duration.is_zero()) {
+        return Err("--duration is too small to represent".into());
+    }
+
+    pw::init();
+    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
+    let signal_handlers = if stop.is_none() {
+        let loop_for_int = mainloop.downgrade();
+        let sig_int = mainloop
+            .loop_()
+            .add_signal_local(pw::loop_::Signal::INT, move || {
+                if let Some(mainloop) = loop_for_int.upgrade() {
+                    mainloop.quit();
+                }
+            });
+        let loop_for_term = mainloop.downgrade();
+        let sig_term = mainloop
+            .loop_()
+            .add_signal_local(pw::loop_::Signal::TERM, move || {
+                if let Some(mainloop) = loop_for_term.upgrade() {
+                    mainloop.quit();
+                }
+            });
+        Some((sig_int, sig_term))
+    } else {
+        None
+    };
+    let context = pw::context::ContextRc::new(&mainloop, None)?;
+    let core = context.connect_rc(Some(properties! {
+        *pw::keys::REMOTE_NAME => "pipewire-0"
+    }))?;
 
     let local_time = local_now()?;
     let session = Session::create(args.output_dir.join(session_dir_name(&local_time)))?;
@@ -90,12 +131,6 @@ fn run_inner(
     session.write_manifest(&manifest)?;
     drop(JsonlAppender::create(&session.screenshots_index_path())?);
 
-    pw::init();
-    let mainloop = pw::main_loop::MainLoopRc::new(None)?;
-    let context = pw::context::ContextRc::new(&mainloop, None)?;
-    let core = context.connect_rc(Some(properties! {
-        *pw::keys::REMOTE_NAME => "pipewire-0"
-    }))?;
     let t0_ns = pw_helpers::monotonic_ns();
 
     let mut mic_writer = if manifest.mic.enabled {
@@ -168,31 +203,14 @@ fn run_inner(
         None => None,
     };
 
-    let loop_for_int = mainloop.downgrade();
-    let _sig_int = mainloop
-        .loop_()
-        .add_signal_local(pw::loop_::Signal::INT, move || {
-            if let Some(mainloop) = loop_for_int.upgrade() {
-                mainloop.quit();
-            }
-        });
-    let loop_for_term = mainloop.downgrade();
-    let _sig_term = mainloop
-        .loop_()
-        .add_signal_local(pw::loop_::Signal::TERM, move || {
-            if let Some(mainloop) = loop_for_term.upgrade() {
-                mainloop.quit();
-            }
-        });
-
-    let duration_timer = args.duration.map(|seconds| {
+    let duration_timer = duration.map(|duration| {
         let loop_for_timer = mainloop.downgrade();
         let timer = mainloop.loop_().add_timer(move |_| {
             if let Some(mainloop) = loop_for_timer.upgrade() {
                 mainloop.quit();
             }
         });
-        let _ = timer.update_timer(Some(Duration::from_secs_f64(seconds)), None);
+        let _ = timer.update_timer(Some(duration), None);
         timer
     });
     let stop_timer = stop.map(|stop| {
@@ -271,6 +289,7 @@ fn run_inner(
     if mic_writer.is_some() || system_writer.is_some() {
         mainloop.run();
     }
+    drop(signal_handlers);
     drop(stop_timer);
     drop(duration_timer);
     drop(status_timer);
@@ -463,6 +482,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::os::unix::fs::DirBuilderExt;
+    use std::thread;
 
     #[test]
     fn manifest_round_trip() {
@@ -488,5 +508,79 @@ mod tests {
         session.write_manifest(&manifest).expect("write manifest");
         assert_eq!(session.read_manifest().expect("read manifest"), manifest);
         fs::remove_dir_all(root).expect("remove temp session");
+    }
+
+    #[test]
+    fn gui_worker_stops_without_registering_process_signals() {
+        if std::env::var_os("SINGSTONE_PW_TEST").is_none() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "singstone-gui-record-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("current time")
+                .as_nanos()
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .expect("create temp root");
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread_root = root.clone();
+        let worker = thread::spawn(move || {
+            run_with_telemetry(
+                RecordArgs {
+                    mic: "none".into(),
+                    system: "test-sink".into(),
+                    screenshots: None,
+                    screenshot_ext: vec!["png".into()],
+                    local_speaker: "Me".into(),
+                    output_dir: thread_root,
+                    duration: None,
+                },
+                thread_stop,
+                RecordingTelemetry::default(),
+            )
+            .map(|session| session.dir)
+            .map_err(|error| error.to_string())
+        });
+        thread::sleep(Duration::from_millis(500));
+        stop.store(true, Ordering::Release);
+        let path = worker
+            .join()
+            .expect("recording worker must not panic")
+            .expect("recording must stop cleanly");
+        let session = Session::open(path).expect("open recorded session");
+        assert_eq!(
+            session.read_manifest().expect("read manifest").state,
+            SessionState::Stopped
+        );
+        fs::remove_dir_all(root).expect("remove temp session");
+    }
+
+    #[test]
+    fn rejects_unrepresentable_durations_before_creating_a_session() {
+        for duration in [1e99, 1e-300] {
+            let root = std::env::temp_dir().join(format!(
+                "singstone-duration-{}-{duration}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            let error = run(RecordArgs {
+                mic: "default".into(),
+                system: "none".into(),
+                screenshots: None,
+                screenshot_ext: vec!["png".into()],
+                local_speaker: "Me".into(),
+                output_dir: root.clone(),
+                duration: Some(duration),
+            })
+            .expect_err("duration must be rejected");
+            assert!(error.to_string().contains("--duration"));
+            assert!(!root.exists());
+        }
     }
 }

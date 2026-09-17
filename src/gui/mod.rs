@@ -137,6 +137,7 @@ fn build_window(app: &adw::Application) {
     let recording_page = build_recording_page(&config.borrow());
     let speakers_page = build_speakers_page(&window);
     let settings_page = build_settings_page(&config.borrow());
+    let close_when_recording_stops = Rc::new(Cell::new(false));
 
     let content_toolbar = adw::ToolbarView::new();
     let live_bar = build_live_bar();
@@ -168,6 +169,13 @@ fn build_window(app: &adw::Application) {
         "Settings",
         "preferences-system-symbolic",
     );
+    let speakers_for_switch = speakers_page.clone();
+    let window_for_speakers = window.clone();
+    stack.connect_visible_child_name_notify(move |stack| {
+        if stack.visible_child_name().as_deref() == Some("speakers") {
+            speakers_for_switch.refresh(&window_for_speakers);
+        }
+    });
     stack.set_visible_child_name("session");
     content_toolbar.set_content(Some(&stack));
     let switcher = adw::ViewSwitcherBar::new();
@@ -205,6 +213,7 @@ fn build_window(app: &adw::Application) {
         &search,
         &detail,
         &stack,
+        &close_when_recording_stops,
     );
     wire_processing(
         &window,
@@ -229,9 +238,12 @@ fn build_window(app: &adw::Application) {
     about.connect_clicked(move |_| show_about(&window_for_about));
 
     let stop_on_close = recording_page.job.clone();
+    let close_after_stop = close_when_recording_stops.clone();
     window.connect_close_request(move |_| {
         if let Some(job) = stop_on_close.borrow().as_ref() {
             job.stop.store(true, Ordering::Release);
+            close_after_stop.set(true);
+            return glib::Propagation::Stop;
         }
         glib::Propagation::Proceed
     });
@@ -987,12 +999,12 @@ fn wire_settings(
         chooser.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
             let Ok(folder) = result else { return };
             let Some(path) = folder.path() else { return };
-            let save = {
-                let mut config = config.borrow_mut();
-                config.meetings_dir = path.clone();
-                config.save()
+            let updated = {
+                let mut updated = config.borrow().clone();
+                updated.meetings_dir = path.clone();
+                updated
             };
-            if let Err(error) = save {
+            if let Err(error) = updated.save() {
                 show_error(
                     &parent_for_result,
                     "Could not save settings",
@@ -1000,6 +1012,7 @@ fn wire_settings(
                 );
                 return;
             }
+            *config.borrow_mut() = updated;
             row.set_subtitle(&path.display().to_string());
             hint.set_label(&format!("Creates a new session in {}", path.display()));
             populate_sessions(&sessions, &paths, &path, &search.text());
@@ -1027,12 +1040,12 @@ fn wire_settings(
         chooser.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
             let Ok(folder) = result else { return };
             let Some(path) = folder.path() else { return };
-            let save = {
-                let mut config = config.borrow_mut();
-                config.screenshots_dir = path.clone();
-                config.save()
+            let updated = {
+                let mut updated = config.borrow().clone();
+                updated.screenshots_dir = path.clone();
+                updated
             };
-            if let Err(error) = save {
+            if let Err(error) = updated.save() {
                 show_error(
                     &parent_for_result,
                     "Could not save settings",
@@ -1040,6 +1053,7 @@ fn wire_settings(
                 );
                 return;
             }
+            *config.borrow_mut() = updated;
             row.set_subtitle(&path.display().to_string());
             recording_shots.set_subtitle(&path.display().to_string());
         });
@@ -1105,6 +1119,7 @@ fn wire_recording(
     search: &gtk::SearchEntry,
     detail: &SessionDetail,
     stack: &adw::ViewStack,
+    close_when_stopped: &Rc<Cell<bool>>,
 ) {
     let stop_for_button = page.job.clone();
     let record_button_for_stop = page.button.clone();
@@ -1229,6 +1244,7 @@ fn wire_recording(
     let search_for_poll = search.clone();
     let detail_for_poll = detail.clone();
     let stack_for_poll = stack.clone();
+    let close_when_stopped = close_when_stopped.clone();
     glib::timeout_add_local(Duration::from_millis(200), move || {
         let completed = {
             let jobs = job_for_poll.borrow();
@@ -1254,6 +1270,10 @@ fn wire_recording(
             return glib::ControlFlow::Continue;
         };
         job_for_poll.borrow_mut().take();
+        if close_when_stopped.replace(false) {
+            window_for_poll.close();
+            return glib::ControlFlow::Break;
+        }
         button_for_poll.set_label("Start recording");
         button_for_poll.remove_css_class("destructive-action");
         button_for_poll.add_css_class("suggested-action");
@@ -1371,7 +1391,9 @@ fn wire_processing(
         let selected_for_poll = selected.clone();
         glib::timeout_add_local(Duration::from_millis(150), move || {
             let stage = *progress.lock().expect("processing progress mutex");
-            label.set_label(stage.label());
+            if !cancelled.load(Ordering::Acquire) {
+                label.set_label(stage.label());
+            }
             bar.set_fraction(stage.fraction());
             update_processing_stages(&stages, stage);
             let completed = result.lock().expect("processing result mutex").take();
@@ -1383,7 +1405,8 @@ fn wire_processing(
             processing_dialog.force_close();
             match result {
                 Ok(()) => {
-                    if let Some(path) = selected_for_poll.borrow().clone() {
+                    let selected_path = selected_for_poll.borrow().clone();
+                    if let Some(path) = selected_path {
                         let _ = detail_for_poll.load(&path);
                     }
                     populate_sessions(
@@ -1847,7 +1870,8 @@ fn start_assignment(detail: &SessionDetail, speaker_id: String, name: String) {
         progress.close();
         match result {
             Ok(outcome) => {
-                if let Some(path) = detail.selected.borrow().clone() {
+                let selected_path = detail.selected.borrow().clone();
+                if let Some(path) = selected_path {
                     let _ = detail.load(&path);
                 }
                 if !outcome.learned {

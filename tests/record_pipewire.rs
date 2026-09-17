@@ -354,3 +354,29 @@ fn sigkill_leaves_recording_manifest_and_raw_files() {
     assert!(session.join("audio/mic.f32le").is_file());
     assert!(session.join("audio/system.f32le").is_file());
 }
+
+#[test]
+fn sigint_and_sigterm_stop_and_finalize_recordings() {
+    if !enabled() {
+        return;
+    }
+    for signal in ["INT", "TERM"] {
+        let output = TempDir::new(&format!("signal-{signal}")).expect("create output dir");
+        let mut record = recorder(
+            output.path(),
+            &["--mic", "none", "--system", "test-sink", "--duration", "30"],
+        )
+        .expect("start recorder");
+        let session = wait_for_session(output.path());
+        thread::sleep(Duration::from_secs(1));
+        assert!(
+            Command::new("kill")
+                .args([format!("-{signal}"), record.id().to_string()])
+                .status()
+                .expect("send signal")
+                .success()
+        );
+        assert!(record.wait().expect("wait for recorder").success());
+        assert_eq!(manifest(&session)["state"], "stopped");
+    }
+}

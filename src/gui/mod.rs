@@ -282,6 +282,7 @@ fn build_sidebar(search: &gtk::SearchEntry, list: &gtk::ListBox) -> gtk::Box {
 struct RecordingPage {
     root: gtk::Box,
     mic: adw::ComboRow,
+    diarize_mic: adw::SwitchRow,
     system: adw::ComboRow,
     screenshots: adw::SwitchRow,
     name: adw::EntryRow,
@@ -313,7 +314,7 @@ fn build_recording_page(config: &GuiConfig) -> RecordingPage {
         .build();
     let mic = adw::ComboRow::builder()
         .title("Microphone")
-        .subtitle("Your voice — labeled with your name")
+        .subtitle("Voices in the room")
         .build();
     mic.add_prefix(&gtk::Image::from_icon_name(
         "audio-input-microphone-symbolic",
@@ -327,11 +328,18 @@ fn build_recording_page(config: &GuiConfig) -> RecordingPage {
         "Default (WirePlumber)",
         "None",
     ])));
+    let diarize_mic = adw::SwitchRow::builder()
+        .title("Several people share the microphone")
+        .subtitle("Separate microphone speech by speaker during processing")
+        .active(config.diarize_mic)
+        .build();
+    diarize_mic.add_prefix(&gtk::Image::from_icon_name("system-users-symbolic"));
     system.set_model(Some(&gtk::StringList::new(&[
         "Default (WirePlumber)",
         "None",
     ])));
     audio.add(&mic);
+    audio.add(&diarize_mic);
     audio.add(&system);
     body.append(&audio);
 
@@ -347,7 +355,10 @@ fn build_recording_page(config: &GuiConfig) -> RecordingPage {
     screenshot_group.add(&screenshots);
     body.append(&screenshot_group);
 
-    let identity = adw::PreferencesGroup::builder().title("You").build();
+    let identity = adw::PreferencesGroup::builder()
+        .title("Speaker label")
+        .description("Used when microphone speaker separation is off")
+        .build();
     let name = adw::EntryRow::builder()
         .title("Your name in the transcript")
         .text(&config.local_speaker)
@@ -385,6 +396,7 @@ fn build_recording_page(config: &GuiConfig) -> RecordingPage {
     let page = RecordingPage {
         root,
         mic,
+        diarize_mic,
         system,
         screenshots,
         name,
@@ -1121,6 +1133,29 @@ fn wire_recording(
     stack: &adw::ViewStack,
     close_when_stopped: &Rc<Cell<bool>>,
 ) {
+    let updating_diarize_mic = Rc::new(Cell::new(false));
+    let updating_diarize_mic_for_notify = updating_diarize_mic.clone();
+    let config_for_diarize_mic = config.clone();
+    let window_for_diarize_mic = window.clone();
+    page.diarize_mic.connect_active_notify(move |row| {
+        if updating_diarize_mic_for_notify.replace(true) {
+            return;
+        }
+        let mut updated = config_for_diarize_mic.borrow().clone();
+        updated.diarize_mic = row.is_active();
+        if let Err(error) = updated.save() {
+            show_error(
+                &window_for_diarize_mic,
+                "Could not save settings",
+                &error.to_string(),
+            );
+            row.set_active(config_for_diarize_mic.borrow().diarize_mic);
+        } else {
+            *config_for_diarize_mic.borrow_mut() = updated;
+        }
+        updating_diarize_mic_for_notify.set(false);
+    });
+
     let stop_for_button = page.job.clone();
     let record_button_for_stop = page.button.clone();
     live.stop.connect_clicked(move |_| {
@@ -1133,6 +1168,7 @@ fn wire_recording(
     let window_for_start = window.clone();
     let config_for_start = config.clone();
     let mic = page.mic.clone();
+    let diarize_mic = page.diarize_mic.clone();
     let system = page.system.clone();
     let screenshots = page.screenshots.clone();
     let name = page.name.clone();
@@ -1214,6 +1250,7 @@ fn wire_recording(
         button.add_css_class("destructive-action");
         hint.set_label("Recording… press Stop when the meeting is finished");
         mic.set_sensitive(false);
+        diarize_mic.set_sensitive(false);
         system.set_sensitive(false);
         screenshots.set_sensitive(false);
         name.set_sensitive(false);
@@ -1231,6 +1268,7 @@ fn wire_recording(
     let button_for_poll = page.button.clone();
     let hint_for_poll = page.hint.clone();
     let mic_for_poll = page.mic.clone();
+    let diarize_mic_for_poll = page.diarize_mic.clone();
     let system_for_poll = page.system.clone();
     let shots_for_poll = page.screenshots.clone();
     let name_for_poll = page.name.clone();
@@ -1282,6 +1320,7 @@ fn wire_recording(
             config_for_poll.borrow().meetings_dir.display()
         ));
         mic_for_poll.set_sensitive(true);
+        diarize_mic_for_poll.set_sensitive(true);
         system_for_poll.set_sensitive(true);
         shots_for_poll.set_sensitive(true);
         name_for_poll.set_sensitive(true);
@@ -1347,9 +1386,11 @@ fn wire_processing(
         let thread_progress = progress.clone();
         let thread_result = result.clone();
         let thread_cancelled = cancelled.clone();
+        let diarize_mic = config_for_done.borrow().diarize_mic;
         std::thread::spawn(move || {
             let value = (|| -> Result<(), String> {
-                let args = ProcessArgs::for_session(session_path);
+                let mut args = ProcessArgs::for_session(session_path);
+                args.diarize_mic = diarize_mic;
                 let command = Command::Process(args);
                 model_setup::ensure_available(&command).map_err(|error| error.to_string())?;
                 let Command::Process(args) = command else {

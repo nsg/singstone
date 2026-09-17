@@ -12,6 +12,7 @@ pub struct GuiConfig {
     pub meetings_dir: PathBuf,
     pub screenshots_dir: PathBuf,
     pub local_speaker: String,
+    pub diarize_mic: bool,
 }
 
 impl Default for GuiConfig {
@@ -27,6 +28,7 @@ impl Default for GuiConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("Pictures/Screenshots")),
             local_speaker: "Me".into(),
+            diarize_mic: true,
         }
     }
 }
@@ -79,6 +81,22 @@ mod tests {
 
     #[test]
     fn defaults_have_a_nonempty_identity() {
-        assert!(!GuiConfig::default().local_speaker.trim().is_empty());
+        let config = GuiConfig::default();
+        assert!(!config.local_speaker.trim().is_empty());
+        assert!(config.diarize_mic);
+    }
+
+    #[test]
+    fn legacy_config_enables_microphone_diarization() {
+        let config: GuiConfig = serde_json::from_str(
+            r#"{
+                "meetings_dir": "/meetings",
+                "screenshots_dir": "/screenshots",
+                "local_speaker": "Alice"
+            }"#,
+        )
+        .expect("deserialize legacy GUI config");
+
+        assert!(config.diarize_mic);
     }
 }

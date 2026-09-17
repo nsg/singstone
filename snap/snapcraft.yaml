@@ -54,6 +54,7 @@ apps:
   model-download:
     command: usr/lib/singstone/model-download-service
     command-chain:
+      - snap/command-chain/gpu-2404-wrapper
       - snap/command-chain/desktop-launch
     daemon: simple
     daemon-scope: user

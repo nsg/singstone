@@ -143,7 +143,8 @@ jobs:
             forbidden = plugs & %w[network network-bind]
             abort "runtime network plug declared: #{forbidden.join(", ")}" unless forbidden.empty?
             abort "download helper is not a simple user service" unless setup["daemon"] == "simple" && setup["daemon-scope"] == "user"
-            abort "download helper lacks the GNOME runtime loader" unless setup["command-chain"] == ["snap/command-chain/desktop-launch"]
+            expected_chain = ["snap/command-chain/gpu-2404-wrapper", "snap/command-chain/desktop-launch"]
+            abort "download helper lacks the GNOME runtime loaders" unless setup["command-chain"] == expected_chain
             abort "download helper socket is disabled" if setup["install-mode"] == "disable"
             socket = setup.dig("sockets", "activation") || abort("download helper activation socket missing")
             abort "download helper socket has the wrong path" unless socket["listen-stream"] == "$SNAP_USER_COMMON/model-setup.sock"

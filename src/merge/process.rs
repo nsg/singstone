@@ -438,7 +438,7 @@ fn stage_process_args(session: PathBuf) -> ProcessArgs {
         diarize_mic: false,
         no_diarize: false,
         skip_transcription: false,
-        language: "en".into(),
+        language: "auto".into(),
         threads: None,
         speakers_db: None,
         speaker_threshold: 0.6,

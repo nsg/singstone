@@ -103,11 +103,11 @@ singstone process ~/Meetings/session-20260914-103000
 ```
 
 The first model-backed command downloads all three pinned models, about
-186 MiB in total. Singstone displays percentage and byte progress, blocks until
+1.6 GiB in total. Singstone displays percentage and byte progress, blocks until
 the files pass verification, and then continues the command automatically:
 
 ```text
-Downloading models [=========               ] 38% 71/186 MiB — whisper-base.en
+Downloading models [=                       ] 4% 71/1593 MiB — whisper-large-v3-turbo
 ```
 
 Later commands reuse the cache. It survives Snap refreshes. The final outputs

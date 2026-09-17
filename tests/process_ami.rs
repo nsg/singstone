@@ -225,7 +225,7 @@ fn run_process(session: &Path, models: &Path, database: Option<&Path>) -> io::Re
         .arg("--embedding-model")
         .arg(models.join("nemo_en_titanet_small.onnx"))
         .arg("--allow-unverified-models")
-        .args(["--threads", "4"]);
+        .args(["--language", "en", "--threads", "4"]);
     if let Some(database) = database {
         command.arg("--speakers-db").arg(database);
     } else {

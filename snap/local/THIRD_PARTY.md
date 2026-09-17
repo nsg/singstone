@@ -3,7 +3,7 @@
 The Snap's model setup service downloads and verifies these checksum-pinned
 files. The Snap itself contains their trusted manifest and notices:
 
-- `ggml-base.en.bin`, from
+- `ggml-large-v3-turbo.bin`, from
   [whisper.cpp](https://github.com/ggml-org/whisper.cpp), MIT.
 - `segmentation.onnx`, the
   [pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0)

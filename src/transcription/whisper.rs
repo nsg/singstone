@@ -42,8 +42,8 @@ impl WhisperTranscriber {
     fn params<'a>(language: &'a str, threads: usize) -> FullParams<'a, 'static> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(threads.try_into().unwrap_or(i32::MAX));
+        // A null language detects and then transcribes; detect_language stops after detection.
         params.set_language((language != "auto").then_some(language));
-        params.set_detect_language(language == "auto");
         params.set_token_timestamps(true);
         params.set_print_special(false);
         params.set_print_progress(false);

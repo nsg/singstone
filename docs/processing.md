@@ -31,22 +31,21 @@ runs.
 
 ```bash
 singstone transcribe SESSION \
-    --whisper-model ~/.local/share/singstone/models/ggml-base.en.bin \
-    --language en --threads 8
+    --whisper-model ~/.local/share/singstone/models/ggml-large-v3-turbo.bin \
+    --language auto --threads 8
 ```
 
 **Input:** `manifest.json`, every enabled `audio/*.f32le` track, and a
 whisper.cpp GGML model. The audio must be 16 kHz mono float PCM, as produced by
 `record`.
 
-**Model:** Whisper, through `whisper-rs`. The documented example uses
-`ggml-base.en.bin`, but any compatible, correctly locked whisper.cpp GGML model
-can be supplied. `--language auto` enables language detection; otherwise the
-given language code is passed to Whisper. The same loaded model and inference
-state are reused for the microphone and system tracks.
-Use a multilingual Whisper model for non-English languages or automatic
-language detection; the example `base.en` model is English-only. Each enabled
-raw track is read into memory before its transcription pass.
+**Model:** Whisper, through `whisper-rs`. The packaged
+`ggml-large-v3-turbo.bin` model is multilingual, and language detection is
+enabled by default. A specific Whisper language code can be supplied with
+`--language`; any compatible, correctly locked whisper.cpp GGML model can also
+be supplied. The same loaded model and inference state are reused for the
+microphone and system tracks. Each enabled raw track is read into memory before
+its transcription pass.
 
 The stage performs these operations:
 

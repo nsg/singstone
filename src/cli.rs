@@ -97,7 +97,7 @@ pub struct ProcessArgs {
     #[arg(long)]
     pub skip_transcription: bool,
     /// Whisper language code (`auto` to detect).
-    #[arg(long, default_value = "en")]
+    #[arg(long, default_value = "auto")]
     pub language: String,
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]
@@ -129,7 +129,7 @@ impl ProcessArgs {
             diarize_mic: false,
             no_diarize: false,
             skip_transcription: false,
-            language: "en".into(),
+            language: "auto".into(),
             threads: None,
             speakers_db: std::env::var_os("SINGSTONE_SPEAKERS_DB").map(PathBuf::from),
             speaker_threshold: 0.6,
@@ -153,7 +153,7 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub allow_unverified_models: bool,
     /// Whisper language code (`auto` to detect).
-    #[arg(long, default_value = "en")]
+    #[arg(long, default_value = "auto")]
     pub language: String,
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]
@@ -260,6 +260,17 @@ mod tests {
 
     #[test]
     fn parses_each_processing_stage_command() {
+        assert_eq!(
+            ProcessArgs::for_session(PathBuf::from("session")).language,
+            "auto"
+        );
+        let process =
+            Cli::try_parse_from(["singstone", "process", "session"]).expect("parse process");
+        assert!(matches!(
+            process.command,
+            Command::Process(ProcessArgs { language, .. }) if language == "auto"
+        ));
+
         let transcribe = Cli::try_parse_from([
             "singstone",
             "transcribe",
@@ -268,7 +279,10 @@ mod tests {
             "whisper.bin",
         ])
         .expect("parse transcribe");
-        assert!(matches!(transcribe.command, Command::Transcribe(_)));
+        assert!(matches!(
+            transcribe.command,
+            Command::Transcribe(TranscribeArgs { language, .. }) if language == "auto"
+        ));
 
         let diarize = Cli::try_parse_from([
             "singstone",

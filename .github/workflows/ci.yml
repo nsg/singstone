@@ -188,7 +188,15 @@ jobs:
             sleep 0.1
           done
           test -S "$model_socket"
+          model_service_diagnostics() {
+            snap logs -n=100 singstone.model-download || true
+            systemctl --user status snap.singstone.model-download.service --no-pager || true
+            systemctl --user status snap.singstone.model-download.activation.socket --no-pager || true
+            journalctl --user -u snap.singstone.model-download.service --no-pager -n 100 || true
+          }
+          trap model_service_diagnostics ERR
           singstone model-setup-check
+          trap - ERR
           snap services --user singstone.model-download | grep -q 'socket-activated'
           test ! -e "$HOME/snap/singstone/common/models/.download-status.json"
 

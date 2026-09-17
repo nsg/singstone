@@ -2,7 +2,7 @@
 set -eu
 
 if [ "${LISTEN_PID:-}" != "$$" ] || [ "${LISTEN_FDS:-0}" != "1" ]; then
-    echo "model download service requires one activation socket" >&2
+    echo "model download service requires one activation socket (pid=$$, LISTEN_PID=${LISTEN_PID:-unset}, LISTEN_FDS=${LISTEN_FDS:-unset})" >&2
     exit 1
 fi
 

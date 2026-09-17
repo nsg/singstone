@@ -155,10 +155,47 @@ jobs:
 
       - name: Install and smoke test
         run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pipewire pipewire-bin wireplumber
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -o "$USER" -g "$(id -gn)" -m 700 "$runtime_dir"
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          source scripts/pw-headless.sh
+
           sudo snap set system experimental.user-daemons=true
           sudo snap install --dangerous ./*.snap
+          sudo snap connect singstone:pipewire
           singstone --version
           singstone speakers
+
+          devices=$(singstone devices)
+          grep -q 'test-sink' <<<"$devices"
+          grep -q 'test-mic' <<<"$devices"
+
+          sessions="$RUNNER_TEMP/singstone-sessions"
+          mkdir -p "$sessions"
+          singstone record \
+            --mic none \
+            --system test-sink \
+            --output-dir "$sessions" &
+          recorder_pid=$!
+          manifest=""
+          for _ in {1..100}; do
+            manifest=$(find "$sessions" -name manifest.json -print -quit)
+            [[ -n "$manifest" ]] && break
+            sleep 0.1
+          done
+          test -n "$manifest"
+          kill -TERM "$recorder_pid"
+          wait "$recorder_pid"
+
+          ruby -rjson -e '
+            manifest_path = ARGV.fetch(0)
+            manifest = JSON.parse(File.read(manifest_path))
+            abort "recording was not finalized" unless manifest.fetch("state") == "stopped"
+            audio = File.join(File.dirname(manifest_path), "audio/system.f32le")
+            abort "recording contains no audio frames" unless File.size?(audio)
+          ' "$manifest"
 
   release:
     name: Publish latest main build

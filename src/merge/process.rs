@@ -2,6 +2,7 @@ use crate::cli::{DiarizeArgs, ProcessArgs, RecognizeArgs, RenderArgs, Transcribe
 use crate::diarization::Diarizer;
 use crate::diarization::sherpa::SherpaDiarizer;
 use crate::format::jsonl;
+use crate::merge::leakage::{self, AudioEnvelopes};
 use crate::merge::utterances::{self, DEFAULT_NEAREST_TOLERANCE_MS};
 use crate::models;
 use crate::session::Session;
@@ -984,8 +985,21 @@ fn render_artifacts_with_segments_and_hook(
     warn_transcription_provenance(session);
     warn_diarization_provenance(session, diarize_mic);
     let recognized = read_speaker_assignments(session)?;
+    let audio = match AudioEnvelopes::read(
+        &session.audio_path(AudioSource::Mic),
+        &session.audio_path(AudioSource::System),
+    ) {
+        Ok(audio) => Some(audio),
+        Err(error) => {
+            eprintln!(
+                "warning: cannot compare microphone and system audio for leakage: {error}; using conservative text matching"
+            );
+            None
+        }
+    };
+    let leakage = leakage::suppress_leaked_mic_words(&words, audio.as_ref());
     let utterances = utterances::build_utterances(
-        &words,
+        &leakage.words,
         &segments,
         &recognized,
         &manifest.local_speaker,
@@ -993,11 +1007,19 @@ fn render_artifacts_with_segments_and_hook(
         DEFAULT_NEAREST_TOLERANCE_MS,
     );
     before_write();
+    jsonl::write_all_atomic(&session.leakage_suppressions_path(), &leakage.suppressions)?;
     jsonl::write_all_atomic(&session.transcript_path(), &utterances)?;
     write_transcript_text(&session.transcript_text_path(), &utterances)?;
+    let suppressed_words = leakage
+        .suppressions
+        .iter()
+        .map(|suppression| suppression.suppressed_words)
+        .sum::<usize>();
     eprintln!(
-        "merge: {} utterance(s) in {:.1} s",
+        "merge: {} utterance(s), suppressed {} leaked microphone word(s) in {} region(s), in {:.1} s",
         utterances.len(),
+        suppressed_words,
+        leakage.suppressions.len(),
         merge_started.elapsed().as_secs_f64()
     );
     Ok(())
@@ -1729,6 +1751,89 @@ mod tests {
         let transcript: Vec<Utterance> =
             jsonl::read_all(&session.transcript_path()).expect("read transcript");
         assert_eq!(transcript[0].speaker, "Carol");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn render_suppresses_leakage_without_changing_word_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-render-leakage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        let mut words = ["we", "should", "release", "Friday"]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| TimedWord {
+                source: AudioSource::System,
+                start_ms: 1_000 + index as u64 * 350,
+                end_ms: 1_300 + index as u64 * 350,
+                text: (*text).into(),
+            })
+            .collect::<Vec<_>>();
+        words.push(TimedWord {
+            source: AudioSource::Mic,
+            start_ms: 770,
+            end_ms: 970,
+            text: "yes".into(),
+        });
+        words.extend(
+            ["we", "should", "release", "Friday"]
+                .iter()
+                .enumerate()
+                .map(|(index, text)| TimedWord {
+                    source: AudioSource::Mic,
+                    start_ms: 1_120 + index as u64 * 350,
+                    end_ms: 1_420 + index as u64 * 350,
+                    text: (*text).into(),
+                }),
+        );
+        jsonl::write_all_atomic(&session.words_path(), &words).expect("write words");
+        let original_words = fs::read(session.words_path()).expect("read original words");
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 900,
+                end_ms: 2_500,
+                cluster: 0,
+            }],
+        )
+        .expect("write diarization");
+
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: Some(false),
+        })
+        .expect("render leakage");
+        assert_eq!(
+            fs::read(session.words_path()).expect("reread words"),
+            original_words
+        );
+        let first_transcript = fs::read(session.transcript_path()).expect("read transcript");
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("parse transcript");
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].text, "yes");
+        assert_eq!(transcript[1].text, "we should release Friday");
+        let suppressions: Vec<serde_json::Value> =
+            jsonl::read_all(&session.leakage_suppressions_path()).expect("read suppressions");
+        assert_eq!(suppressions.len(), 1);
+        assert_eq!(suppressions[0]["suppressed_words"], 4);
+
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: Some(false),
+        })
+        .expect("rerender leakage");
+        assert_eq!(
+            fs::read(session.transcript_path()).expect("reread transcript"),
+            first_transcript
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

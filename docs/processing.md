@@ -236,9 +236,22 @@ singstone render SESSION
 ```
 
 **Input:** `manifest.json`, `words.jsonl`, `diarization.jsonl`, their metadata
-sidecars when present, and optionally `speaker-assignments.json`. Missing
-assignment data is allowed, but malformed or unsupported assignment metadata or
-diarization metadata is an error. This stage uses no ML model and is fast.
+sidecars when present, optionally `speaker-assignments.json`, and the raw audio
+tracks when both are available. Missing assignment data is allowed, but
+malformed or unsupported assignment metadata or diarization metadata is an
+error. This stage uses no ML model and is fast.
+
+When microphone and system speech overlap, `render` compares their timed word
+sequences. With both audio tracks available, it confirms candidates from
+correlated 10 ms audio energy patterns at a plausible speaker-to-microphone
+delay. Only matching microphone words are removed, so a local interjection or
+simultaneous unrelated speech is preserved. If either audio track is
+unavailable, render falls back to stricter long-sequence text matching. The raw
+`words.jsonl` remains unchanged.
+
+Every decision is written to `leakage-suppressions.jsonl`, including the two
+matched spans, word count, text similarity, optional audio similarity and
+estimated delay. An empty file means no microphone words were suppressed.
 
 For each word, `render` considers only diarization segments from the same audio
 source. It chooses the cluster with the greatest timestamp overlap. When there

@@ -16,3 +16,16 @@ files. The Snap itself contains their trusted manifest and notices:
 
 Exact revisions, source URLs, sizes, and SHA-256 digests are recorded in the
 installed `models.lock` file.
+
+## Bundled GPU runtimes
+
+- Intel oneAPI DPC++/C++ and Unified Runtime 2026.1 provide the SYCL runtime.
+- Intel oneMKL 2026.1 provides the SYCL BLAS implementation used by ggml.
+- The Level Zero loader and Intel compute runtime come from Ubuntu Noble's
+  `libze1` and `libze-intel-gpu1` packages; both upstream projects use the MIT
+  license.
+
+The Intel component licenses and third-party notices copied from the build
+packages are installed beside this file under `oneapi-licensing` and
+`onemkl-licensing`. Ubuntu package copyright files are installed under
+`/usr/share/doc` in the Snap.

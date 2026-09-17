@@ -28,6 +28,22 @@ All Rust-lang / gtk-rs / Alex Crichton lineage. They run arbitrary code at
 build time by design; they are the reason the build must run in a trusted
 environment, not why it must be online.
 
+## Native GPU toolchain
+
+The AMD64 Snap builds a second Whisper executable with Intel oneAPI DPC++/C++
+2026.1, oneMKL SYCL BLAS 2026.1, and `GGML_SYCL_F16=ON`. The build packages
+come from Intel's signed oneAPI APT repository; its current signing key is
+vendored under `snap/keys` and selected by its full fingerprint in the Snap
+recipe. The Snap copies the resulting executable's Intel ELF dependency
+closure and the dynamically loaded Level Zero Unified Runtime adapter. The
+packaged notices come from the same oneAPI installation.
+
+Ubuntu Noble's `libze1` and `libze-intel-gpu1` packages provide the Level Zero
+loader and Intel compute driver. The main app already receives `/dev/dri`
+access through the GNOME extension's `opengl` interface. A separate SYCL probe
+requires an Intel GPU with FP16 and a working queue before the launcher starts
+the GPU-linked executable; failure selects the independently built CPU binary.
+
 ## Flagged items
 
 1. **sherpa-onnx-sys download fallback.** The checked-in Cargo configuration

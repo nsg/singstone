@@ -1,0 +1,70 @@
+#!/bin/bash
+set -euo pipefail
+
+if (( $# < 2 )); then
+  echo "usage: $0 DESTINATION ELF..." >&2
+  exit 2
+fi
+
+destination=$1
+shift
+mkdir -p "$destination"
+
+declare -a roots=("$@")
+declare -a queue=("${roots[@]}")
+declare -A visited=()
+
+# Unified Runtime loads Level Zero adapters by name, so they do not appear in
+# the loader's ELF dependency list. Package both adapter generations shipped by
+# the selected oneAPI release; the loader chooses the one it supports.
+while IFS= read -r adapter; do
+  queue+=("$adapter")
+done < <(
+  find /opt/intel/oneapi/compiler/latest/lib \
+    -maxdepth 1 -type l \
+    \( -name 'libur_adapter_level_zero.so.0' \
+       -o -name 'libur_adapter_level_zero_v2.so.0' \) \
+    -print
+)
+
+while (( ${#queue[@]} )); do
+  object=${queue[0]}
+  queue=("${queue[@]:1}")
+  object=$(readlink -f "$object")
+  [[ -n "$object" && -f "$object" ]] || continue
+  [[ -z ${visited[$object]+x} ]] || continue
+  visited[$object]=1
+
+  if [[ "$object" == /opt/intel/oneapi/* ]]; then
+    soname=$(readelf -d "$object" 2>/dev/null \
+      | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p')
+    [[ -n "$soname" ]] || soname=$(basename "$object")
+    install -Dm755 "$object" "$destination/$soname"
+  fi
+
+  while IFS= read -r dependency; do
+    queue+=("$dependency")
+  done < <(
+    ldd "$object" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*[^[:space:]]*[[:space:]]*=>[[:space:]]*\(\/[^[:space:]]*\).*/\1/p'
+  )
+done
+
+for required in \
+  'libsycl.so.*' \
+  'libur_loader.so.*' \
+  'libur_adapter_level_zero.so.*' \
+  'libmkl_sycl_blas.so.*'; do
+  compgen -G "$destination/$required" >/dev/null || {
+    echo "missing required SYCL runtime library: $required" >&2
+    exit 1
+  }
+done
+
+for object in "${roots[@]}" "$destination"/libur_adapter_level_zero*.so.*; do
+  if LD_LIBRARY_PATH="$destination" ldd "$object" | grep -q 'not found'; then
+    echo "unresolved packaged dependency for $object" >&2
+    LD_LIBRARY_PATH="$destination" ldd "$object" >&2
+    exit 1
+  fi
+done

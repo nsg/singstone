@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+
+cpu_binary="$SNAP/bin/singstone"
+sycl_binary="$SNAP/bin/singstone-sycl"
+sycl_probe="${SINGSTONE_SYCL_PROBE:-$SNAP/bin/singstone-sycl-probe}"
+
+# Constrain oneAPI to the Level Zero GPU runtime packaged by the snap. The probe
+# runs in a separate process because an unavailable SYCL runtime may terminate
+# during device discovery instead of returning an error to whisper.cpp.
+export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}"
+
+if [ "${SINGSTONE_DISABLE_GPU:-0}" != "1" ] \
+  && [ -x "$sycl_binary" ] \
+  && [ -x "$sycl_probe" ] \
+  && "$sycl_probe"; then
+  export GGML_SYCL_DEVICE="${GGML_SYCL_DEVICE:-0}"
+  export SINGSTONE_WHISPER_BACKEND="intel-sycl"
+  exec "$sycl_binary" "$@"
+fi
+
+export SINGSTONE_WHISPER_BACKEND="cpu"
+exec "$cpu_binary" "$@"

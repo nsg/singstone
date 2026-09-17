@@ -47,6 +47,12 @@ be supplied. The same loaded model and inference state are reused for the
 microphone and system tracks. Each enabled raw track is read into memory before
 its transcription pass.
 
+The Snap packages separate CPU and Intel SYCL builds. Its launcher selects the
+FP16 SYCL build when a probe can open an Intel Level Zero GPU, including the
+Tiger Lake Iris Xe in the Core i7-1185G7. It falls back to the CPU build when
+the device or driver is unavailable. `SINGSTONE_DISABLE_GPU=1` forces that CPU
+path, and the selected backend is printed when Whisper initializes.
+
 The stage performs these operations:
 
 1. It runs an energy-based voice activity detector over 20 ms frames. A frame

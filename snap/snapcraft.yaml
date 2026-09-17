@@ -10,6 +10,19 @@ assumes:
 platforms:
   amd64:
 
+package-repositories:
+  - type: apt
+    url: https://apt.repos.intel.com/oneapi
+    suites:
+      - all
+    components:
+      - main
+    formats:
+      - deb
+    architectures:
+      - amd64
+    key-id: E9BF0AFC46D6E8B7DA5882F1BAC6F0C353D04109
+
 website: https://github.com/nsg/singstone
 source-code: https://github.com/nsg/singstone
 issues: https://github.com/nsg/singstone/issues
@@ -29,7 +42,7 @@ slots:
 
 apps:
   singstone:
-    command: bin/singstone
+    command: bin/singstone-launcher
     desktop: usr/share/applications/io.github.nsg.Singstone.desktop
     extensions:
       - gnome
@@ -162,6 +175,8 @@ parts:
     build-packages:
       - clang
       - cmake
+      - intel-oneapi-compiler-dpcpp-cpp-2026.1
+      - intel-oneapi-mkl-sycl-devel-2026.1
       - libclang-dev
       - libpipewire-0.3-dev
       - libspa-0.2-dev
@@ -170,6 +185,8 @@ parts:
       - bzip2
       - ca-certificates
       - curl
+      - libze-intel-gpu1
+      - libze1
       - libpipewire-0.3-0t64
       - libspa-0.2-modules
       - pipewire-bin
@@ -181,6 +198,42 @@ parts:
       cargo clippy --release --all-targets --locked -- -D warnings
       cargo test --release --locked
       craftctl default
+      . /opt/intel/oneapi/setvars.sh --force
+      icpx -fsycl -O2 snap/local/sycl-probe.cpp \
+        -o "$CRAFT_PART_INSTALL/bin/singstone-sycl-probe"
+      GGML_SYCL_F16=ON \
+        CARGO_TARGET_DIR="$CRAFT_PART_BUILD/target-sycl" \
+        cargo build --release --locked --features intel-sycl
+      install -Dm755 "$CRAFT_PART_BUILD/target-sycl/release/singstone" \
+        "$CRAFT_PART_INSTALL/bin/singstone-sycl"
+      install -Dm755 snap/local/singstone-launcher \
+        "$CRAFT_PART_INSTALL/bin/singstone-launcher"
+      mapfile -t sycl_native_dirs < <(
+        find "$CRAFT_PART_BUILD/target-sycl/release/build" \
+          -type f -path '*/out/lib/libggml-sycl.so' -printf '%h\n'
+      )
+      if (( ${#sycl_native_dirs[@]} != 1 )); then
+        echo "expected one SYCL native library directory, found ${#sycl_native_dirs[@]}" >&2
+        exit 1
+      fi
+      sycl_native_dir=${sycl_native_dirs[0]}
+      mkdir -p "$CRAFT_PART_INSTALL/lib"
+      cp -a "$sycl_native_dir"/libggml*.so* \
+        "$sycl_native_dir"/libwhisper.so* \
+        "$CRAFT_PART_INSTALL/lib/"
+      LD_LIBRARY_PATH="$CRAFT_PART_INSTALL/lib:$LD_LIBRARY_PATH" \
+        snap/local/install-sycl-runtime "$CRAFT_PART_INSTALL/lib" \
+        "$CRAFT_PART_INSTALL/bin/singstone-sycl-probe" \
+        "$CRAFT_PART_INSTALL/lib/libggml-sycl.so"
+      mkdir -p "$CRAFT_PART_INSTALL/usr/share/doc/singstone"
+      if [ -d /opt/intel/oneapi/licensing ]; then
+        cp -a /opt/intel/oneapi/licensing \
+          "$CRAFT_PART_INSTALL/usr/share/doc/singstone/oneapi-licensing"
+      fi
+      if [ -d /opt/intel/oneapi/mkl/latest/share/doc/mkl/licensing ]; then
+        cp -a /opt/intel/oneapi/mkl/latest/share/doc/mkl/licensing \
+          "$CRAFT_PART_INSTALL/usr/share/doc/singstone/onemkl-licensing"
+      fi
       install -Dm644 docs/models.lock \
         "$CRAFT_PART_INSTALL/usr/share/singstone/models.lock"
       install -Dm644 snap/gui/io.github.nsg.Singstone.desktop \

@@ -27,6 +27,9 @@ jobs:
 
       - run: cargo fmt --check
 
+      - name: Test Intel GPU launcher selection
+        run: scripts/test-sycl-launcher.sh
+
       - name: Install cargo-audit
         run: command -v cargo-audit >/dev/null || cargo install --locked cargo-audit
 
@@ -35,7 +38,7 @@ jobs:
   snap:
     name: Build snap
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -109,6 +112,24 @@ jobs:
         run: |
           sudo snapcraft pack --destructive-mode
           sudo chown "$USER:$USER" ./*.snap
+
+      - name: Verify Intel SYCL payload
+        run: |
+          snap_path=$(find . -maxdepth 1 -type f -name '*.snap' -print -quit)
+          test -n "$snap_path"
+          file_list=$(unsquashfs -l "$snap_path")
+          for payload in \
+            bin/singstone \
+            bin/singstone-launcher \
+            bin/singstone-sycl \
+            bin/singstone-sycl-probe \
+            lib/libggml-sycl.so \
+            lib/libmkl_sycl_blas.so \
+            lib/libsycl.so \
+            lib/libur_adapter_level_zero.so \
+            lib/libur_loader.so; do
+            grep -Eq "squashfs-root/$payload(\\.|$)" <<<"$file_list"
+          done
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

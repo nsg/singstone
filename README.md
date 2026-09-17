@@ -36,6 +36,8 @@ the recorded audio is preserved.
 - Records a microphone, a PipeWire sink monitor, or both as aligned 16 kHz audio.
 - Files screenshots against the same meeting clock.
 - Transcribes with Whisper and separates speakers with pyannote and TitaNet.
+- Automatically accelerates Whisper with Intel SYCL and Level Zero on a
+  compatible Intel GPU, with a CPU fallback.
 - Recognizes enrolled voices while leaving uncertain matches anonymous.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   explicit processing stages, transcript-side speaker assignment, and editable
@@ -52,6 +54,11 @@ Requirements:
 - AMD64 Linux
 - snapd 2.68 or newer
 - PipeWire
+
+The Snap is tuned for the Intel Iris Xe GPU in the Core i7-1185G7 and other
+Intel GPUs that expose Level Zero and native FP16. It probes the packaged GPU
+stack at every launch and otherwise uses the existing CPU build. Set
+`SINGSTONE_DISABLE_GPU=1` to force the CPU path for diagnosis.
 
 Download the `.snap` directly from the rolling
 [Latest release](https://github.com/nsg/singstone/releases/latest), then install
@@ -121,6 +128,11 @@ are `transcript.jsonl` for programs and `transcript.txt` for people.
 |---|---|---|
 | `singstone` | `home`, `pipewire`; no network | Recording, processing, and transcript output |
 | `model-download` | outbound network, private Unix socket | On-demand, per-user download of pinned models |
+
+The `singstone` launcher opens a small SYCL queue in a separate probe process.
+An Intel FP16 GPU and a working Level Zero driver select the FP16 SYCL build;
+probe errors, missing device access, and other GPU types select the CPU build.
+The transcription log prints the backend in use when Whisper initializes.
 
 Model weights are not bundled in the Snap. The setup service downloads the
 exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the

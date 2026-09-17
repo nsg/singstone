@@ -32,11 +32,11 @@ const CSS: &str = r#"
 .speaker-1 { background: #613583; }
 .speaker-2 { background: #26a269; }
 .speaker-unknown { color: #63460a; background: #f6d32d; }
-.warning-text { color: #b45309; }
+.warning-text { color: @warning_color; }
 .pill { border-radius: 999px; padding: 2px 10px; font-size: 11px; font-weight: 600; }
-.pill-ok { color: #1b5e20; background: alpha(#2ec27e, 0.25); }
-.pill-idle { color: #1a5fb4; background: alpha(#3584e4, 0.18); }
-.pill-busy { color: #63460a; background: alpha(#e5a50a, 0.25); }
+.pill-ok { color: @success_fg_color; background: @success_bg_color; }
+.pill-idle { color: @accent_fg_color; background: @accent_bg_color; }
+.pill-busy { color: @warning_fg_color; background: @warning_bg_color; }
 .recording-dot { color: #e01b24; }
 .live-bar { background: alpha(#e01b24, 0.10); padding: 7px 12px; }
 .pill-button { border-radius: 999px; padding: 8px 26px; font-weight: 600; }
@@ -88,6 +88,12 @@ pub fn run() -> ExitCode {
 fn build_window(app: &adw::Application) {
     install_css();
 
+    let config = Rc::new(RefCell::new(GuiConfig::load().unwrap_or_default()));
+    let style_manager = adw::StyleManager::default();
+    if let Some(dark_mode) = config.borrow().dark_mode {
+        set_dark_mode(&style_manager, dark_mode);
+    }
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Singstone")
@@ -110,6 +116,11 @@ fn build_window(app: &adw::Application) {
     let about = gtk::Button::from_icon_name("help-about-symbolic");
     about.set_tooltip_text(Some("About Singstone"));
     header.pack_end(&about);
+    let theme = gtk::ToggleButton::new();
+    theme.add_css_class("flat");
+    theme.set_active(style_manager.is_dark());
+    update_theme_button(&theme);
+    header.pack_end(&theme);
     toolbar.add_top_bar(&header);
 
     let banner = adw::Banner::new("");
@@ -119,7 +130,6 @@ fn build_window(app: &adw::Application) {
     banner.connect_button_clicked(move |_| banner_for_click.set_revealed(false));
     toolbar.add_top_bar(&banner);
 
-    let config = Rc::new(RefCell::new(GuiConfig::load().unwrap_or_default()));
     let session_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
     let session_list = gtk::ListBox::new();
     session_list.add_css_class("navigation-sidebar");
@@ -237,6 +247,53 @@ fn build_window(app: &adw::Application) {
     let window_for_about = window.clone();
     about.connect_clicked(move |_| show_about(&window_for_about));
 
+    let changing_theme = Rc::new(Cell::new(false));
+    let changing_theme_for_toggle = changing_theme.clone();
+    let config_for_theme = config.clone();
+    let window_for_theme = window.clone();
+    let style_for_theme = style_manager.clone();
+    let current_dark = Rc::new(Cell::new(style_manager.is_dark()));
+    let current_dark_for_toggle = current_dark.clone();
+    theme.connect_toggled(move |button| {
+        if changing_theme_for_toggle.replace(true) {
+            return;
+        }
+        let dark_mode = button.is_active();
+        let mut updated = config_for_theme.borrow().clone();
+        updated.dark_mode = Some(dark_mode);
+        if let Err(error) = updated.save() {
+            let previous = current_dark_for_toggle.get();
+            button.set_active(previous);
+            show_error(
+                &window_for_theme,
+                "Could not save appearance",
+                &error.to_string(),
+            );
+        } else {
+            set_dark_mode(&style_for_theme, dark_mode);
+            current_dark_for_toggle.set(dark_mode);
+            *config_for_theme.borrow_mut() = updated;
+        }
+        update_theme_button(button);
+        changing_theme_for_toggle.set(false);
+    });
+
+    let theme_for_system = theme.clone();
+    let config_for_system = config.clone();
+    let changing_theme_for_system = changing_theme.clone();
+    let current_dark_for_system = current_dark.clone();
+    style_manager.connect_dark_notify(move |style| {
+        if config_for_system.borrow().dark_mode.is_some() || changing_theme_for_system.replace(true)
+        {
+            return;
+        }
+        let dark_mode = style.is_dark();
+        theme_for_system.set_active(dark_mode);
+        current_dark_for_system.set(dark_mode);
+        update_theme_button(&theme_for_system);
+        changing_theme_for_system.set(false);
+    });
+
     let stop_on_close = recording_page.job.clone();
     let close_after_stop = close_when_recording_stops.clone();
     window.connect_close_request(move |_| {
@@ -249,6 +306,24 @@ fn build_window(app: &adw::Application) {
     });
 
     window.present();
+}
+
+fn set_dark_mode(style_manager: &adw::StyleManager, dark_mode: bool) {
+    style_manager.set_color_scheme(if dark_mode {
+        adw::ColorScheme::ForceDark
+    } else {
+        adw::ColorScheme::ForceLight
+    });
+}
+
+fn update_theme_button(button: &gtk::ToggleButton) {
+    if button.is_active() {
+        button.set_icon_name("weather-clear-night-symbolic");
+        button.set_tooltip_text(Some("Use light mode"));
+    } else {
+        button.set_icon_name("weather-clear-symbolic");
+        button.set_tooltip_text(Some("Use dark mode"));
+    }
 }
 
 fn install_css() {

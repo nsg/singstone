@@ -13,6 +13,8 @@ pub struct GuiConfig {
     pub screenshots_dir: PathBuf,
     pub local_speaker: String,
     pub diarize_mic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dark_mode: Option<bool>,
 }
 
 impl Default for GuiConfig {
@@ -29,6 +31,7 @@ impl Default for GuiConfig {
                 .unwrap_or_else(|| home.join("Pictures/Screenshots")),
             local_speaker: "Me".into(),
             diarize_mic: true,
+            dark_mode: None,
         }
     }
 }
@@ -84,6 +87,7 @@ mod tests {
         let config = GuiConfig::default();
         assert!(!config.local_speaker.trim().is_empty());
         assert!(config.diarize_mic);
+        assert_eq!(config.dark_mode, None);
     }
 
     #[test]
@@ -98,5 +102,17 @@ mod tests {
         .expect("deserialize legacy GUI config");
 
         assert!(config.diarize_mic);
+        assert_eq!(config.dark_mode, None);
+    }
+
+    #[test]
+    fn selected_theme_round_trips() {
+        let config = GuiConfig {
+            dark_mode: Some(true),
+            ..GuiConfig::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize GUI config");
+        let restored: GuiConfig = serde_json::from_str(&json).expect("deserialize GUI config");
+        assert_eq!(restored.dark_mode, Some(true));
     }
 }

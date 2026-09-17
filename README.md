@@ -180,7 +180,6 @@ Latest release with the `.snap` binary.
 - [Recording internals](docs/recording.md)
 - [Processing stages](docs/processing.md)
 - [Dependency and supply-chain review](docs/dependencies.md)
-- [Design specification](docs/design-spec.md)
 
 ## License
 

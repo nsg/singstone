@@ -1438,6 +1438,7 @@ fn wire_processing(
     search: &gtk::SearchEntry,
 ) {
     let busy = Rc::new(Cell::new(false));
+    let confirmed_reprocess = Rc::new(Cell::new(false));
     let selected = detail.selected.clone();
     let parent = window.clone();
     let detail_for_done = detail.clone();
@@ -1446,13 +1447,35 @@ fn wire_processing(
     let list_for_done = list.clone();
     let paths_for_done = paths.clone();
     let search_for_done = search.clone();
-    detail.process_button.connect_clicked(move |_| {
+    detail.process_button.connect_clicked(move |button| {
         if busy.get() {
             return;
         }
         let Some(session_path) = selected.borrow().clone() else {
             return;
         };
+        if session_path.join("transcript.jsonl").is_file()
+            && !confirmed_reprocess.replace(false)
+        {
+            let dialog = adw::AlertDialog::new(
+                Some("Reprocess this recording?"),
+                Some(
+                    "This replaces the transcript, intermediate processing files, and assigned speaker names. Recorded audio is preserved.",
+                ),
+            );
+            dialog.add_responses(&[("cancel", "Cancel"), ("reprocess", "Reprocess")]);
+            dialog.set_default_response(Some("reprocess"));
+            dialog.set_close_response("cancel");
+            dialog.set_response_appearance("reprocess", adw::ResponseAppearance::Suggested);
+            let button = button.clone();
+            let confirmed_reprocess = confirmed_reprocess.clone();
+            dialog.connect_response(Some("reprocess"), move |_, _| {
+                confirmed_reprocess.set(true);
+                button.emit_clicked();
+            });
+            dialog.present(Some(&parent));
+            return;
+        }
         busy.set(true);
         let dialog = processing_dialog();
         let progress = Arc::new(Mutex::new(ProcessingStage::Preparing));
@@ -1463,7 +1486,7 @@ fn wire_processing(
         let thread_cancelled = cancelled.clone();
         let diarize_mic = config_for_done.borrow().diarize_mic;
         std::thread::spawn(move || {
-            let value = (|| -> Result<(), String> {
+            let prepared = (|| -> Result<ProcessArgs, String> {
                 let mut args = ProcessArgs::for_session(session_path);
                 args.diarize_mic = diarize_mic;
                 let command = Command::Process(args);
@@ -1471,16 +1494,29 @@ fn wire_processing(
                 let Command::Process(args) = command else {
                     unreachable!()
                 };
-                process::run_with_control(
+                Ok(args)
+            })();
+            let outcome = match prepared {
+                Err(error) => ProcessingOutcome::Failed(error),
+                Ok(args) => match process::run_with_control(
                     args,
                     |stage| {
                         *thread_progress.lock().expect("processing progress mutex") = stage;
                     },
                     thread_cancelled,
-                )
-                .map_err(|error| error.to_string())
-            })();
-            *thread_result.lock().expect("processing result mutex") = Some(value);
+                ) {
+                    Ok(()) => ProcessingOutcome::Finished,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted) =>
+                    {
+                        ProcessingOutcome::Cancelled
+                    }
+                    Err(error) => ProcessingOutcome::Failed(error.to_string()),
+                },
+            };
+            *thread_result.lock().expect("processing result mutex") = Some(outcome);
         });
 
         let label = dialog.label.clone();
@@ -1520,7 +1556,7 @@ fn wire_processing(
             cancel_button.set_sensitive(false);
             processing_dialog.force_close();
             match result {
-                Ok(()) => {
+                ProcessingOutcome::Finished => {
                     let selected_path = selected_for_poll.borrow().clone();
                     if let Some(path) = selected_path {
                         let _ = detail_for_poll.load(&path);
@@ -1536,11 +1572,15 @@ fn wire_processing(
                     );
                     banner_for_poll.set_revealed(true);
                 }
-                Err(_) if cancelled.load(Ordering::Acquire) => {
-                    banner_for_poll.set_title("Processing cancelled — the recording is unchanged");
+                ProcessingOutcome::Cancelled => {
+                    banner_for_poll.set_title(
+                        "Processing cancelled — recorded audio is unchanged; completed stages may have refreshed outputs",
+                    );
                     banner_for_poll.set_revealed(true);
                 }
-                Err(error) => show_error(&parent_for_poll, "Processing failed", &error),
+                ProcessingOutcome::Failed(error) => {
+                    show_error(&parent_for_poll, "Processing failed", &error)
+                }
             }
             glib::ControlFlow::Break
         });
@@ -1554,6 +1594,12 @@ struct ProcessingDialog {
     progress: gtk::ProgressBar,
     stages: Vec<gtk::Label>,
     cancel: gtk::Button,
+}
+
+enum ProcessingOutcome {
+    Finished,
+    Cancelled,
+    Failed(String),
 }
 
 fn processing_dialog() -> ProcessingDialog {
@@ -1657,7 +1703,14 @@ impl SessionDetail {
         set_status(&self.status, status, class);
         self.status.set_visible(true);
         self.process_button
-            .set_visible(manifest.state != SessionState::Recording && !processed);
+            .set_label(if processed { "Reprocess" } else { "Process" });
+        self.process_button.set_tooltip_text(Some(if processed {
+            "Replace the transcript, intermediate files, and speaker assignments. Recorded audio is preserved."
+        } else {
+            "Process this recording"
+        }));
+        self.process_button
+            .set_visible(manifest.state != SessionState::Recording);
 
         clear_box(&self.transcript);
         if processed {

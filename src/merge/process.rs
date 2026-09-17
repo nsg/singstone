@@ -176,7 +176,6 @@ pub fn run_with_control(
     render_artifacts_with_hook(&session, &manifest, args.diarize_mic, || {
         progress(ProcessingStage::Writing);
     })?;
-    ensure_not_cancelled(&cancelled)?;
     progress(ProcessingStage::Finished);
     Ok(())
 }
@@ -1602,6 +1601,85 @@ mod tests {
         .expect("fall back when diarization models cannot be verified");
         assert!(session.diarization_metadata_path().is_file());
         assert!(session.speaker_assignments_path().is_file());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn reprocessing_preserves_recorded_audio() {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-reprocess-audio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        let mut manifest = session.read_manifest().expect("read manifest");
+        manifest.mic.enabled = true;
+        manifest.system.enabled = true;
+        session
+            .write_manifest(&manifest)
+            .expect("enable audio tracks");
+
+        let mic_audio = (0..64)
+            .flat_map(|sample| ((sample as f32 - 32.0) / 64.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        let system_audio = (0..96)
+            .flat_map(|sample| ((48.0 - sample as f32) / 96.0).to_le_bytes())
+            .collect::<Vec<_>>();
+        let mic_timeline = b"mic timeline sentinel\n".to_vec();
+        let system_timeline = b"system timeline sentinel\n".to_vec();
+        fs::write(session.audio_path(AudioSource::Mic), &mic_audio).expect("write mic audio");
+        fs::write(session.audio_path(AudioSource::System), &system_audio)
+            .expect("write system audio");
+        fs::write(session.timeline_path(AudioSource::Mic), &mic_timeline)
+            .expect("write mic timeline");
+        fs::write(session.timeline_path(AudioSource::System), &system_timeline)
+            .expect("write system timeline");
+        jsonl::write_all_atomic::<TimedWord>(&session.words_path(), &[]).expect("write words");
+        fs::write(session.transcript_path(), b"stale transcript\n")
+            .expect("write stale transcript");
+
+        run(ProcessArgs {
+            session: session.dir.clone(),
+            whisper_model: None,
+            segmentation_model: None,
+            embedding_model: None,
+            models_lock: None,
+            allow_unverified_models: false,
+            diarize_mic: false,
+            no_diarize: true,
+            skip_transcription: true,
+            language: "en".into(),
+            threads: Some(1),
+            speakers_db: None,
+            speaker_threshold: 0.6,
+            cluster_threshold: 1.0,
+            num_speakers: None,
+        })
+        .expect("reprocess session");
+
+        assert_eq!(
+            fs::read(session.audio_path(AudioSource::Mic)).expect("read mic audio"),
+            mic_audio
+        );
+        assert_eq!(
+            fs::read(session.audio_path(AudioSource::System)).expect("read system audio"),
+            system_audio
+        );
+        assert_eq!(
+            fs::read(session.timeline_path(AudioSource::Mic)).expect("read mic timeline"),
+            mic_timeline
+        );
+        assert_eq!(
+            fs::read(session.timeline_path(AudioSource::System)).expect("read system timeline"),
+            system_timeline
+        );
+        assert_ne!(
+            fs::read(session.transcript_path()).expect("read replaced transcript"),
+            b"stale transcript\n"
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

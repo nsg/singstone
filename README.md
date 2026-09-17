@@ -26,6 +26,8 @@ names to speakers directly from the session view.
 
 Run the local processing pipeline without leaving the meeting window. The
 dialog reports each stage and can be cancelled while work is in progress.
+Processed meetings can be processed again to replace their derived outputs;
+the recorded audio is preserved.
 
 ![Singstone processing a meeting in an in-window dialog](docs/images/singstone-processing.png)
 

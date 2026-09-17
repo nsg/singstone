@@ -59,7 +59,6 @@ apps:
     daemon: simple
     daemon-scope: user
     restart-condition: never
-    refresh-mode: endure
     sockets:
       activation:
         listen-stream: $SNAP_USER_COMMON/model-setup.sock

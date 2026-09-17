@@ -183,12 +183,6 @@ jobs:
           singstone --version
           singstone speakers
 
-          model_socket="$HOME/snap/singstone/common/model-setup.sock"
-          for _ in {1..100}; do
-            [[ -S "$model_socket" ]] && break
-            sleep 0.1
-          done
-          test -S "$model_socket"
           model_service_diagnostics() {
             snap logs -n=100 singstone.model-download || true
             systemctl --user status snap.singstone.model-download.service --no-pager || true
@@ -196,7 +190,15 @@ jobs:
             journalctl --user -u snap.singstone.model-download.service --no-pager -n 100 || true
           }
           trap model_service_diagnostics ERR
-          singstone model-setup-check
+          model_service_ready=false
+          for _ in {1..100}; do
+            if singstone model-setup-check; then
+              model_service_ready=true
+              break
+            fi
+            sleep 0.1
+          done
+          test "$model_service_ready" = true
           trap - ERR
           snap services --user singstone.model-download | grep -q 'socket-activated'
           test ! -e "$HOME/snap/singstone/common/models/.download-status.json"

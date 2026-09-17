@@ -1,8 +1,9 @@
-use super::Transcriber;
 use super::backend;
 use super::vad::{self, SpeechRegion, VadConfig};
+use super::{ProgressReporter, Transcriber, TranscriptionProgress};
 use crate::types::{AudioSource, SAMPLE_RATE, TimedWord, samples_to_ms};
 use std::path::Path;
+use std::time::Instant;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
@@ -14,6 +15,7 @@ pub struct WhisperTranscriber {
     language: String,
     threads: usize,
     vad: VadConfig,
+    progress: Option<ProgressReporter>,
 }
 
 impl WhisperTranscriber {
@@ -22,6 +24,7 @@ impl WhisperTranscriber {
         source: AudioSource,
         language: String,
         threads: usize,
+        progress: Option<ProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         whisper_rs::install_logging_hooks();
         eprintln!(
@@ -37,6 +40,7 @@ impl WhisperTranscriber {
             language,
             threads,
             vad: VadConfig::default(),
+            progress,
         })
     }
 
@@ -82,6 +86,10 @@ impl Transcriber for WhisperTranscriber {
             return Ok(Vec::new());
         }
         let mut words = Vec::new();
+        let source_started = Instant::now();
+        let mut completed_audio_seconds = 0.0;
+        let mut decoded_tokens = 0u64;
+        let mut tokens_per_second = None;
         let chunk_samples = 30 * SAMPLE_RATE as usize;
         for region in &regions {
             for (chunk_number, chunk) in samples[region.start..region.end]
@@ -96,12 +104,34 @@ impl Transcriber for WhisperTranscriber {
                 } else {
                     chunk
                 };
-                let params = Self::params(&self.language, self.threads);
+                let audio_seconds = audio.len() as f64 / SAMPLE_RATE as f64;
+                let chunk_started = Instant::now();
+                let mut params = Self::params(&self.language, self.threads);
+                if let Some(progress) = self.progress.clone() {
+                    let source = self.source;
+                    let transcription_started = source_started;
+                    let base_audio_seconds = completed_audio_seconds;
+                    let completed_tokens = decoded_tokens;
+                    let last_tokens_per_second = tokens_per_second;
+                    params.set_progress_callback_safe(move |percent: i32| {
+                        let percent = percent.clamp(0, 100) as u8;
+                        progress(TranscriptionProgress {
+                            source,
+                            chunk_percent: percent,
+                            audio_seconds: base_audio_seconds
+                                + audio_seconds * f64::from(percent) / 100.0,
+                            elapsed_seconds: transcription_started.elapsed().as_secs_f64(),
+                            decoded_tokens: completed_tokens,
+                            tokens_per_second: last_tokens_per_second,
+                        });
+                    });
+                }
                 self.state.full(params, audio)?;
                 let offset_samples = region.start + chunk_number * chunk_samples;
                 let offset_ms = samples_to_ms(offset_samples as u64);
                 let chunk_end_ms = offset_ms + samples_to_ms(chunk.len() as u64);
                 let mut chunk_words = Vec::new();
+                let mut chunk_tokens = 0u64;
                 for segment in self.state.as_iter() {
                     let segment_text = segment.to_str_lossy()?.trim().to_string();
                     if segment_text.is_empty() || is_annotation(&segment_text) {
@@ -117,6 +147,7 @@ impl Transcriber for WhisperTranscriber {
                         if token.token_id() >= self.context.token_eot() {
                             continue;
                         }
+                        chunk_tokens += 1;
                         let raw = token.to_str_lossy()?;
                         let token_text = raw.trim();
                         if token_text.is_empty() {
@@ -155,6 +186,21 @@ impl Transcriber for WhisperTranscriber {
                 }
                 normalize_chunk_words(&mut chunk_words, offset_ms, chunk_end_ms);
                 words.extend(chunk_words);
+                completed_audio_seconds += audio_seconds;
+                decoded_tokens += chunk_tokens;
+                let chunk_elapsed = chunk_started.elapsed().as_secs_f64();
+                tokens_per_second =
+                    (chunk_elapsed > 0.0).then_some(chunk_tokens as f64 / chunk_elapsed);
+                if let Some(progress) = &self.progress {
+                    progress(TranscriptionProgress {
+                        source: self.source,
+                        chunk_percent: 100,
+                        audio_seconds: completed_audio_seconds,
+                        elapsed_seconds: source_started.elapsed().as_secs_f64(),
+                        decoded_tokens,
+                        tokens_per_second,
+                    });
+                }
             }
         }
         words.sort_by_key(|word| (word.start_ms, word.end_ms));

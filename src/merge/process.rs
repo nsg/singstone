@@ -8,8 +8,8 @@ use crate::models;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase};
 use crate::speaker::embedding::{self, ClusterCandidate, EmbeddingExtractor};
-use crate::transcription::Transcriber;
 use crate::transcription::whisper::WhisperTranscriber;
+use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
     AudioSource, Manifest, SAMPLE_RATE, SessionState, SpeakerAssignment,
     SpeakerAssignmentProvenance, SpeakerAssignments, SpeakerSegment, TimedWord, Utterance,
@@ -127,6 +127,15 @@ pub fn run_with_control(
     progress: impl Fn(ProcessingStage),
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_control_and_metrics(args, progress, cancelled, Arc::new(|_| {}))
+}
+
+pub fn run_with_control_and_metrics(
+    args: ProcessArgs,
+    progress: impl Fn(ProcessingStage),
+    cancelled: Arc<AtomicBool>,
+    transcription_progress: ProgressReporter,
+) -> Result<(), Box<dyn std::error::Error>> {
     progress(ProcessingStage::Preparing);
     ensure_not_cancelled(&cancelled)?;
     let (session, manifest) = open_session(&args.session)?;
@@ -145,6 +154,7 @@ pub fn run_with_control(
             false,
             Some(&progress),
             Some(&cancelled),
+            Some(transcription_progress),
         )?;
     }
 
@@ -214,6 +224,7 @@ pub fn run_transcribe(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Er
         thread_count(process.threads),
         &mut words,
         true,
+        None,
         None,
         None,
     )
@@ -487,6 +498,7 @@ fn transcribe_sources(
     strict_audio: bool,
     progress: Option<&dyn Fn(ProcessingStage)>,
     cancelled: Option<&AtomicBool>,
+    transcription_progress: Option<ProgressReporter>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let model = args.whisper_model.as_deref().ok_or_else(|| {
         io::Error::new(
@@ -500,8 +512,13 @@ fn transcribe_sources(
         args.models_lock.as_deref(),
         args.allow_unverified_models,
     )?;
-    let mut transcriber =
-        WhisperTranscriber::new(model, AudioSource::Mic, args.language.clone(), threads)?;
+    let mut transcriber = WhisperTranscriber::new(
+        model,
+        AudioSource::Mic,
+        args.language.clone(),
+        threads,
+        transcription_progress,
+    )?;
     for (source, enabled) in [
         (AudioSource::Mic, manifest.mic.enabled),
         (AudioSource::System, manifest.system.enabled),

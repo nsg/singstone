@@ -8,7 +8,7 @@ use crate::model_setup;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase};
 use crate::speaker::enroll;
-use crate::transcription::backend;
+use crate::transcription::{TranscriptionProgress, backend};
 use crate::types::{AudioSource, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -1510,9 +1510,11 @@ fn wire_processing(
         busy.set(true);
         let dialog = processing_dialog(&backend::current());
         let progress = Arc::new(Mutex::new(ProcessingStage::Preparing));
+        let transcription_metrics = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
         let thread_progress = progress.clone();
+        let thread_transcription_metrics = transcription_metrics.clone();
         let thread_result = result.clone();
         let thread_cancelled = cancelled.clone();
         let diarize_mic = config_for_done.borrow().diarize_mic;
@@ -1529,12 +1531,17 @@ fn wire_processing(
             })();
             let outcome = match prepared {
                 Err(error) => ProcessingOutcome::Failed(error),
-                Ok(args) => match process::run_with_control(
+                Ok(args) => match process::run_with_control_and_metrics(
                     args,
                     |stage| {
                         *thread_progress.lock().expect("processing progress mutex") = stage;
                     },
                     thread_cancelled,
+                    Arc::new(move |metrics| {
+                        *thread_transcription_metrics
+                            .lock()
+                            .expect("transcription metrics mutex") = Some(metrics);
+                    }),
                 ) {
                     Ok(()) => ProcessingOutcome::Finished,
                     Err(error)
@@ -1553,6 +1560,8 @@ fn wire_processing(
         let label = dialog.label.clone();
         let bar = dialog.progress.clone();
         let stages = dialog.stages.clone();
+        let throughput = dialog.throughput.clone();
+        let throughput_detail = dialog.throughput_detail.clone();
         let cancel_button = dialog.cancel.clone();
         let cancelled_for_click = cancelled.clone();
         let label_for_cancel = dialog.label.clone();
@@ -1579,6 +1588,12 @@ fn wire_processing(
             }
             bar.set_fraction(stage.fraction());
             update_processing_stages(&stages, stage);
+            if let Some(metrics) = *transcription_metrics
+                .lock()
+                .expect("transcription metrics mutex")
+            {
+                update_transcription_metrics(&throughput, &throughput_detail, metrics);
+            }
             let completed = result.lock().expect("processing result mutex").take();
             let Some(result) = completed else {
                 return glib::ControlFlow::Continue;
@@ -1624,6 +1639,8 @@ struct ProcessingDialog {
     label: gtk::Label,
     progress: gtk::ProgressBar,
     stages: Vec<gtk::Label>,
+    throughput: gtk::Label,
+    throughput_detail: gtk::Label,
     cancel: gtk::Button,
 }
 
@@ -1665,6 +1682,18 @@ fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
     compute_description.set_wrap(true);
     compute.append(&compute_description);
     body.append(&compute);
+    let metrics = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    metrics.set_halign(gtk::Align::Center);
+    let throughput = gtk::Label::new(Some("Measuring decoder throughput…"));
+    throughput.add_css_class("title-4");
+    throughput.set_tooltip_text(Some(
+        "Token rate is for the latest completed chunk. Realtime speed is the audio processed per second since the current track started.",
+    ));
+    metrics.append(&throughput);
+    let throughput_detail = gtk::Label::new(Some("Starts when Whisper begins transcribing"));
+    throughput_detail.add_css_class("dim-label");
+    metrics.append(&throughput_detail);
+    body.append(&metrics);
     let progress = gtk::ProgressBar::new();
     progress.set_fraction(ProcessingStage::Preparing.fraction());
     progress.set_show_text(true);
@@ -1698,8 +1727,39 @@ fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
         label,
         progress,
         stages,
+        throughput,
+        throughput_detail,
         cancel,
     }
+}
+
+fn update_transcription_metrics(
+    throughput: &gtk::Label,
+    detail: &gtk::Label,
+    metrics: TranscriptionProgress,
+) {
+    let (throughput_text, detail_text) = transcription_metrics_text(metrics);
+    throughput.set_label(&throughput_text);
+    detail.set_label(&detail_text);
+}
+
+fn transcription_metrics_text(metrics: TranscriptionProgress) -> (String, String) {
+    let speed = metrics.realtime_speed();
+    let token_rate = metrics
+        .tokens_per_second
+        .map(|rate| format!("{rate:.1} tokens/s"))
+        .unwrap_or_else(|| "Measuring tokens/s".into());
+    (
+        format!("{token_rate}  ·  {speed:.2}× realtime"),
+        format!(
+            "{} · {}% of current chunk · {:.1} s audio in {:.1} s · {} tokens",
+            metrics.source,
+            metrics.chunk_percent,
+            metrics.audio_seconds,
+            metrics.elapsed_seconds,
+            metrics.decoded_tokens
+        ),
+    )
 }
 
 fn update_processing_stages(rows: &[gtk::Label], current: ProcessingStage) {
@@ -2285,5 +2345,22 @@ mod tests {
         assert_eq!(format_duration(42_000), "42 s");
         assert_eq!(format_duration(125_000), "2 min 05 s");
         assert_eq!(format_timestamp(3_723_000), "01:02:03");
+    }
+
+    #[test]
+    fn decoder_metrics_are_human_readable() {
+        let (throughput, detail) = transcription_metrics_text(TranscriptionProgress {
+            source: AudioSource::System,
+            chunk_percent: 75,
+            audio_seconds: 45.0,
+            elapsed_seconds: 30.0,
+            decoded_tokens: 420,
+            tokens_per_second: Some(14.25),
+        });
+        assert_eq!(throughput, "14.2 tokens/s  ·  1.50× realtime");
+        assert_eq!(
+            detail,
+            "system · 75% of current chunk · 45.0 s audio in 30.0 s · 420 tokens"
+        );
     }
 }

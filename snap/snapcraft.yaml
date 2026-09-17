@@ -176,6 +176,7 @@ parts:
       - clang
       - cmake
       - intel-oneapi-compiler-dpcpp-cpp-2026.1
+      - intel-oneapi-dpcpp-ct-2025.3
       - intel-oneapi-mkl-sycl-devel-2026.1
       - libclang-dev
       - libpipewire-0.3-dev

@@ -20,6 +20,12 @@ description: |
   collects screenshots, and creates timestamped, speaker-attributed
   transcripts. Recording and machine-learning inference run locally.
 
+slots:
+  singstone-dbus:
+    interface: dbus
+    bus: session
+    name: io.github.nsg.Singstone
+
 apps:
   singstone:
     command: bin/singstone
@@ -30,6 +36,7 @@ apps:
       LD_LIBRARY_PATH: $SNAP/lib:$SNAP/usr/lib/x86_64-linux-gnu
       SPA_PLUGIN_DIR: $SNAP/usr/lib/x86_64-linux-gnu/spa-0.2
       PIPEWIRE_CONFIG_DIR: $SNAP/usr/share/pipewire
+      PIPEWIRE_MODULE_DIR: $SNAP/usr/lib/x86_64-linux-gnu/pipewire-0.3
       SINGSTONE_WHISPER_MODEL: $SNAP_USER_COMMON/models/ggml-base.en.bin
       SINGSTONE_SEGMENTATION_MODEL: $SNAP_USER_COMMON/models/model.onnx
       SINGSTONE_EMBEDDING_MODEL: $SNAP_USER_COMMON/models/nemo_en_titanet_small.onnx
@@ -40,6 +47,8 @@ apps:
     plugs:
       - home
       - pipewire
+    slots:
+      - singstone-dbus
   model-setup:
     command: bin/singstone model-setup
     daemon: simple
@@ -154,6 +163,7 @@ parts:
       - curl
       - libpipewire-0.3-0t64
       - libspa-0.2-modules
+      - pipewire-bin
       - tar
     build-environment:
       - SHERPA_ONNX_LIB_DIR: $CRAFT_STAGE/lib

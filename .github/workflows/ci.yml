@@ -77,6 +77,11 @@ jobs:
             plugs = Array(main["plugs"])
             abort "home plug is missing" unless plugs.include?("home")
             abort "pipewire plug is missing" unless plugs.include?("pipewire")
+            abort "session D-Bus slot is missing from main app" unless Array(main["slots"]).include?("singstone-dbus")
+            dbus = metadata.dig("slots", "singstone-dbus") || abort("session D-Bus slot missing")
+            abort "session D-Bus slot has the wrong interface" unless dbus["interface"] == "dbus"
+            abort "session D-Bus slot has the wrong bus" unless dbus["bus"] == "session"
+            abort "session D-Bus slot has the wrong name" unless dbus["name"] == "io.github.nsg.Singstone"
             forbidden = plugs & %w[network network-bind]
             abort "runtime network plug declared: #{forbidden.join(", ")}" unless forbidden.empty?
             abort "setup is not a simple user service" unless setup["daemon"] == "simple" && setup["daemon-scope"] == "user"
@@ -84,6 +89,8 @@ jobs:
             abort "setup must have only outbound network" unless Array(setup["plugs"]) == ["network"]
           '
           unsquashfs -l ./*.snap > snap-files.txt
+          grep -q 'usr/share/pipewire/client.conf$' snap-files.txt
+          grep -q 'usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-protocol-native.so$' snap-files.txt
           grep -q 'usr/share/singstone/models.lock$' snap-files.txt
           if grep -Eq '/(ggml-base\.en\.bin|model\.onnx|nemo_en_titanet_small\.onnx)$' snap-files.txt; then
             echo "model weights must not be bundled in the snap" >&2

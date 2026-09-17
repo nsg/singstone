@@ -125,8 +125,11 @@ jobs:
           ruby -ryaml -e '
             metadata = YAML.safe_load_file("built-snap.yaml", aliases: true)
             abort "snap is not strictly confined" unless metadata["confinement"] == "strict"
+            abort "SNAP_UID support is not required" unless Array(metadata["assumes"]).include?("snap-uid-envvars")
             main = metadata.dig("apps", "singstone") || abort("main app missing")
             setup = metadata.dig("apps", "model-setup") || abort("model setup service missing")
+            environment = main["environment"] || abort("main app environment missing")
+            abort "PipeWire runtime directory is wrong" unless environment["PIPEWIRE_RUNTIME_DIR"] == "/run/user/$SNAP_UID"
             plugs = Array(main["plugs"])
             abort "home plug is missing" unless plugs.include?("home")
             abort "pipewire plug is missing" unless plugs.include?("pipewire")

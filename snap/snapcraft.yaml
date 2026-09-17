@@ -6,6 +6,7 @@ grade: stable
 confinement: strict
 assumes:
   - snapd2.68
+  - snap-uid-envvars
 platforms:
   amd64:
 
@@ -37,6 +38,7 @@ apps:
       SPA_PLUGIN_DIR: $SNAP/usr/lib/x86_64-linux-gnu/spa-0.2
       PIPEWIRE_CONFIG_DIR: $SNAP/usr/share/pipewire
       PIPEWIRE_MODULE_DIR: $SNAP/usr/lib/x86_64-linux-gnu/pipewire-0.3
+      PIPEWIRE_RUNTIME_DIR: /run/user/$SNAP_UID
       SINGSTONE_WHISPER_MODEL: $SNAP_USER_COMMON/models/ggml-base.en.bin
       SINGSTONE_SEGMENTATION_MODEL: $SNAP_USER_COMMON/models/model.onnx
       SINGSTONE_EMBEDDING_MODEL: $SNAP_USER_COMMON/models/nemo_en_titanet_small.onnx

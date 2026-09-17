@@ -223,7 +223,8 @@ parts:
         "$CRAFT_PART_INSTALL/bin/singstone-launcher"
       mapfile -t sycl_native_dirs < <(
         find "$CRAFT_PART_BUILD/target-sycl/release/build" \
-          -type f -path '*/out/lib/libggml-sycl.so' -printf '%h\n'
+          -type f -path '*/out/lib/libggml-sycl.so.*' -printf '%h\n' \
+          | sort -u
       )
       if (( ${#sycl_native_dirs[@]} != 1 )); then
         echo "expected one SYCL native library directory, found ${#sycl_native_dirs[@]}" >&2

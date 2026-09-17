@@ -13,11 +13,13 @@ printf 'cpu:%s:%s\n' "${SINGSTONE_WHISPER_BACKEND:-}" "$*"
 EOF
 cat >"$test_root/bin/singstone-sycl" <<'EOF'
 #!/bin/sh
-printf 'sycl:%s:%s:%s\n' \
-  "${SINGSTONE_WHISPER_BACKEND:-}" "${ONEAPI_DEVICE_SELECTOR:-}" "$*"
+printf 'sycl:%s:%s:%s:%s\n' \
+  "${SINGSTONE_WHISPER_BACKEND:-}" "${SINGSTONE_WHISPER_DEVICE:-}" \
+  "${ONEAPI_DEVICE_SELECTOR:-}" "$*"
 EOF
 cat >"$test_root/bin/probe-ok" <<'EOF'
 #!/bin/sh
+printf '%s\n' 'Intel(R) Iris(R) Xe Graphics'
 exit 0
 EOF
 cat >"$test_root/bin/probe-fail" <<'EOF'
@@ -37,7 +39,7 @@ assert_output() {
 }
 
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
-  assert_output 'sycl:intel-sycl:level_zero:gpu:one two words' one 'two words'
+  assert_output 'sycl:intel-sycl:Intel(R) Iris(R) Xe Graphics:level_zero:gpu:one two words' one 'two words'
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-fail" \
   assert_output 'cpu:cpu:one two words' one 'two words'
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
@@ -45,4 +47,4 @@ SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
   assert_output 'cpu:cpu:one two words' one 'two words'
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
   ONEAPI_DEVICE_SELECTOR='level_zero:0' \
-  assert_output 'sycl:intel-sycl:level_zero:0:one two words' one 'two words'
+  assert_output 'sycl:intel-sycl:Intel(R) Iris(R) Xe Graphics:level_zero:0:one two words' one 'two words'

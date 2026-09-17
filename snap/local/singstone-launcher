@@ -13,11 +13,13 @@ export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}"
 if [ "${SINGSTONE_DISABLE_GPU:-0}" != "1" ] \
   && [ -x "$sycl_binary" ] \
   && [ -x "$sycl_probe" ] \
-  && "$sycl_probe"; then
+  && gpu_device=$("$sycl_probe"); then
   export GGML_SYCL_DEVICE="${GGML_SYCL_DEVICE:-0}"
   export SINGSTONE_WHISPER_BACKEND="intel-sycl"
+  export SINGSTONE_WHISPER_DEVICE="${gpu_device:-Intel GPU}"
   exec "$sycl_binary" "$@"
 fi
 
 export SINGSTONE_WHISPER_BACKEND="cpu"
+unset SINGSTONE_WHISPER_DEVICE
 exec "$cpu_binary" "$@"

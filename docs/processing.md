@@ -51,7 +51,8 @@ The Snap packages separate CPU and Intel SYCL builds. Its launcher selects the
 FP16 SYCL build when a probe can open an Intel Level Zero GPU, including the
 Tiger Lake Iris Xe in the Core i7-1185G7. It falls back to the CPU build when
 the device or driver is unavailable. `SINGSTONE_DISABLE_GPU=1` forces that CPU
-path, and the selected backend is printed when Whisper initializes.
+path. The GUI header and processing dialog identify CPU or GPU use, while the
+Settings page and transcription log include the full backend description.
 
 The stage performs these operations:
 

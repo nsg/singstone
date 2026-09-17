@@ -1,6 +1,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <iostream>
 
 int main() noexcept {
   try {
@@ -14,6 +15,7 @@ int main() noexcept {
           // rather than merely finding an entry in the device list.
           sycl::queue queue(device);
           queue.single_task([=]() {}).wait_and_throw();
+          std::cout << device.get_info<sycl::info::device::name>() << '\n';
           return 0;
         }
       }

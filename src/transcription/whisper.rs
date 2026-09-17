@@ -1,4 +1,5 @@
 use super::Transcriber;
+use super::backend;
 use super::vad::{self, SpeechRegion, VadConfig};
 use crate::types::{AudioSource, SAMPLE_RATE, TimedWord, samples_to_ms};
 use std::path::Path;
@@ -23,7 +24,10 @@ impl WhisperTranscriber {
         threads: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         whisper_rs::install_logging_hooks();
-        eprintln!("transcribe: Whisper backend: {}", whisper_backend_name());
+        eprintln!(
+            "transcribe: Whisper backend: {}",
+            backend::current().description
+        );
         let context = WhisperContext::new_with_params(model, WhisperContextParameters::default())?;
         let state = context.create_state()?;
         Ok(Self {
@@ -54,18 +58,6 @@ impl WhisperTranscriber {
         params.set_single_segment(false);
         params.set_no_context(true);
         params
-    }
-}
-
-const fn whisper_backend_name() -> &'static str {
-    if cfg!(feature = "intel-sycl") {
-        "Intel SYCL / Level Zero"
-    } else if cfg!(feature = "vulkan") {
-        "Vulkan"
-    } else if cfg!(feature = "openblas") {
-        "OpenBLAS"
-    } else {
-        "CPU"
     }
 }
 

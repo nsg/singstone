@@ -8,6 +8,7 @@ use crate::model_setup;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase};
 use crate::speaker::enroll;
+use crate::transcription::backend;
 use crate::types::{AudioSource, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -121,6 +122,20 @@ fn build_window(app: &adw::Application) {
     theme.set_active(style_manager.is_dark());
     update_theme_button(&theme);
     header.pack_end(&theme);
+    let whisper_backend = backend::current();
+    let backend_badge = status_pill(
+        whisper_backend.badge,
+        if whisper_backend.accelerated {
+            "ok"
+        } else {
+            "idle"
+        },
+    );
+    backend_badge.set_tooltip_text(Some(&format!(
+        "Whisper compute: {}",
+        whisper_backend.description
+    )));
+    header.pack_end(&backend_badge);
     toolbar.add_top_bar(&header);
 
     let banner = adw::Banner::new("");
@@ -1003,6 +1018,22 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
     storage.add(&shots);
     body.append(&storage);
 
+    let compute_group = adw::PreferencesGroup::builder()
+        .title("Transcription compute")
+        .build();
+    let backend = backend::current();
+    let compute = adw::ActionRow::builder()
+        .title("Whisper backend")
+        .subtitle(&backend.description)
+        .build();
+    compute.add_prefix(&gtk::Image::from_icon_name("computer-symbolic"));
+    compute.add_suffix(&status_pill(
+        if backend.accelerated { "GPU" } else { "CPU" },
+        if backend.accelerated { "ok" } else { "idle" },
+    ));
+    compute_group.add(&compute);
+    body.append(&compute_group);
+
     let model_group = adw::PreferencesGroup::builder()
         .title("Local models")
         .description("Downloaded once, verified by SHA-256, and cached per user")
@@ -1477,7 +1508,7 @@ fn wire_processing(
             return;
         }
         busy.set(true);
-        let dialog = processing_dialog();
+        let dialog = processing_dialog(&backend::current());
         let progress = Arc::new(Mutex::new(ProcessingStage::Preparing));
         let cancelled = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
@@ -1602,7 +1633,7 @@ enum ProcessingOutcome {
     Failed(String),
 }
 
-fn processing_dialog() -> ProcessingDialog {
+fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
     let dialog = adw::Dialog::builder()
         .title("Processing session")
         .can_close(false)
@@ -1623,6 +1654,17 @@ fn processing_dialog() -> ProcessingDialog {
     label.add_css_class("title-3");
     label.set_wrap(true);
     body.append(&label);
+    let compute = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    compute.set_halign(gtk::Align::Center);
+    compute.append(&status_pill(
+        if backend.accelerated { "GPU" } else { "CPU" },
+        if backend.accelerated { "ok" } else { "idle" },
+    ));
+    let compute_description = gtk::Label::new(Some(&backend.description));
+    compute_description.add_css_class("dim-label");
+    compute_description.set_wrap(true);
+    compute.append(&compute_description);
+    body.append(&compute);
     let progress = gtk::ProgressBar::new();
     progress.set_fraction(ProcessingStage::Preparing.fraction());
     progress.set_show_text(true);

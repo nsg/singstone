@@ -1,5 +1,6 @@
 //! Speech recognition producing timed words.
 
+pub mod backend;
 pub mod vad;
 pub mod whisper;
 

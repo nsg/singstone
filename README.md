@@ -132,7 +132,8 @@ are `transcript.jsonl` for programs and `transcript.txt` for people.
 The `singstone` launcher opens a small SYCL queue in a separate probe process.
 An Intel FP16 GPU and a working Level Zero driver select the FP16 SYCL build;
 probe errors, missing device access, and other GPU types select the CPU build.
-The transcription log prints the backend in use when Whisper initializes.
+The header, Settings page, processing dialog, and transcription log identify
+the selected backend. GPU mode includes the device name reported by oneAPI.
 
 Model weights are not bundled in the Snap. The setup service downloads the
 exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the

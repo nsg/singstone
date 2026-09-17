@@ -198,7 +198,9 @@ parts:
       cargo clippy --release --all-targets --locked -- -D warnings
       cargo test --release --locked
       craftctl default
+      set +u
       . /opt/intel/oneapi/setvars.sh --force
+      set -u
       icpx -fsycl -O2 snap/local/sycl-probe.cpp \
         -o "$CRAFT_PART_INSTALL/bin/singstone-sycl-probe"
       GGML_SYCL_F16=ON \

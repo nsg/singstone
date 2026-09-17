@@ -118,7 +118,7 @@ are `transcript.jsonl` for programs and `transcript.txt` for people.
 | Component | Access | Purpose |
 |---|---|---|
 | `singstone` | `home`, `pipewire`; no network | Recording, processing, and transcript output |
-| `model-setup` | outbound network only | On-demand, per-user download of pinned models |
+| `model-download` | outbound network, private Unix socket | On-demand, per-user download of pinned models |
 
 Model weights are not bundled in the Snap. The setup service downloads the
 exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the
@@ -136,7 +136,7 @@ diagnostics:
 ```bash
 snap connections singstone
 snap services singstone
-snap logs -n=100 singstone.model-setup
+snap logs -n=100 singstone.model-download
 ```
 
 ## Commands

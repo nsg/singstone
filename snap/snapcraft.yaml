@@ -44,26 +44,33 @@ apps:
       SINGSTONE_EMBEDDING_MODEL: $SNAP_USER_COMMON/models/nemo_en_titanet_small.onnx
       SINGSTONE_MODELS_LOCK: $SNAP/usr/share/singstone/models.lock
       SINGSTONE_MODELS_DIR: $SNAP_USER_COMMON/models
-      SINGSTONE_MODEL_SETUP_SERVICE: $SNAP_INSTANCE_NAME.model-setup
+      SINGSTONE_MODEL_SETUP_SOCKET: $SNAP_USER_COMMON/model-setup.sock
       SINGSTONE_SPEAKERS_DB: $SNAP_USER_COMMON/speakers.json
     plugs:
       - home
       - pipewire
     slots:
       - singstone-dbus
-  model-setup:
-    command: bin/singstone model-setup
+  model-download:
+    command: usr/lib/singstone/model-download-service
+    command-chain:
+      - snap/command-chain/desktop-launch
     daemon: simple
     daemon-scope: user
-    install-mode: disable
     restart-condition: never
     refresh-mode: endure
+    sockets:
+      activation:
+        listen-stream: $SNAP_USER_COMMON/model-setup.sock
+        socket-mode: 384
     environment:
       LD_LIBRARY_PATH: $SNAP/lib:$SNAP/usr/lib/x86_64-linux-gnu
       SINGSTONE_MODELS_LOCK: $SNAP/usr/share/singstone/models.lock
       SINGSTONE_MODELS_DIR: $SNAP_USER_COMMON/models
+      SINGSTONE_MODEL_SETUP_SOCKET: $SNAP_USER_COMMON/model-setup.sock
     plugs:
       - network
+      - network-bind
 
 parts:
   onnxruntime:
@@ -181,5 +188,7 @@ parts:
       install -Dm644 LICENSE "$CRAFT_PART_INSTALL/usr/share/doc/singstone/LICENSE"
       install -Dm644 snap/local/THIRD_PARTY.md \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/THIRD_PARTY.md"
+      install -Dm755 snap/local/model-download-service \
+        "$CRAFT_PART_INSTALL/usr/lib/singstone/model-download-service"
       install -Dm644 snap/local/licenses/pyannote-segmentation.LICENSE \
         "$CRAFT_PART_INSTALL/usr/share/singstone/licenses/pyannote-segmentation.LICENSE"

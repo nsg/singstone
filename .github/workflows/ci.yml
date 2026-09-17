@@ -127,9 +127,11 @@ jobs:
             abort "snap is not strictly confined" unless metadata["confinement"] == "strict"
             abort "SNAP_UID support is not required" unless Array(metadata["assumes"]).include?("snap-uid-envvars")
             main = metadata.dig("apps", "singstone") || abort("main app missing")
-            setup = metadata.dig("apps", "model-setup") || abort("model setup service missing")
+            setup = metadata.dig("apps", "model-download") || abort("model download service missing")
+            abort "obsolete model setup service remains" if metadata.dig("apps", "model-setup")
             environment = main["environment"] || abort("main app environment missing")
             abort "PipeWire runtime directory is wrong" unless environment["PIPEWIRE_RUNTIME_DIR"] == "/run/user/$SNAP_UID"
+            abort "model setup socket path is wrong" unless environment["SINGSTONE_MODEL_SETUP_SOCKET"] == "$SNAP_USER_COMMON/model-setup.sock"
             plugs = Array(main["plugs"])
             abort "home plug is missing" unless plugs.include?("home")
             abort "pipewire plug is missing" unless plugs.include?("pipewire")
@@ -140,20 +142,25 @@ jobs:
             abort "session D-Bus slot has the wrong name" unless dbus["name"] == "io.github.nsg.Singstone"
             forbidden = plugs & %w[network network-bind]
             abort "runtime network plug declared: #{forbidden.join(", ")}" unless forbidden.empty?
-            abort "setup is not a simple user service" unless setup["daemon"] == "simple" && setup["daemon-scope"] == "user"
-            abort "setup must start on demand" unless setup["install-mode"] == "disable"
-            abort "setup must have only outbound network" unless Array(setup["plugs"]) == ["network"]
+            abort "download helper is not a simple user service" unless setup["daemon"] == "simple" && setup["daemon-scope"] == "user"
+            abort "download helper lacks the GNOME runtime loader" unless setup["command-chain"] == ["snap/command-chain/desktop-launch"]
+            abort "download helper socket is disabled" if setup["install-mode"] == "disable"
+            socket = setup.dig("sockets", "activation") || abort("download helper activation socket missing")
+            abort "download helper socket has the wrong path" unless socket["listen-stream"] == "$SNAP_USER_COMMON/model-setup.sock"
+            abort "download helper socket is not private" unless socket["socket-mode"] == 384
+            abort "download helper has the wrong plugs" unless Array(setup["plugs"]) == %w[network network-bind]
           '
           unsquashfs -l ./*.snap > snap-files.txt
           grep -q 'usr/share/pipewire/client.conf$' snap-files.txt
           grep -q 'usr/lib/x86_64-linux-gnu/pipewire-0.3/libpipewire-module-protocol-native.so$' snap-files.txt
           grep -q 'usr/share/singstone/models.lock$' snap-files.txt
+          grep -q 'usr/lib/singstone/model-download-service$' snap-files.txt
           if grep -Eq '/(ggml-base\.en\.bin|model\.onnx|nemo_en_titanet_small\.onnx)$' snap-files.txt; then
             echo "model weights must not be bundled in the snap" >&2
             exit 1
           fi
 
-      - name: Install and smoke test
+      - name: Install, upgrade, and smoke test
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pipewire pipewire-bin wireplumber
@@ -163,10 +170,27 @@ jobs:
           source scripts/pw-headless.sh
 
           sudo snap set system experimental.user-daemons=true
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            previous_snap="$RUNNER_TEMP/previous-singstone.snap"
+            curl --fail --location --retry 3 \
+              --output "$previous_snap" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/singstone_amd64.snap"
+            sudo snap install --dangerous "$previous_snap"
+          fi
           sudo snap install --dangerous ./*.snap
           sudo snap connect singstone:pipewire
           singstone --version
           singstone speakers
+
+          model_socket="$HOME/snap/singstone/common/model-setup.sock"
+          for _ in {1..100}; do
+            [[ -S "$model_socket" ]] && break
+            sleep 0.1
+          done
+          test -S "$model_socket"
+          singstone model-setup-check
+          snap services --user singstone.model-download | grep -q 'socket-activated'
+          test ! -e "$HOME/snap/singstone/common/models/.download-status.json"
 
           devices=$(singstone devices)
           grep -q 'test-sink' <<<"$devices"

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ "${LISTEN_PID:-}" != "$$" ] || [ "${LISTEN_FDS:-0}" != "1" ]; then
+    echo "model download service requires one activation socket" >&2
+    exit 1
+fi
+
+export SINGSTONE_MODEL_SETUP_ACTIVATED=1
+unset LISTEN_PID LISTEN_FDS LISTEN_FDNAMES
+exec "$SNAP/bin/singstone" model-setup 0<&3 3<&-

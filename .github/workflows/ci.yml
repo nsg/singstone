@@ -179,7 +179,7 @@ jobs:
             sudo snap install --dangerous "$previous_snap"
           fi
           sudo snap install --dangerous ./*.snap
-          snap restart --user singstone.model-download
+          systemctl --user restart snap.singstone.model-download.activation.socket
           sudo snap connect singstone:pipewire
           singstone --version
           singstone speakers

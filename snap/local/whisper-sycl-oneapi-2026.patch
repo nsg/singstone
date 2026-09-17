@@ -1,0 +1,4 @@
+--- a/whisper.cpp/ggml/src/ggml-sycl/dpct/helper.hpp
++++ b/whisper.cpp/ggml/src/ggml-sycl/dpct/helper.hpp
+@@ -17 +16,0 @@
+-#include <syclcompat/math.hpp>

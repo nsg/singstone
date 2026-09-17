@@ -176,11 +176,11 @@ parts:
       - clang
       - cmake
       - intel-oneapi-compiler-dpcpp-cpp-2026.1
-      - intel-oneapi-dpcpp-ct-2025.3
       - intel-oneapi-mkl-sycl-devel-2026.1
       - libclang-dev
       - libpipewire-0.3-dev
       - libspa-0.2-dev
+      - patch
       - pkg-config
     stage-packages:
       - bzip2
@@ -202,6 +202,16 @@ parts:
       set +u
       . /opt/intel/oneapi/setvars.sh --force
       set -u
+      mapfile -t whisper_sys_dirs < <(
+        find "${CARGO_HOME:-/root/.cargo}/registry/src" \
+          -type d -name 'whisper-rs-sys-0.15.0' -print
+      )
+      if (( ${#whisper_sys_dirs[@]} != 1 )); then
+        echo "expected one whisper-rs-sys 0.15.0 source, found ${#whisper_sys_dirs[@]}" >&2
+        exit 1
+      fi
+      patch --directory="${whisper_sys_dirs[0]}" --strip=1 \
+        < snap/local/whisper-sycl-oneapi-2026.patch
       icpx -fsycl -O2 snap/local/sycl-probe.cpp \
         -o "$CRAFT_PART_INSTALL/bin/singstone-sycl-probe"
       GGML_SYCL_F16=ON \

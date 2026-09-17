@@ -31,13 +31,14 @@ environment, not why it must be online.
 ## Native GPU toolchain
 
 The AMD64 Snap builds a second Whisper executable with Intel oneAPI DPC++/C++
-2026.1, the final DPC++ Compatibility Tool headers (2025.3), oneMKL SYCL BLAS
-2026.1, and `GGML_SYCL_F16=ON`. The build packages come from Intel's signed
-oneAPI APT repository; its current signing key is vendored under `snap/keys`
-and selected by its full fingerprint in the Snap recipe. The Snap copies the
-resulting executable's Intel ELF dependency closure and the dynamically loaded
-Level Zero Unified Runtime adapter. The packaged notices come from the same
-oneAPI installation.
+2026.1, oneMKL SYCL BLAS 2026.1, and `GGML_SYCL_F16=ON`. The pinned ggml source
+contains one unused `syclcompat` include removed by newer upstream versions;
+the checked-in one-line patch removes it so this release builds with oneAPI
+2026. The build packages come from Intel's signed oneAPI APT repository; its
+current signing key is vendored under `snap/keys` and selected by its full
+fingerprint in the Snap recipe. The Snap copies the resulting executable's
+Intel ELF dependency closure and the dynamically loaded Level Zero Unified
+Runtime adapter. The packaged notices come from the same oneAPI installation.
 
 Ubuntu Noble's `libze1` and `libze-intel-gpu1` packages provide the Level Zero
 loader and Intel compute driver. The main app already receives `/dev/dri`

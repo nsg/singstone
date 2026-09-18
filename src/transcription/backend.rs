@@ -29,9 +29,13 @@ fn intel_sycl_backend() -> WhisperBackend {
         .ok()
         .filter(|device| !device.trim().is_empty())
         .unwrap_or_else(|| "Intel GPU".into());
+    let runtime = std::env::var("SINGSTONE_WHISPER_RUNTIME")
+        .ok()
+        .filter(|runtime| !runtime.trim().is_empty())
+        .unwrap_or_else(|| "Level Zero".into());
     WhisperBackend {
         badge: "Intel GPU · SYCL",
-        description: format!("{device} — SYCL / Level Zero (FP16)"),
+        description: format!("{device} — SYCL / {runtime} (FP16)"),
         accelerated: true,
     }
 }

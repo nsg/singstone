@@ -36,8 +36,8 @@ the recorded audio is preserved.
 - Records a microphone, a PipeWire sink monitor, or both as aligned 16 kHz audio.
 - Files screenshots against the same meeting clock.
 - Transcribes with Whisper and separates speakers with pyannote and TitaNet.
-- Automatically accelerates Whisper with Intel SYCL and Level Zero on a
-  compatible Intel GPU, with a CPU fallback.
+- Automatically accelerates Whisper with Intel SYCL on a compatible Intel GPU,
+  preferring Level Zero and retrying through OpenCL before using CPU.
 - Recognizes enrolled voices while leaving uncertain matches anonymous.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   explicit processing stages, transcript-side speaker assignment, and editable
@@ -56,9 +56,9 @@ Requirements:
 - PipeWire
 
 The Snap is tuned for the Intel Iris Xe GPU in the Core i7-1185G7 and other
-Intel GPUs that expose Level Zero and native FP16. It probes the packaged GPU
-stack at every launch and otherwise uses the existing CPU build. Set
-`SINGSTONE_DISABLE_GPU=1` to force the CPU path for diagnosis.
+Intel GPUs with native FP16. It probes Level Zero at every launch, retries
+through Intel OpenCL if Level Zero fails, and otherwise uses the existing CPU
+build. Set `SINGSTONE_DISABLE_GPU=1` to force the CPU path for diagnosis.
 The probe writes its last completed stage and exit status to
 `~/snap/singstone/common/gpu-probe.log`; when GPU startup fails, the CPU
 indicator also shows the fallback reason.
@@ -133,10 +133,11 @@ are `transcript.jsonl` for programs and `transcript.txt` for people.
 | `model-download` | outbound network, private Unix socket | On-demand, per-user download of pinned models |
 
 The `singstone` launcher opens a small SYCL queue in a separate probe process.
-An Intel FP16 GPU and a working Level Zero driver select the FP16 SYCL build;
-probe errors, missing device access, and other GPU types select the CPU build.
-The header, Settings page, processing dialog, and transcription log identify
-the selected backend. GPU mode includes the device name reported by oneAPI.
+An Intel FP16 GPU with a working Level Zero or OpenCL driver selects the FP16
+SYCL build. Level Zero is preferred for performance; OpenCL is the automatic
+GPU fallback. Probe errors, missing device access, and other GPU types select
+the CPU build. The header, Settings page, processing dialog, and transcription
+log identify the selected backend, runtime, and device name reported by oneAPI.
 
 Model weights are not bundled in the Snap. The setup service downloads the
 exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the

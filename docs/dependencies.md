@@ -37,14 +37,16 @@ the checked-in one-line patch removes it so this release builds with oneAPI
 2026. The build packages come from Intel's signed oneAPI APT repository; its
 current signing key is vendored under `snap/keys` and selected by its full
 fingerprint in the Snap recipe. The Snap copies the resulting executable's
-Intel ELF dependency closure and the dynamically loaded Level Zero Unified
-Runtime adapter. The packaged notices come from the same oneAPI installation.
+Intel ELF dependency closure and the dynamically loaded Level Zero and OpenCL
+Unified Runtime adapters. The packaged notices come from the same oneAPI
+installation.
 
-Ubuntu Noble's `libze1` and `libze-intel-gpu1` packages provide the Level Zero
-loader and Intel compute driver. The main app already receives `/dev/dri`
-access through the GNOME extension's `opengl` interface. A separate SYCL probe
-requires an Intel GPU with FP16 and a working queue before the launcher starts
-the GPU-linked executable; failure selects the independently built CPU binary.
+Ubuntu Noble's `libze1`, `libze-intel-gpu1`, and `intel-opencl-icd` packages
+provide the two loaders and Intel compute driver. The main app already receives
+`/dev/dri` access through the GNOME extension's `opengl` interface. A separate
+SYCL probe requires an Intel GPU with FP16 and a working queue before the
+launcher starts the GPU-linked executable. Level Zero is tried first, OpenCL
+second, and failure of both selects the independently built CPU binary.
 
 ## Flagged items
 

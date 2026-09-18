@@ -7,10 +7,12 @@ sycl_probe="${SINGSTONE_SYCL_PROBE:-$SNAP/bin/singstone-sycl-probe}"
 probe_state_dir="${SNAP_USER_COMMON:-$SNAP}"
 probe_log="${SINGSTONE_GPU_PROBE_LOG:-$probe_state_dir/gpu-probe.log}"
 
-# Constrain oneAPI to the Level Zero GPU runtime packaged by the snap. The probe
-# runs in a separate process because an unavailable SYCL runtime may terminate
-# during device discovery instead of returning an error to whisper.cpp.
-export ONEAPI_DEVICE_SELECTOR="${ONEAPI_DEVICE_SELECTOR:-level_zero:gpu}"
+# The probe runs in a separate process because an unavailable SYCL runtime may
+# terminate during device discovery instead of returning an error to
+# whisper.cpp. A caller-supplied selector is tried alone; otherwise prefer
+# Level Zero and retry through OpenCL before falling back to CPU.
+requested_selector="${ONEAPI_DEVICE_SELECTOR:-}"
+export OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-$SNAP/etc/OpenCL/vendors}"
 unset SINGSTONE_WHISPER_FALLBACK
 
 if [ "${SINGSTONE_DISABLE_GPU:-0}" != "1" ] \
@@ -18,25 +20,64 @@ if [ "${SINGSTONE_DISABLE_GPU:-0}" != "1" ] \
   && [ -x "$sycl_probe" ]; then
   mkdir -p "$(dirname "$probe_log")"
   probe_log_tmp="$probe_log.tmp.$$"
-  if gpu_device=$({
-    # A faulty GPU runtime must not leave a potentially large core file. The
-    # compound command also captures the shell's signal diagnostic in the log.
-    ulimit -c 0
-    "$sycl_probe"
-  } 2>"$probe_log_tmp"); then
-    printf 'status=0 backend=%s\n' "$ONEAPI_DEVICE_SELECTOR" >>"$probe_log_tmp"
+  : >"$probe_log_tmp"
+
+  probe_device=''
+  probe_status=1
+  probe_selector() {
+    selector=$1
+    printf 'attempt=%s\n' "$selector" >>"$probe_log_tmp"
+    if probe_device=$({
+      # A faulty GPU runtime must not leave a potentially large core file. The
+      # compound command also captures the shell's signal diagnostic in the log.
+      ulimit -c 0
+      ONEAPI_DEVICE_SELECTOR="$selector" "$sycl_probe"
+    } 2>>"$probe_log_tmp"); then
+      probe_status=0
+    else
+      probe_status=$?
+    fi
+    printf 'status=%s backend=%s\n' "$probe_status" "$selector" \
+      >>"$probe_log_tmp"
+    return "$probe_status"
+  }
+
+  selected_runtime=''
+  if [ -n "$requested_selector" ]; then
+    if probe_selector "$requested_selector"; then
+      selected_runtime="$requested_selector"
+    fi
+  elif probe_selector 'level_zero:gpu'; then
+    selected_runtime='level_zero:gpu'
+  else
+    level_zero_status=$probe_status
+    if probe_selector 'opencl:gpu'; then
+      selected_runtime='opencl:gpu'
+    else
+      opencl_status=$probe_status
+    fi
+  fi
+
+  if [ -n "$selected_runtime" ]; then
     mv -f "$probe_log_tmp" "$probe_log"
+    export ONEAPI_DEVICE_SELECTOR="$selected_runtime"
     export GGML_SYCL_DEVICE="${GGML_SYCL_DEVICE:-0}"
     export SINGSTONE_WHISPER_BACKEND="intel-sycl"
-    export SINGSTONE_WHISPER_DEVICE="${gpu_device:-Intel GPU}"
+    export SINGSTONE_WHISPER_DEVICE="${probe_device:-Intel GPU}"
+    case "$selected_runtime" in
+      level_zero:*) export SINGSTONE_WHISPER_RUNTIME='Level Zero' ;;
+      opencl:*) export SINGSTONE_WHISPER_RUNTIME='OpenCL' ;;
+      *) export SINGSTONE_WHISPER_RUNTIME="$selected_runtime" ;;
+    esac
     exec "$sycl_binary" "$@"
   else
-    probe_status=$?
-    printf 'status=%s backend=%s\n' "$probe_status" \
-      "$ONEAPI_DEVICE_SELECTOR" >>"$probe_log_tmp"
     mv -f "$probe_log_tmp" "$probe_log"
-    if [ "$probe_status" -gt 128 ]; then
+    if [ -n "$requested_selector" ] && [ "$probe_status" -gt 128 ]; then
       export SINGSTONE_WHISPER_FALLBACK="Intel GPU probe crashed (exit $probe_status)"
+    elif [ -z "$requested_selector" ] \
+      && { [ "${level_zero_status:-1}" -gt 128 ] \
+        || [ "${opencl_status:-1}" -gt 128 ]; }; then
+      export SINGSTONE_WHISPER_FALLBACK="Intel GPU probes failed (see gpu-probe.log)"
     else
       export SINGSTONE_WHISPER_FALLBACK="No compatible Intel GPU was available"
     fi
@@ -45,4 +86,5 @@ fi
 
 export SINGSTONE_WHISPER_BACKEND="cpu"
 unset SINGSTONE_WHISPER_DEVICE
+unset SINGSTONE_WHISPER_RUNTIME
 exec "$cpu_binary" "$@"

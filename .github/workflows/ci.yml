@@ -123,9 +123,11 @@ jobs:
             bin/singstone-launcher \
             bin/singstone-sycl \
             bin/singstone-sycl-probe \
+            etc/OpenCL/vendors/intel.icd \
             lib/libggml-sycl.so \
             lib/libmkl_sycl_blas.so \
             lib/libsycl.so \
+            lib/libur_adapter_opencl.so \
             lib/libur_adapter_level_zero.so \
             lib/libur_loader.so; do
             grep -Eq "squashfs-root/$payload(\\.|$)" <<<"$file_list"

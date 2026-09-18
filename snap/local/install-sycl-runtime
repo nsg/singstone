@@ -14,15 +14,16 @@ declare -a roots=("$@")
 declare -a queue=("${roots[@]}")
 declare -A visited=()
 
-# Unified Runtime loads Level Zero adapters by name, so they do not appear in
-# the loader's ELF dependency list. Package both adapter generations shipped by
-# the selected oneAPI release; the loader chooses the one it supports.
+# Unified Runtime loads GPU adapters by name, so they do not appear in the
+# loader's ELF dependency list. Package OpenCL plus both Level Zero adapter
+# generations shipped by the selected oneAPI release.
 while IFS= read -r adapter; do
   queue+=("$adapter")
 done < <(
   find /opt/intel/oneapi/compiler/latest/lib \
-    -maxdepth 1 -type l \
-    \( -name 'libur_adapter_level_zero.so.0' \
+    -maxdepth 1 \( -type f -o -type l \) \
+    \( -name 'libur_adapter_opencl.so.0' \
+       -o -name 'libur_adapter_level_zero.so.0' \
        -o -name 'libur_adapter_level_zero_v2.so.0' \) \
     -print
 )
@@ -53,6 +54,7 @@ done
 for required in \
   'libsycl.so.*' \
   'libur_loader.so.*' \
+  'libur_adapter_opencl.so.*' \
   'libur_adapter_level_zero.so.*' \
   'libmkl_sycl_blas.so.*'; do
   compgen -G "$destination/$required" >/dev/null || {
@@ -61,7 +63,12 @@ for required in \
   }
 done
 
-for object in "${roots[@]}" "$destination"/libur_adapter_level_zero*.so.*; do
+declare -a packaged_objects=("${roots[@]}")
+while IFS= read -r adapter; do
+  packaged_objects+=("$adapter")
+done < <(find "$destination" -maxdepth 1 -type f -name 'libur_adapter_*.so.*' -print)
+
+for object in "${packaged_objects[@]}"; do
   if LD_LIBRARY_PATH="$destination" ldd "$object" | grep -q 'not found'; then
     echo "unresolved packaged dependency for $object" >&2
     LD_LIBRARY_PATH="$destination" ldd "$object" >&2

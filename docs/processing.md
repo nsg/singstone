@@ -54,6 +54,13 @@ the device or driver is unavailable. `SINGSTONE_DISABLE_GPU=1` forces that CPU
 path. The GUI header and processing dialog identify CPU or GPU use, while the
 Settings page and transcription log include the full backend description.
 
+The probe runs with core dumps disabled and records its stages in
+`$SNAP_USER_COMMON/gpu-probe.log`. A successful kernel exits directly after
+flushing the device name because some Level Zero runtime versions can fail
+during process teardown after GPU work has already completed. If probing still
+fails, the CPU backend description includes the reason and the log identifies
+the last completed discovery stage.
+
 The stage performs these operations:
 
 1. It runs an energy-based voice activity detector over 20 ms frames. A frame

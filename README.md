@@ -59,6 +59,9 @@ The Snap is tuned for the Intel Iris Xe GPU in the Core i7-1185G7 and other
 Intel GPUs that expose Level Zero and native FP16. It probes the packaged GPU
 stack at every launch and otherwise uses the existing CPU build. Set
 `SINGSTONE_DISABLE_GPU=1` to force the CPU path for diagnosis.
+The probe writes its last completed stage and exit status to
+`~/snap/singstone/common/gpu-probe.log`; when GPU startup fails, the CPU
+indicator also shows the fallback reason.
 
 Download the `.snap` directly from the rolling
 [Latest release](https://github.com/nsg/singstone/releases/latest), then install

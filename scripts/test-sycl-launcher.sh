@@ -26,6 +26,10 @@ cat >"$test_root/bin/probe-fail" <<'EOF'
 #!/bin/sh
 exit 1
 EOF
+cat >"$test_root/bin/probe-crash" <<'EOF'
+#!/bin/sh
+kill -SEGV $$
+EOF
 chmod +x "$test_root/bin/"*
 
 assert_output() {
@@ -39,12 +43,32 @@ assert_output() {
 }
 
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
+  SNAP_USER_COMMON="$test_root/state-ok" \
   assert_output 'sycl:intel-sycl:Intel(R) Iris(R) Xe Graphics:level_zero:gpu:one two words' one 'two words'
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-fail" \
+  SNAP_USER_COMMON="$test_root/state-fail" \
   assert_output 'cpu:cpu:one two words' one 'two words'
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
+  SNAP_USER_COMMON="$test_root/state-disabled" \
   SINGSTONE_DISABLE_GPU=1 \
   assert_output 'cpu:cpu:one two words' one 'two words'
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
+  SNAP_USER_COMMON="$test_root/state-selector" \
   ONEAPI_DEVICE_SELECTOR='level_zero:0' \
   assert_output 'sycl:intel-sycl:Intel(R) Iris(R) Xe Graphics:level_zero:0:one two words' one 'two words'
+
+crash_stderr="$test_root/crash.stderr"
+actual=$(SNAP="$test_root" SNAP_USER_COMMON="$test_root/state-crash" \
+  SINGSTONE_SYCL_PROBE="$test_root/bin/probe-crash" \
+  "$launcher" 2>"$crash_stderr")
+[ "$actual" = 'cpu:cpu:' ] || {
+  printf 'expected crash fallback to CPU, got: %s\n' "$actual" >&2
+  exit 1
+}
+[ ! -s "$crash_stderr" ] || {
+  printf 'probe crash escaped to launcher stderr:\n' >&2
+  cat "$crash_stderr" >&2
+  exit 1
+}
+grep -q '^status=139 backend=level_zero:gpu$' \
+  "$test_root/state-crash/gpu-probe.log"

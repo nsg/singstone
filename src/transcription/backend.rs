@@ -37,9 +37,14 @@ fn intel_sycl_backend() -> WhisperBackend {
 }
 
 fn cpu_backend() -> WhisperBackend {
+    let description = std::env::var("SINGSTONE_WHISPER_FALLBACK")
+        .ok()
+        .filter(|reason| !reason.trim().is_empty())
+        .map(|reason| format!("CPU transcription — {reason}"))
+        .unwrap_or_else(|| "CPU transcription".into());
     WhisperBackend {
         badge: "CPU",
-        description: "CPU transcription".into(),
+        description,
         accelerated: false,
     }
 }

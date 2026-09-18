@@ -55,12 +55,18 @@ Requirements:
 - snapd 2.68 or newer
 - PipeWire
 
-The Snap is tuned for the Intel Iris Xe GPU in the Core i7-1185G7 and other
-Intel GPUs with native FP16. It probes Level Zero at every launch, retries
-through Intel OpenCL if Level Zero fails, and otherwise uses the existing CPU
-build. Set `SINGSTONE_DISABLE_GPU=1` to force the CPU path for diagnosis.
+The Snap is tuned for the Intel Iris Xe GPU in the Core i7-1185G7 and supports
+the Intel GPU families covered by oneAPI 2026: 11th-generation Intel Core
+integrated graphics and newer, Iris Xe, Arc, and Intel data-center GPUs. It
+probes Level Zero at every launch, retries through Intel OpenCL if Level Zero
+fails, and otherwise uses the existing CPU build. Older integrated GPUs can
+pass a trivial SYCL kernel and still fail during Whisper inference, so the
+launcher rejects them before selecting the GPU executable. Set
+`SINGSTONE_DISABLE_GPU=1` to force the CPU path for diagnosis.
 Swedish transcription uses KBLab's Swedish-tuned Whisper Small Q5_0 model and
-sets the Whisper language to `sv` by default.
+sets the Whisper language to `sv` by default. A persistent, default-on Swedish
+toggle in Settings switches to the multilingual OpenAI Whisper Small Q5_1
+model with automatic language detection when turned off.
 The probe writes its last completed stage and exit status to
 `~/snap/singstone/common/gpu-probe.log`; when GPU startup fails, the CPU
 indicator also shows the fallback reason.
@@ -117,12 +123,12 @@ Process the created session directory:
 singstone process ~/Meetings/session-20260914-103000
 ```
 
-The first model-backed command downloads all three pinned models, about
-212 MiB in total. Singstone displays percentage and byte progress, blocks until
+The first model-backed command downloads all four pinned models, about
+393 MiB in total. Singstone displays percentage and byte progress, blocks until
 the files pass verification, and then continues the command automatically:
 
 ```text
-Downloading models [=                       ] 4% 9/212 MiB — kb-whisper-small-q5_0
+Downloading models [=                       ] 2% 9/393 MiB — kb-whisper-small-q5_0
 ```
 
 Later commands reuse the cache. It survives Snap refreshes. The final outputs

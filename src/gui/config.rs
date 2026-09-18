@@ -13,6 +13,7 @@ pub struct GuiConfig {
     pub screenshots_dir: PathBuf,
     pub local_speaker: String,
     pub diarize_mic: bool,
+    pub swedish_transcription: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dark_mode: Option<bool>,
 }
@@ -31,6 +32,7 @@ impl Default for GuiConfig {
                 .unwrap_or_else(|| home.join("Pictures/Screenshots")),
             local_speaker: "Me".into(),
             diarize_mic: true,
+            swedish_transcription: true,
             dark_mode: None,
         }
     }
@@ -87,6 +89,7 @@ mod tests {
         let config = GuiConfig::default();
         assert!(!config.local_speaker.trim().is_empty());
         assert!(config.diarize_mic);
+        assert!(config.swedish_transcription);
         assert_eq!(config.dark_mode, None);
     }
 
@@ -102,6 +105,7 @@ mod tests {
         .expect("deserialize legacy GUI config");
 
         assert!(config.diarize_mic);
+        assert!(config.swedish_transcription);
         assert_eq!(config.dark_mode, None);
     }
 

@@ -47,11 +47,11 @@ pub fn ensure_available(command: &Command) -> io::Result<()> {
         return Ok(());
     };
     let lock = ModelsLock::load(&lock_path)?;
-    let purposes = required_default_purposes(command, &models_dir, &lock);
-    if purposes.is_empty()
-        || purposes
+    let required_models = required_default_models(command, &models_dir, &lock);
+    if required_models.is_empty()
+        || required_models
             .iter()
-            .all(|purpose| purpose_ready(&lock, &models_dir, purpose))
+            .all(|entry| model_ready(&models_dir, entry))
     {
         return Ok(());
     }
@@ -66,9 +66,9 @@ pub fn ensure_available(command: &Command) -> io::Result<()> {
     })?;
 
     wait_for_download(&models_dir, &request_id, &mut service)?;
-    if purposes
+    if required_models
         .iter()
-        .all(|purpose| purpose_ready(&lock, &models_dir, purpose))
+        .all(|entry| model_ready(&models_dir, entry))
     {
         Ok(())
     } else {
@@ -121,11 +121,11 @@ pub fn check_service() -> io::Result<()> {
     Ok(())
 }
 
-fn required_default_purposes<'a>(
+fn required_default_models<'a>(
     command: &'a Command,
     models_dir: &Path,
     lock: &'a ModelsLock,
-) -> Vec<&'a str> {
+) -> Vec<&'a ModelEntry> {
     let mut requested: Vec<(&str, &Path)> = Vec::new();
     match command {
         Command::Process(args) => {
@@ -155,19 +155,15 @@ fn required_default_purposes<'a>(
     requested
         .into_iter()
         .filter_map(|(purpose, path)| {
-            let entry = lock.models.iter().find(|entry| entry.purpose == purpose)?;
-            (path == models_dir.join(&entry.filename)).then_some(purpose)
+            lock.models
+                .iter()
+                .find(|entry| entry.purpose == purpose && path == models_dir.join(&entry.filename))
         })
         .collect()
 }
 
-fn purpose_ready(lock: &ModelsLock, models_dir: &Path, purpose: &str) -> bool {
-    lock.models
-        .iter()
-        .find(|entry| entry.purpose == purpose)
-        .is_some_and(|entry| {
-            verified(&models_dir.join(&entry.filename), entry.size, &entry.sha256).unwrap_or(false)
-        })
+fn model_ready(models_dir: &Path, entry: &ModelEntry) -> bool {
+    verified(&models_dir.join(&entry.filename), entry.size, &entry.sha256).unwrap_or(false)
 }
 
 fn wait_for_download(
@@ -688,6 +684,39 @@ mod tests {
         let mut last = String::new();
         render_progress(&status, false, &mut last).expect("render progress");
         assert_eq!(last, "ready:10");
+    }
+
+    #[test]
+    fn recognizes_each_default_model_for_the_same_purpose() {
+        let models_dir = PathBuf::from("/models");
+        let make_entry = |name: &str, filename: &str| ModelEntry {
+            name: name.into(),
+            purpose: "transcription".into(),
+            upstream: "fixture".into(),
+            url: "file:///fixture".into(),
+            revision: "1".into(),
+            license: "MIT".into(),
+            filename: filename.into(),
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            download_size: None,
+            download_sha256: None,
+            archive_member: None,
+        };
+        let lock = ModelsLock {
+            models: vec![
+                make_entry("swedish", "swedish.bin"),
+                make_entry("multilingual", "multilingual.bin"),
+            ],
+        };
+        let mut args = crate::cli::ProcessArgs::for_session("/session".into());
+        args.whisper_model = Some(models_dir.join("multilingual.bin"));
+        let command = Command::Process(args);
+
+        let required = required_default_models(&command, &models_dir, &lock);
+
+        assert_eq!(required.len(), 1);
+        assert_eq!(required[0].name, "multilingual");
     }
 
     #[test]

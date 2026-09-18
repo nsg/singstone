@@ -982,6 +982,7 @@ struct SettingsPage {
     root: gtk::Box,
     meetings: adw::ActionRow,
     screenshots: adw::ActionRow,
+    swedish_transcription: gtk::Switch,
     meetings_change: gtk::Button,
     screenshots_change: gtk::Button,
 }
@@ -1032,6 +1033,18 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
         if backend.accelerated { "ok" } else { "idle" },
     ));
     compute_group.add(&compute);
+    let swedish_row = adw::ActionRow::builder()
+        .title("Swedish transcription")
+        .subtitle("Use KB-Whisper Small; turn off for multilingual Whisper Small")
+        .activatable(true)
+        .build();
+    let swedish_transcription = gtk::Switch::builder()
+        .active(config.swedish_transcription)
+        .valign(gtk::Align::Center)
+        .build();
+    swedish_row.add_suffix(&swedish_transcription);
+    swedish_row.set_activatable_widget(Some(&swedish_transcription));
+    compute_group.add(&swedish_row);
     body.append(&compute_group);
 
     let model_group = adw::PreferencesGroup::builder()
@@ -1039,7 +1052,14 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
         .description("Downloaded once, verified by SHA-256, and cached per user")
         .build();
     for (title, env) in [
-        ("Whisper — transcription", "SINGSTONE_WHISPER_MODEL"),
+        (
+            "KB-Whisper Small — Swedish",
+            "SINGSTONE_WHISPER_MODEL_SWEDISH",
+        ),
+        (
+            "Whisper Small — multilingual",
+            "SINGSTONE_WHISPER_MODEL_MULTILINGUAL",
+        ),
         (
             "pyannote segmentation — diarization",
             "SINGSTONE_SEGMENTATION_MODEL",
@@ -1078,6 +1098,7 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
         root,
         meetings,
         screenshots: shots,
+        swedish_transcription,
         meetings_change,
         screenshots_change,
     }
@@ -1176,6 +1197,27 @@ fn wire_settings(
             recording_shots.set_subtitle(&path.display().to_string());
         });
     });
+
+    let parent = window.clone();
+    let config_for_language = config.clone();
+    let changing_language = Rc::new(Cell::new(false));
+    let changing_language_for_notify = changing_language.clone();
+    page.swedish_transcription
+        .connect_active_notify(move |toggle| {
+            if changing_language_for_notify.get() {
+                return;
+            }
+            let mut updated = config_for_language.borrow().clone();
+            updated.swedish_transcription = toggle.is_active();
+            if let Err(error) = updated.save() {
+                changing_language_for_notify.set(true);
+                toggle.set_active(config_for_language.borrow().swedish_transcription);
+                changing_language_for_notify.set(false);
+                show_error(&parent, "Could not save settings", &error.to_string());
+            } else {
+                *config_for_language.borrow_mut() = updated;
+            }
+        });
 }
 
 fn wire_session_browser(
@@ -1517,11 +1559,23 @@ fn wire_processing(
         let thread_transcription_metrics = transcription_metrics.clone();
         let thread_result = result.clone();
         let thread_cancelled = cancelled.clone();
-        let diarize_mic = config_for_done.borrow().diarize_mic;
+        let (diarize_mic, swedish_transcription) = {
+            let config = config_for_done.borrow();
+            (config.diarize_mic, config.swedish_transcription)
+        };
         std::thread::spawn(move || {
             let prepared = (|| -> Result<ProcessArgs, String> {
                 let mut args = ProcessArgs::for_session(session_path);
                 args.diarize_mic = diarize_mic;
+                let model_env = if swedish_transcription {
+                    "SINGSTONE_WHISPER_MODEL_SWEDISH"
+                } else {
+                    "SINGSTONE_WHISPER_MODEL_MULTILINGUAL"
+                };
+                if let Some(model) = std::env::var_os(model_env) {
+                    args.whisper_model = Some(PathBuf::from(model));
+                }
+                args.language = if swedish_transcription { "sv" } else { "auto" }.into();
                 let command = Command::Process(args);
                 model_setup::ensure_available(&command).map_err(|error| error.to_string())?;
                 let Command::Process(args) = command else {

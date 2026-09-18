@@ -12,6 +12,17 @@
       "sha256": "6768836a51abc902e420c613153e6d418c90ea2774e913274d02ab23170225b7"
     },
     {
+      "name": "whisper-small-q5_1",
+      "purpose": "transcription",
+      "upstream": "ggerganov/whisper.cpp (OpenAI Whisper Small)",
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small-q5_1.bin",
+      "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
+      "license": "MIT",
+      "filename": "ggml-small-q5_1.bin",
+      "size": 190085487,
+      "sha256": "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb"
+    },
+    {
       "name": "pyannote-segmentation-3.0-onnx",
       "purpose": "diarization-segmentation",
       "upstream": "pyannote/segmentation-3.0 converted by k2-fsa/sherpa-onnx",

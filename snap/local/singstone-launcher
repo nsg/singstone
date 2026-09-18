@@ -78,7 +78,13 @@ if [ "${SINGSTONE_DISABLE_GPU:-0}" != "1" ] \
     exec "$sycl_binary" "$@"
   else
     mv -f "$probe_log_tmp" "$probe_log"
-    if [ -n "$requested_selector" ] && [ "$probe_status" -gt 128 ]; then
+    if [ -n "$requested_selector" ] && [ "$probe_status" -eq 2 ]; then
+      export SINGSTONE_WHISPER_FALLBACK="Intel GPU is older than oneAPI 2026 support (11th-generation Core or newer required)"
+    elif [ -z "$requested_selector" ] \
+      && { [ "${level_zero_status:-1}" -eq 2 ] \
+        || [ "${opencl_status:-1}" -eq 2 ]; }; then
+      export SINGSTONE_WHISPER_FALLBACK="Intel GPU is older than oneAPI 2026 support (11th-generation Core or newer required)"
+    elif [ -n "$requested_selector" ] && [ "$probe_status" -gt 128 ]; then
       export SINGSTONE_WHISPER_FALLBACK="Intel GPU probe crashed (exit $probe_status)"
     elif [ -z "$requested_selector" ] \
       && { [ "${level_zero_status:-1}" -gt 128 ] \

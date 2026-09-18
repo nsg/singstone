@@ -6,6 +6,9 @@ files. The Snap itself contains their trusted manifest and notices:
 - `kb-whisper-small-q5_0.bin`, the standard Swedish KB-Whisper Small model
   from [KBLab](https://huggingface.co/KBLab/kb-whisper-small), Apache 2.0. Its
   license is installed as `licenses/kb-whisper-small.LICENSE`.
+- `ggml-small-q5_1.bin`, the multilingual OpenAI Whisper Small model converted
+  and quantized by [whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp),
+  MIT.
 - `segmentation.onnx`, the
   [pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0)
   model converted to ONNX by

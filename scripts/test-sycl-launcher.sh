@@ -27,6 +27,10 @@ cat >"$test_root/bin/probe-fail" <<'EOF'
 #!/bin/sh
 exit 1
 EOF
+cat >"$test_root/bin/probe-unsupported" <<'EOF'
+#!/bin/sh
+exit 2
+EOF
 cat >"$test_root/bin/probe-crash" <<'EOF'
 #!/bin/sh
 kill -SEGV $$
@@ -61,6 +65,9 @@ SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-fail" \
   SNAP_USER_COMMON="$test_root/state-fail" \
   assert_output 'cpu:cpu:No compatible Intel GPU was available:one two words' one 'two words'
+SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-unsupported" \
+  SNAP_USER_COMMON="$test_root/state-unsupported" \
+  assert_output 'cpu:cpu:Intel GPU is older than oneAPI 2026 support (11th-generation Core or newer required):one two words' one 'two words'
 SNAP="$test_root" SINGSTONE_SYCL_PROBE="$test_root/bin/probe-ok" \
   SNAP_USER_COMMON="$test_root/state-disabled" \
   SINGSTONE_DISABLE_GPU=1 \

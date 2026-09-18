@@ -43,20 +43,25 @@ whisper.cpp GGML model. The audio must be 16 kHz mono float PCM, as produced by
 `kb-whisper-small-q5_0.bin` is KBLab's Swedish-tuned Whisper Small model in the
 official GGML Q5_0 format. It is much smaller than large-v3-turbo and KBLab's
 Swedish evaluations report better word error rates than OpenAI large-v3. The
-Snap defaults to Swedish (`sv`) to match this model and avoid a language
-detection pass. Pass `--language auto` or another Whisper language code for an
-exceptional non-Swedish recording. Direct non-Snap builds still default to
-automatic detection. Any compatible, correctly locked whisper.cpp GGML model
-can also be supplied. The same loaded model and inference state are reused for
-the microphone and system tracks. Each enabled raw track is read into memory
-before its transcription pass.
+GUI's Swedish transcription toggle is on by default, selecting this model and
+the fixed `sv` language. Turning it off selects the packaged multilingual
+OpenAI Whisper Small Q5_1 model and automatic language detection. The setting
+persists for later meetings. The command line keeps the Swedish default in the
+Snap; use both `--whisper-model` and `--language` to choose another combination.
+Direct non-Snap builds default to automatic detection. Any compatible,
+correctly locked whisper.cpp GGML model can also be supplied. The same loaded
+model and inference state are reused for the microphone and system tracks.
+Each enabled raw track is read into memory before its transcription pass.
 
 The Snap packages separate CPU and Intel SYCL builds. Its launcher selects the
 FP16 SYCL build when a probe can open an Intel GPU, including the Tiger Lake
-Iris Xe in the Core i7-1185G7. It prefers Level Zero, retries with OpenCL when
-Level Zero fails, and falls back to the CPU build only when neither GPU runtime
-works. `SINGSTONE_DISABLE_GPU=1` forces that CPU path. The GUI header and
-processing dialog identify CPU or GPU use, while the Settings page and
+Iris Xe in the Core i7-1185G7. Intel's oneAPI 2026 GPU support starts with
+11th-generation Intel Core integrated graphics; the probe rejects older
+devices even when they can run its trivial test kernel, because larger ggml
+kernels are not supported there. It prefers Level Zero, retries with OpenCL
+when Level Zero fails, and falls back to the CPU build when no supported GPU
+runtime works. `SINGSTONE_DISABLE_GPU=1` forces that CPU path. The GUI header
+and processing dialog identify CPU or GPU use, while the Settings page and
 transcription log include the device and selected SYCL runtime.
 
 The probe runs with core dumps disabled and records its stages in

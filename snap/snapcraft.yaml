@@ -53,6 +53,8 @@ apps:
       PIPEWIRE_MODULE_DIR: $SNAP/usr/lib/x86_64-linux-gnu/pipewire-0.3
       PIPEWIRE_RUNTIME_DIR: /run/user/$SNAP_UID
       SINGSTONE_WHISPER_MODEL: $SNAP_USER_COMMON/models/kb-whisper-small-q5_0.bin
+      SINGSTONE_WHISPER_MODEL_SWEDISH: $SNAP_USER_COMMON/models/kb-whisper-small-q5_0.bin
+      SINGSTONE_WHISPER_MODEL_MULTILINGUAL: $SNAP_USER_COMMON/models/ggml-small-q5_1.bin
       SINGSTONE_WHISPER_LANGUAGE: sv
       SINGSTONE_SEGMENTATION_MODEL: $SNAP_USER_COMMON/models/model.onnx
       SINGSTONE_EMBEDDING_MODEL: $SNAP_USER_COMMON/models/nemo_en_titanet_small.onnx

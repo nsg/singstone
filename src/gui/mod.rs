@@ -77,6 +77,13 @@ struct ActivePlayback {
     child: Child,
     button: gtk::Button,
     writer_error: Arc<Mutex<Option<String>>>,
+    stderr: Arc<Mutex<String>>,
+}
+
+struct SpawnedPlayback {
+    child: Child,
+    writer_error: Arc<Mutex<Option<String>>>,
+    stderr: Arc<Mutex<String>>,
 }
 
 #[derive(Clone)]
@@ -1921,14 +1928,15 @@ impl PlaybackController {
 
         let generation = self.allocate_id();
         match start_audio_playback(audio_path, start_ms, end_ms) {
-            Ok((child, writer_result)) => {
+            Ok(spawned) => {
                 set_playback_button(button, true);
                 *self.active.borrow_mut() = Some(ActivePlayback {
                     row_id,
                     generation,
-                    child,
+                    child: spawned.child,
                     button: button.clone(),
-                    writer_error: writer_result,
+                    writer_error: spawned.writer_error,
+                    stderr: spawned.stderr,
                 });
                 self.poll(generation, window.clone());
             }
@@ -1966,14 +1974,22 @@ impl PlaybackController {
                 .lock()
                 .ok()
                 .and_then(|mut result| result.take());
-            let error = match (completed, writer_error) {
-                (Ok(status), None) if status.success() => None,
-                (Ok(status), Some(error)) if status.success() => Some(error),
-                (Ok(status), Some(error)) => Some(format!(
+            let stderr = active
+                .stderr
+                .lock()
+                .map(|output| output.trim().to_owned())
+                .unwrap_or_default();
+            let error = match (completed, writer_error, stderr.as_str()) {
+                (Ok(status), None, _) if status.success() => None,
+                (Ok(status), Some(error), _) if status.success() => Some(error),
+                (Ok(status), _, stderr) if !stderr.is_empty() => {
+                    Some(format!("PipeWire playback exited with {status}:\n{stderr}"))
+                }
+                (Ok(status), Some(error), _) => Some(format!(
                     "PipeWire playback exited with {status}. Audio streaming failed: {error}"
                 )),
-                (Ok(status), None) => Some(format!("PipeWire playback exited with {status}.")),
-                (Err(error), _) => Some(format!("Could not monitor PipeWire playback: {error}")),
+                (Ok(status), None, _) => Some(format!("PipeWire playback exited with {status}.")),
+                (Err(error), _, _) => Some(format!("Could not monitor PipeWire playback: {error}")),
             };
             if let Some(error) = error {
                 show_error(&window, "Audio playback stopped", &error);
@@ -1998,24 +2014,17 @@ fn start_audio_playback(
     audio_path: &Path,
     start_ms: u64,
     end_ms: u64,
-) -> io::Result<(Child, Arc<Mutex<Option<String>>>)> {
+) -> io::Result<SpawnedPlayback> {
     let mut audio = fs::File::open(audio_path)?;
     let (offset, byte_count) = audio_byte_range(start_ms, end_ms, audio.metadata()?.len())?;
     audio.seek(SeekFrom::Start(offset))?;
 
     let executable = pw_play_executable();
-    let mut child = ProcessCommand::new(&executable)
-        .arg("--playback")
-        .arg("--raw")
-        .arg(format!("--rate={SAMPLE_RATE}"))
-        .arg("--channels=1")
-        .arg("--channel-map=mono")
-        .arg("--format=f32")
-        .arg("--media-role=Communication")
+    let mut child = pw_play_command(&executable)
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| {
             io::Error::new(
@@ -2031,6 +2040,29 @@ fn start_audio_playback(
             "PipeWire playback did not provide an audio input",
         ));
     };
+    let Some(mut child_stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other(
+            "PipeWire playback did not provide diagnostic output",
+        ));
+    };
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stderr_for_thread = stderr.clone();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 1_024];
+        while let Ok(count) = child_stderr.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            if let Ok(mut output) = stderr_for_thread.lock()
+                && output.len() < 16_384
+            {
+                let remaining = 16_384 - output.len();
+                output.push_str(&String::from_utf8_lossy(&buffer[..count.min(remaining)]));
+            }
+        }
+    });
     let writer_error = Arc::new(Mutex::new(None));
     let writer_error_for_thread = writer_error.clone();
     std::thread::spawn(move || {
@@ -2044,7 +2076,24 @@ fn start_audio_playback(
             *slot = Some(error);
         }
     });
-    Ok((child, writer_error))
+    Ok(SpawnedPlayback {
+        child,
+        writer_error,
+        stderr,
+    })
+}
+
+fn pw_play_command(executable: &Path) -> ProcessCommand {
+    let mut command = ProcessCommand::new(executable);
+    command.args([
+        "--playback",
+        &format!("--rate={SAMPLE_RATE}"),
+        "--channels=1",
+        "--channel-map=mono",
+        "--format=f32",
+        "--media-role=Communication",
+    ]);
+    command
 }
 
 fn pw_play_executable() -> PathBuf {
@@ -2743,5 +2792,26 @@ mod tests {
     fn playback_range_rejects_empty_or_missing_audio() {
         assert!(audio_byte_range(1_000, 1_000, 100_000).is_err());
         assert!(audio_byte_range(2_000, 3_000, 100_000).is_err());
+    }
+
+    #[test]
+    fn playback_command_uses_pipewire_1_0_options() {
+        let command = pw_play_command(Path::new("pw-play"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--playback",
+                "--rate=16000",
+                "--channels=1",
+                "--channel-map=mono",
+                "--format=f32",
+                "--media-role=Communication",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--raw"));
     }
 }

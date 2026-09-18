@@ -2383,6 +2383,17 @@ fn transcript_row(utterance: &Utterance, detail: &SessionDetail, audio_path: Pat
     timestamp.add_css_class("dim-label");
     timestamp.add_css_class("caption");
     head.append(&timestamp);
+    let (source_icon_name, source_label) = match utterance.source {
+        AudioSource::Mic => ("audio-input-microphone-symbolic", "Microphone audio"),
+        AudioSource::System => ("audio-speakers-symbolic", "System audio"),
+    };
+    let source_icon = gtk::Image::from_icon_name(source_icon_name);
+    source_icon.set_pixel_size(16);
+    source_icon.set_tooltip_text(Some(source_label));
+    source_icon.update_property(&[gtk::accessible::Property::Label(source_label)]);
+    source_icon.add_css_class("dim-label");
+    source_icon.set_valign(gtk::Align::Center);
+    head.append(&source_icon);
     let play = gtk::Button::new();
     play.add_css_class("flat");
     play.set_valign(gtk::Align::Center);

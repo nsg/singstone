@@ -104,6 +104,15 @@ fn build_window(app: &adw::Application) {
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
+    let new_recording = header_action_button("media-record-symbolic", "New recording");
+    new_recording.set_tooltip_text(Some("Create a new recording"));
+    header.pack_start(&new_recording);
+    let speakers = header_action_button("system-users-symbolic", "Speakers");
+    speakers.set_tooltip_text(Some("Manage enrolled speakers"));
+    header.pack_start(&speakers);
+    let settings = header_action_button("preferences-system-symbolic", "Settings");
+    settings.set_tooltip_text(Some("Open application settings"));
+    header.pack_start(&settings);
     let header_live = gtk::Box::new(gtk::Orientation::Horizontal, 7);
     let live_icon = gtk::Image::from_icon_name("media-record-symbolic");
     live_icon.add_css_class("recording-dot");
@@ -170,30 +179,10 @@ fn build_window(app: &adw::Application) {
     content_toolbar.add_top_bar(&live_bar.root);
 
     let stack = adw::ViewStack::new();
-    stack.add_titled_with_icon(
-        &recording_page.root,
-        Some("new"),
-        "New recording",
-        "media-record-symbolic",
-    );
-    stack.add_titled_with_icon(
-        &detail.root,
-        Some("session"),
-        "Transcript",
-        "format-justify-left-symbolic",
-    );
-    stack.add_titled_with_icon(
-        &speakers_page.root,
-        Some("speakers"),
-        "Speakers",
-        "system-users-symbolic",
-    );
-    stack.add_titled_with_icon(
-        &settings_page.root,
-        Some("settings"),
-        "Settings",
-        "preferences-system-symbolic",
-    );
+    stack.add_named(&recording_page.root, Some("new"));
+    stack.add_named(&detail.root, Some("session"));
+    stack.add_named(&speakers_page.root, Some("speakers"));
+    stack.add_named(&settings_page.root, Some("settings"));
     let speakers_for_switch = speakers_page.clone();
     let window_for_speakers = window.clone();
     stack.connect_visible_child_name_notify(move |stack| {
@@ -203,10 +192,19 @@ fn build_window(app: &adw::Application) {
     });
     stack.set_visible_child_name("session");
     content_toolbar.set_content(Some(&stack));
-    let switcher = adw::ViewSwitcherBar::new();
-    switcher.set_stack(Some(&stack));
-    switcher.set_reveal(true);
-    content_toolbar.add_bottom_bar(&switcher);
+
+    for (button, page_name) in [
+        (&new_recording, "new"),
+        (&speakers, "speakers"),
+        (&settings, "settings"),
+    ] {
+        let stack = stack.clone();
+        let session_list = session_list.clone();
+        button.connect_clicked(move |_| {
+            session_list.unselect_all();
+            stack.set_visible_child_name(page_name);
+        });
+    }
 
     let split = adw::NavigationSplitView::new();
     split.set_min_sidebar_width(250.0);
@@ -2254,6 +2252,15 @@ fn status_pill(text: &str, class: &str) -> gtk::Label {
     label.add_css_class(&format!("pill-{class}"));
     label.set_valign(gtk::Align::Center);
     label
+}
+
+fn header_action_button(icon_name: &str, label: &str) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.append(&gtk::Image::from_icon_name(icon_name));
+    content.append(&gtk::Label::new(Some(label)));
+    let button = gtk::Button::builder().child(&content).build();
+    button.add_css_class("flat");
+    button
 }
 
 fn set_status(label: &gtk::Label, text: &str, class: &str) {

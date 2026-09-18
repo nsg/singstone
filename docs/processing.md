@@ -267,17 +267,21 @@ tracks when both are available. Missing assignment data is allowed, but
 malformed or unsupported assignment metadata or diarization metadata is an
 error. This stage uses no ML model and is fast.
 
-When microphone and system speech overlap, `render` compares their timed word
-sequences. With both audio tracks available, it confirms candidates from
-correlated 10 ms audio energy patterns at a plausible speaker-to-microphone
-delay. Only matching microphone words are removed, so a local interjection or
-simultaneous unrelated speech is preserved. If either audio track is
-unavailable, render falls back to stricter long-sequence text matching. The raw
+When both audio tracks are available, `render` builds 10 ms RMS envelopes and
+estimates the session's speaker-to-microphone delay and gain from recurring
+correlated windows. It suppresses microphone words whose audio follows that
+leak path, including badly transcribed words, while a word whose microphone
+energy exceeds the predicted leak is kept as local speech or double talk. A
+comparison of the timed word sequences, confirmed by correlated audio energy,
+then runs over the remaining microphone words and removes only matching words.
+Without a calibration only that comparison runs; if an audio track cannot be
+read, it falls back to stricter long-sequence text matching. The raw
 `words.jsonl` remains unchanged.
 
 Every decision is written to `leakage-suppressions.jsonl`, including the two
-matched spans, word count, text similarity, optional audio similarity and
-estimated delay. An empty file means no microphone words were suppressed.
+spans, word count, evidence kind, and optional text similarity, audio similarity,
+and estimated delay. Audio-first decisions omit text similarity. An empty file
+means no microphone words were suppressed.
 
 For each word, `render` considers only diarization segments from the same audio
 source. It chooses the cluster with the greatest timestamp overlap. When there

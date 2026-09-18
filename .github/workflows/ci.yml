@@ -133,6 +133,7 @@ jobs:
             lib/libze_loader.so.1.34.0 \
             lib/libze_tracing_layer.so.1.34.0 \
             lib/libze_validation_layer.so.1.34.0 \
+            usr/bin/pw-play \
             usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so \
             usr/share/singstone/licenses/kb-whisper-small.LICENSE; do
             grep -Eq "squashfs-root/$payload(\\.|$)" <<<"$file_list"

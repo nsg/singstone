@@ -52,19 +52,6 @@ impl ProcessingStage {
         }
     }
 
-    pub fn fraction(self) -> f64 {
-        match self {
-            Self::Preparing => 0.05,
-            Self::TranscribingMic => 0.12,
-            Self::TranscribingSystem => 0.3,
-            Self::Diarizing => 0.55,
-            Self::Recognizing => 0.78,
-            Self::Merging => 0.88,
-            Self::Writing => 0.95,
-            Self::Finished => 1.0,
-        }
-    }
-
     pub const ALL: [Self; 8] = [
         Self::Preparing,
         Self::TranscribingMic,
@@ -83,6 +70,30 @@ impl ProcessingStage {
             .unwrap_or(0)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcessingProgress {
+    pub stage: ProcessingStage,
+    pub fraction: Option<f64>,
+}
+
+impl ProcessingProgress {
+    fn indeterminate(stage: ProcessingStage) -> Self {
+        Self {
+            stage,
+            fraction: None,
+        }
+    }
+
+    fn determinate(stage: ProcessingStage, fraction: f64) -> Self {
+        Self {
+            stage,
+            fraction: Some(fraction.clamp(0.0, 1.0)),
+        }
+    }
+}
+
+type ProcessingProgressReporter = Arc<dyn Fn(ProcessingProgress) + Send + Sync>;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TranscriptionMetadata {
@@ -117,26 +128,34 @@ pub fn run(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn run_with_progress(
     args: ProcessArgs,
-    progress: impl Fn(ProcessingStage),
+    progress: impl Fn(ProcessingStage) + Send + Sync + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     run_with_control(args, progress, Arc::new(AtomicBool::new(false)))
 }
 
 pub fn run_with_control(
     args: ProcessArgs,
-    progress: impl Fn(ProcessingStage),
+    progress: impl Fn(ProcessingStage) + Send + Sync + 'static,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_control_and_metrics(args, progress, cancelled, Arc::new(|_| {}))
+    run_with_control_and_metrics(
+        args,
+        move |update| progress(update.stage),
+        cancelled,
+        Arc::new(|_| {}),
+    )
 }
 
 pub fn run_with_control_and_metrics(
     args: ProcessArgs,
-    progress: impl Fn(ProcessingStage),
+    progress: impl Fn(ProcessingProgress) + Send + Sync + 'static,
     cancelled: Arc<AtomicBool>,
     transcription_progress: ProgressReporter,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    progress(ProcessingStage::Preparing);
+    let progress: ProcessingProgressReporter = Arc::new(progress);
+    progress(ProcessingProgress::indeterminate(
+        ProcessingStage::Preparing,
+    ));
     ensure_not_cancelled(&cancelled)?;
     let (session, manifest) = open_session(&args.session)?;
     let threads = thread_count(args.threads);
@@ -152,14 +171,16 @@ pub fn run_with_control_and_metrics(
             threads,
             &mut words,
             false,
-            Some(&progress),
+            Some(progress.clone()),
             Some(&cancelled),
             Some(transcription_progress),
         )?;
     }
 
     ensure_not_cancelled(&cancelled)?;
-    progress(ProcessingStage::Diarizing);
+    progress(ProcessingProgress::indeterminate(
+        ProcessingStage::Diarizing,
+    ));
     let diarization_started = Instant::now();
     let mut segments = diarize_sources(&args, &session, &manifest, threads, false)?;
     sort_segments(&mut segments);
@@ -172,9 +193,24 @@ pub fn run_with_control_and_metrics(
     );
 
     ensure_not_cancelled(&cancelled)?;
-    progress(ProcessingStage::Recognizing);
+    progress(ProcessingProgress::indeterminate(
+        ProcessingStage::Recognizing,
+    ));
     let recognition_started = Instant::now();
-    let recognition = recognize_speakers(&args, &session, &segments, threads, false)?;
+    let recognition_progress = progress.clone();
+    let recognition = recognize_speakers(
+        &args,
+        &session,
+        &segments,
+        threads,
+        false,
+        Some(&move |fraction| {
+            recognition_progress(ProcessingProgress::determinate(
+                ProcessingStage::Recognizing,
+                fraction,
+            ));
+        }),
+    )?;
     write_speaker_assignments(&args, &session, &segments, &recognition)?;
     eprintln!(
         "recognize speakers: {:.1} s",
@@ -182,11 +218,14 @@ pub fn run_with_control_and_metrics(
     );
 
     ensure_not_cancelled(&cancelled)?;
-    progress(ProcessingStage::Merging);
+    progress(ProcessingProgress::indeterminate(ProcessingStage::Merging));
     render_artifacts_with_hook(&session, &manifest, args.diarize_mic, || {
-        progress(ProcessingStage::Writing);
+        progress(ProcessingProgress::indeterminate(ProcessingStage::Writing));
     })?;
-    progress(ProcessingStage::Finished);
+    progress(ProcessingProgress::determinate(
+        ProcessingStage::Finished,
+        1.0,
+    ));
     Ok(())
 }
 
@@ -287,6 +326,7 @@ pub fn run_recognize(args: RecognizeArgs) -> Result<(), Box<dyn std::error::Erro
         &segments,
         thread_count(process.threads),
         true,
+        None,
     )?;
     write_speaker_assignments(&process, &session, &segments, &recognition)?;
     Ok(())
@@ -496,7 +536,7 @@ fn transcribe_sources(
     threads: usize,
     words: &mut Vec<TimedWord>,
     strict_audio: bool,
-    progress: Option<&dyn Fn(ProcessingStage)>,
+    processing_progress: Option<ProcessingProgressReporter>,
     cancelled: Option<&AtomicBool>,
     transcription_progress: Option<ProgressReporter>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -512,12 +552,33 @@ fn transcribe_sources(
         args.models_lock.as_deref(),
         args.allow_unverified_models,
     )?;
+    let processing_for_metrics = processing_progress.clone();
+    let transcription_for_metrics = transcription_progress.clone();
+    let combined_progress =
+        if processing_for_metrics.is_some() || transcription_for_metrics.is_some() {
+            Some(Arc::new(
+                move |metrics: crate::transcription::TranscriptionProgress| {
+                    if let Some(progress) = &processing_for_metrics {
+                        let stage = match metrics.source {
+                            AudioSource::Mic => ProcessingStage::TranscribingMic,
+                            AudioSource::System => ProcessingStage::TranscribingSystem,
+                        };
+                        progress(ProcessingProgress::determinate(stage, metrics.fraction()));
+                    }
+                    if let Some(progress) = &transcription_for_metrics {
+                        progress(metrics);
+                    }
+                },
+            ) as ProgressReporter)
+        } else {
+            None
+        };
     let mut transcriber = WhisperTranscriber::new(
         model,
         AudioSource::Mic,
         args.language.clone(),
         threads,
-        transcription_progress,
+        combined_progress,
     )?;
     for (source, enabled) in [
         (AudioSource::Mic, manifest.mic.enabled),
@@ -530,11 +591,11 @@ fn transcribe_sources(
         if samples.is_empty() {
             continue;
         }
-        if let Some(progress) = progress {
-            progress(match source {
+        if let Some(progress) = &processing_progress {
+            progress(ProcessingProgress::indeterminate(match source {
                 AudioSource::Mic => ProcessingStage::TranscribingMic,
                 AudioSource::System => ProcessingStage::TranscribingSystem,
-            });
+            }));
         }
         let started = Instant::now();
         transcriber.set_source(source);
@@ -702,6 +763,7 @@ fn recognize_speakers(
     segments: &[SpeakerSegment],
     threads: usize,
     strict: bool,
+    progress: Option<&dyn Fn(f64)>,
 ) -> Result<RecognitionResult, Box<dyn std::error::Error>> {
     if segments.is_empty() {
         eprintln!("speaker recognition: no diarized clusters; skipped");
@@ -798,6 +860,18 @@ fn recognize_speakers(
         return Ok(RecognitionResult::default());
     }
 
+    let total_clusters = segments
+        .iter()
+        .filter(|segment| segment.end_ms.saturating_sub(segment.start_ms) >= 1_500)
+        .map(|segment| (segment.source, segment.cluster))
+        .collect::<HashSet<_>>()
+        .len();
+    let mut completed_clusters = 0usize;
+    if let Some(progress) = progress
+        && total_clusters > 0
+    {
+        progress(0.0);
+    }
     let mut result = RecognitionResult::default();
     for source in [AudioSource::System, AudioSource::Mic] {
         let source_segments = segments
@@ -817,7 +891,13 @@ fn recognize_speakers(
                 continue;
             }
         };
-        let cluster_embeddings = embed_clusters(&extractor, &samples, &source_segments);
+        let cluster_embeddings =
+            embed_clusters_with_progress(&extractor, &samples, &source_segments, || {
+                completed_clusters += 1;
+                if let Some(progress) = progress {
+                    progress(completed_clusters as f64 / total_clusters as f64);
+                }
+            });
         let mut candidates = Vec::new();
         eprintln!("speaker recognition ({source}):");
         eprintln!("cluster\tbest candidate\tscore\tassigned");
@@ -1284,6 +1364,15 @@ fn embed_clusters(
     samples: &[f32],
     segments: &[&SpeakerSegment],
 ) -> BTreeMap<u32, Vec<f32>> {
+    embed_clusters_with_progress(extractor, samples, segments, || {})
+}
+
+fn embed_clusters_with_progress(
+    extractor: &EmbeddingExtractor,
+    samples: &[f32],
+    segments: &[&SpeakerSegment],
+    mut completed_cluster: impl FnMut(),
+) -> BTreeMap<u32, Vec<f32>> {
     let mut grouped: BTreeMap<u32, Vec<&SpeakerSegment>> = BTreeMap::new();
     for segment in segments
         .iter()
@@ -1316,6 +1405,7 @@ fn embed_clusters(
         if let Some(mean) = embedding::mean_normalized(&embeddings) {
             output.insert(cluster, mean);
         }
+        completed_cluster();
     }
     output
 }
@@ -1402,6 +1492,22 @@ mod tests {
     use crate::speaker::database::{EmbeddingModelIdentity, SpeakerRecord};
     use crate::types::{ScreenshotEntry, StreamInfo, TimelineEvent};
     use serde::{Serialize, de::DeserializeOwned};
+
+    #[test]
+    fn stage_progress_is_indeterminate_or_clamped() {
+        assert_eq!(
+            ProcessingProgress::indeterminate(ProcessingStage::Diarizing).fraction,
+            None
+        );
+        assert_eq!(
+            ProcessingProgress::determinate(ProcessingStage::Recognizing, 1.5).fraction,
+            Some(1.0)
+        );
+        assert_eq!(
+            ProcessingProgress::determinate(ProcessingStage::TranscribingMic, -0.5).fraction,
+            Some(0.0)
+        );
+    }
 
     #[test]
     fn best_score_uses_max_enrollment_embedding() {

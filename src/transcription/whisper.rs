@@ -82,11 +82,23 @@ impl Transcriber for WhisperTranscriber {
             regions.len(),
             speech_samples as f64 / SAMPLE_RATE as f64
         );
+        let source_started = Instant::now();
+        let total_seconds = samples.len() as f64 / SAMPLE_RATE as f64;
         if regions.is_empty() {
+            if let Some(progress) = &self.progress {
+                progress(TranscriptionProgress {
+                    source: self.source,
+                    processed_seconds: total_seconds,
+                    total_seconds,
+                    audio_seconds: 0.0,
+                    elapsed_seconds: source_started.elapsed().as_secs_f64(),
+                    decoded_tokens: 0,
+                    tokens_per_second: None,
+                });
+            }
             return Ok(Vec::new());
         }
         let mut words = Vec::new();
-        let source_started = Instant::now();
         let mut completed_audio_seconds = 0.0;
         let mut decoded_tokens = 0u64;
         let mut tokens_per_second = None;
@@ -96,6 +108,7 @@ impl Transcriber for WhisperTranscriber {
                 .chunks(chunk_samples)
                 .enumerate()
             {
+                let chunk_sample_count = chunk.len();
                 let mut padded = Vec::new();
                 let audio = if chunk.len() < SAMPLE_RATE as usize {
                     padded.extend_from_slice(chunk);
@@ -105,6 +118,7 @@ impl Transcriber for WhisperTranscriber {
                     chunk
                 };
                 let audio_seconds = audio.len() as f64 / SAMPLE_RATE as f64;
+                let offset_samples = region.start + chunk_number * chunk_samples;
                 let chunk_started = Instant::now();
                 let mut params = Self::params(&self.language, self.threads);
                 if let Some(progress) = self.progress.clone() {
@@ -117,7 +131,10 @@ impl Transcriber for WhisperTranscriber {
                         let percent = percent.clamp(0, 100) as u8;
                         progress(TranscriptionProgress {
                             source,
-                            chunk_percent: percent,
+                            processed_seconds: (offset_samples as f64
+                                + chunk_sample_count as f64 * f64::from(percent) / 100.0)
+                                / SAMPLE_RATE as f64,
+                            total_seconds,
                             audio_seconds: base_audio_seconds
                                 + audio_seconds * f64::from(percent) / 100.0,
                             elapsed_seconds: transcription_started.elapsed().as_secs_f64(),
@@ -127,9 +144,8 @@ impl Transcriber for WhisperTranscriber {
                     });
                 }
                 self.state.full(params, audio)?;
-                let offset_samples = region.start + chunk_number * chunk_samples;
                 let offset_ms = samples_to_ms(offset_samples as u64);
-                let chunk_end_ms = offset_ms + samples_to_ms(chunk.len() as u64);
+                let chunk_end_ms = offset_ms + samples_to_ms(chunk_sample_count as u64);
                 let mut chunk_words = Vec::new();
                 let mut chunk_tokens = 0u64;
                 for segment in self.state.as_iter() {
@@ -194,7 +210,9 @@ impl Transcriber for WhisperTranscriber {
                 if let Some(progress) = &self.progress {
                     progress(TranscriptionProgress {
                         source: self.source,
-                        chunk_percent: 100,
+                        processed_seconds: (offset_samples + chunk_sample_count) as f64
+                            / SAMPLE_RATE as f64,
+                        total_seconds,
                         audio_seconds: completed_audio_seconds,
                         elapsed_seconds: source_started.elapsed().as_secs_f64(),
                         decoded_tokens,
@@ -202,6 +220,17 @@ impl Transcriber for WhisperTranscriber {
                     });
                 }
             }
+        }
+        if let Some(progress) = &self.progress {
+            progress(TranscriptionProgress {
+                source: self.source,
+                processed_seconds: total_seconds,
+                total_seconds,
+                audio_seconds: completed_audio_seconds,
+                elapsed_seconds: source_started.elapsed().as_secs_f64(),
+                decoded_tokens,
+                tokens_per_second,
+            });
         }
         words.sort_by_key(|word| (word.start_ms, word.end_ms));
         words.retain(|word| {

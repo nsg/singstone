@@ -3,7 +3,7 @@ mod config;
 use crate::audio::{devices, record};
 use crate::cli::{Command, EnrollArgs, ProcessArgs, RecordArgs};
 use crate::format::jsonl;
-use crate::merge::process::{self, ProcessingStage};
+use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
 use crate::model_setup;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase};
@@ -16,8 +16,9 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::fs;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,6 +65,20 @@ struct RecordingJob {
     telemetry: record::RecordingTelemetry,
 }
 
+#[derive(Clone, Default)]
+struct PlaybackController {
+    active: Rc<RefCell<Option<ActivePlayback>>>,
+    next_id: Rc<Cell<u64>>,
+}
+
+struct ActivePlayback {
+    row_id: u64,
+    generation: u64,
+    child: Child,
+    button: gtk::Button,
+    writer_error: Arc<Mutex<Option<String>>>,
+}
+
 #[derive(Clone)]
 struct SessionDetail {
     root: gtk::Box,
@@ -76,6 +91,7 @@ struct SessionDetail {
     metadata: gtk::Box,
     files: gtk::Box,
     selected: Rc<RefCell<Option<PathBuf>>>,
+    playback: PlaybackController,
     window: adw::ApplicationWindow,
 }
 
@@ -185,8 +201,13 @@ fn build_window(app: &adw::Application) {
     stack.add_named(&settings_page.root, Some("settings"));
     let speakers_for_switch = speakers_page.clone();
     let window_for_speakers = window.clone();
+    let playback_for_switch = detail.playback.clone();
     stack.connect_visible_child_name_notify(move |stack| {
-        if stack.visible_child_name().as_deref() == Some("speakers") {
+        let visible = stack.visible_child_name();
+        if visible.as_deref() != Some("session") {
+            playback_for_switch.stop();
+        }
+        if visible.as_deref() == Some("speakers") {
             speakers_for_switch.refresh(&window_for_speakers);
         }
     });
@@ -307,9 +328,11 @@ fn build_window(app: &adw::Application) {
         changing_theme_for_system.set(false);
     });
 
+    let playback_on_close = detail.playback.clone();
     let stop_on_close = recording_page.job.clone();
     let close_after_stop = close_when_recording_stops.clone();
     window.connect_close_request(move |_| {
+        playback_on_close.stop();
         if let Some(job) = stop_on_close.borrow().as_ref() {
             job.stop.store(true, Ordering::Release);
             close_after_stop.set(true);
@@ -719,6 +742,7 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         metadata,
         files,
         selected: Rc::new(RefCell::new(None)),
+        playback: PlaybackController::default(),
         window: window.clone(),
     }
 }
@@ -1549,7 +1573,10 @@ fn wire_processing(
         }
         busy.set(true);
         let dialog = processing_dialog(&backend::current());
-        let progress = Arc::new(Mutex::new(ProcessingStage::Preparing));
+        let progress = Arc::new(Mutex::new(ProcessingProgress {
+            stage: ProcessingStage::Preparing,
+            fraction: None,
+        }));
         let transcription_metrics = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
@@ -1585,8 +1612,8 @@ fn wire_processing(
                 Err(error) => ProcessingOutcome::Failed(error),
                 Ok(args) => match process::run_with_control_and_metrics(
                     args,
-                    |stage| {
-                        *thread_progress.lock().expect("processing progress mutex") = stage;
+                    move |update| {
+                        *thread_progress.lock().expect("processing progress mutex") = update;
                     },
                     thread_cancelled,
                     Arc::new(move |metrics| {
@@ -1612,6 +1639,7 @@ fn wire_processing(
         let label = dialog.label.clone();
         let bar = dialog.progress.clone();
         let stages = dialog.stages.clone();
+        let metrics_box = dialog.metrics.clone();
         let throughput = dialog.throughput.clone();
         let throughput_detail = dialog.throughput_detail.clone();
         let cancel_button = dialog.cancel.clone();
@@ -1634,17 +1662,32 @@ fn wire_processing(
         let search_for_poll = search_for_done.clone();
         let selected_for_poll = selected.clone();
         glib::timeout_add_local(Duration::from_millis(150), move || {
-            let stage = *progress.lock().expect("processing progress mutex");
+            let update = *progress.lock().expect("processing progress mutex");
+            let stage = update.stage;
             if !cancelled.load(Ordering::Acquire) {
                 label.set_label(stage.label());
             }
-            bar.set_fraction(stage.fraction());
             update_processing_stages(&stages, stage);
-            if let Some(metrics) = *transcription_metrics
+            let metrics = *transcription_metrics
                 .lock()
-                .expect("transcription metrics mutex")
-            {
+                .expect("transcription metrics mutex");
+            let current_metrics = metrics.filter(|metrics| {
+                matches!(
+                    (stage, metrics.source),
+                    (ProcessingStage::TranscribingMic, AudioSource::Mic)
+                        | (ProcessingStage::TranscribingSystem, AudioSource::System)
+                )
+            });
+            metrics_box.set_visible(current_metrics.is_some());
+            if let Some(metrics) = current_metrics {
                 update_transcription_metrics(&throughput, &throughput_detail, metrics);
+                update_transcription_progress(&bar, metrics);
+            } else if let Some(fraction) = update.fraction {
+                bar.set_fraction(fraction);
+                bar.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+            } else {
+                bar.pulse();
+                bar.set_text(Some("Working…"));
             }
             let completed = result.lock().expect("processing result mutex").take();
             let Some(result) = completed else {
@@ -1691,6 +1734,7 @@ struct ProcessingDialog {
     label: gtk::Label,
     progress: gtk::ProgressBar,
     stages: Vec<gtk::Label>,
+    metrics: gtk::Box,
     throughput: gtk::Label,
     throughput_detail: gtk::Label,
     cancel: gtk::Button,
@@ -1736,6 +1780,7 @@ fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
     body.append(&compute);
     let metrics = gtk::Box::new(gtk::Orientation::Vertical, 2);
     metrics.set_halign(gtk::Align::Center);
+    metrics.set_visible(false);
     let throughput = gtk::Label::new(Some("Measuring decoder throughput…"));
     throughput.add_css_class("title-4");
     throughput.set_tooltip_text(Some(
@@ -1747,8 +1792,9 @@ fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
     metrics.append(&throughput_detail);
     body.append(&metrics);
     let progress = gtk::ProgressBar::new();
-    progress.set_fraction(ProcessingStage::Preparing.fraction());
+    progress.set_pulse_step(0.04);
     progress.set_show_text(true);
+    progress.set_text(Some("Working…"));
     body.append(&progress);
     let stages_box = gtk::Box::new(gtk::Orientation::Vertical, 7);
     stages_box.set_margin_top(4);
@@ -1779,6 +1825,7 @@ fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
         label,
         progress,
         stages,
+        metrics,
         throughput,
         throughput_detail,
         cancel,
@@ -1795,6 +1842,21 @@ fn update_transcription_metrics(
     detail.set_label(&detail_text);
 }
 
+fn update_transcription_progress(bar: &gtk::ProgressBar, metrics: TranscriptionProgress) {
+    let fraction = metrics.fraction();
+    bar.set_fraction(fraction);
+    bar.set_text(Some(&transcription_progress_text(metrics)));
+}
+
+fn transcription_progress_text(metrics: TranscriptionProgress) -> String {
+    format!(
+        "{:.0} / {:.0} s  ·  {:.0}%",
+        metrics.processed_seconds,
+        metrics.total_seconds,
+        metrics.fraction() * 100.0
+    )
+}
+
 fn transcription_metrics_text(metrics: TranscriptionProgress) -> (String, String) {
     let speed = metrics.realtime_speed();
     let token_rate = metrics
@@ -1804,12 +1866,8 @@ fn transcription_metrics_text(metrics: TranscriptionProgress) -> (String, String
     (
         format!("{token_rate}  ·  {speed:.2}× realtime"),
         format!(
-            "{} · {}% of current chunk · {:.1} s audio in {:.1} s · {} tokens",
-            metrics.source,
-            metrics.chunk_percent,
-            metrics.audio_seconds,
-            metrics.elapsed_seconds,
-            metrics.decoded_tokens
+            "{} · {:.1} s audio in {:.1} s · {} tokens",
+            metrics.source, metrics.audio_seconds, metrics.elapsed_seconds, metrics.decoded_tokens
         ),
     )
 }
@@ -1834,8 +1892,224 @@ fn update_processing_stages(rows: &[gtk::Label], current: ProcessingStage) {
     }
 }
 
+impl PlaybackController {
+    fn allocate_id(&self) -> u64 {
+        let id = self.next_id.get().wrapping_add(1);
+        self.next_id.set(id);
+        id
+    }
+
+    fn toggle(
+        &self,
+        row_id: u64,
+        button: &gtk::Button,
+        window: &adw::ApplicationWindow,
+        audio_path: &Path,
+        start_ms: u64,
+        end_ms: u64,
+    ) {
+        if self
+            .active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.row_id == row_id)
+        {
+            self.stop();
+            return;
+        }
+        self.stop();
+
+        let generation = self.allocate_id();
+        match start_audio_playback(audio_path, start_ms, end_ms) {
+            Ok((child, writer_result)) => {
+                set_playback_button(button, true);
+                *self.active.borrow_mut() = Some(ActivePlayback {
+                    row_id,
+                    generation,
+                    child,
+                    button: button.clone(),
+                    writer_error: writer_result,
+                });
+                self.poll(generation, window.clone());
+            }
+            Err(error) => show_error(window, "Could not play audio", &error.to_string()),
+        }
+    }
+
+    fn poll(&self, generation: u64, window: adw::ApplicationWindow) {
+        let controller = self.clone();
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            let completed = {
+                let mut slot = controller.active.borrow_mut();
+                let Some(active) = slot.as_mut() else {
+                    return glib::ControlFlow::Break;
+                };
+                if active.generation != generation {
+                    return glib::ControlFlow::Break;
+                }
+                match active.child.try_wait() {
+                    Ok(None) => None,
+                    Ok(Some(status)) => Some(Ok(status)),
+                    Err(error) => Some(Err(error)),
+                }
+            };
+
+            let Some(completed) = completed else {
+                return glib::ControlFlow::Continue;
+            };
+            let Some(active) = controller.active.borrow_mut().take() else {
+                return glib::ControlFlow::Break;
+            };
+            set_playback_button(&active.button, false);
+            let writer_error = active
+                .writer_error
+                .lock()
+                .ok()
+                .and_then(|mut result| result.take());
+            let error = match (completed, writer_error) {
+                (Ok(status), None) if status.success() => None,
+                (Ok(status), Some(error)) if status.success() => Some(error),
+                (Ok(status), Some(error)) => Some(format!(
+                    "PipeWire playback exited with {status}. Audio streaming failed: {error}"
+                )),
+                (Ok(status), None) => Some(format!("PipeWire playback exited with {status}.")),
+                (Err(error), _) => Some(format!("Could not monitor PipeWire playback: {error}")),
+            };
+            if let Some(error) = error {
+                show_error(&window, "Audio playback stopped", &error);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn stop(&self) {
+        let Some(mut active) = self.active.borrow_mut().take() else {
+            return;
+        };
+        if active.child.try_wait().ok().flatten().is_none() {
+            let _ = active.child.kill();
+        }
+        let _ = active.child.wait();
+        set_playback_button(&active.button, false);
+    }
+}
+
+fn start_audio_playback(
+    audio_path: &Path,
+    start_ms: u64,
+    end_ms: u64,
+) -> io::Result<(Child, Arc<Mutex<Option<String>>>)> {
+    let mut audio = fs::File::open(audio_path)?;
+    let (offset, byte_count) = audio_byte_range(start_ms, end_ms, audio.metadata()?.len())?;
+    audio.seek(SeekFrom::Start(offset))?;
+
+    let executable = pw_play_executable();
+    let mut child = ProcessCommand::new(&executable)
+        .arg("--playback")
+        .arg("--raw")
+        .arg(format!("--rate={SAMPLE_RATE}"))
+        .arg("--channels=1")
+        .arg("--channel-map=mono")
+        .arg("--format=f32")
+        .arg("--media-role=Communication")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not start {}: {error}", executable.display()),
+            )
+        })?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "PipeWire playback did not provide an audio input",
+        ));
+    };
+    let writer_error = Arc::new(Mutex::new(None));
+    let writer_error_for_thread = writer_error.clone();
+    std::thread::spawn(move || {
+        let mut segment = audio.take(byte_count);
+        let result = io::copy(&mut segment, &mut stdin)
+            .and_then(|_| stdin.flush())
+            .map_err(|error| error.to_string());
+        if let Err(error) = result
+            && let Ok(mut slot) = writer_error_for_thread.lock()
+        {
+            *slot = Some(error);
+        }
+    });
+    Ok((child, writer_error))
+}
+
+fn pw_play_executable() -> PathBuf {
+    if let Some(executable) = std::env::var_os("SINGSTONE_PW_PLAY") {
+        return PathBuf::from(executable);
+    }
+    if let Some(snap) = std::env::var_os("SNAP") {
+        let bundled = PathBuf::from(snap).join("usr/bin/pw-play");
+        if bundled.is_file() {
+            return bundled;
+        }
+    }
+    PathBuf::from("pw-play")
+}
+
+fn audio_byte_range(start_ms: u64, end_ms: u64, file_len: u64) -> io::Result<(u64, u64)> {
+    if end_ms <= start_ms {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "audio segment has no duration",
+        ));
+    }
+    const BYTES_PER_SAMPLE: u128 = size_of::<f32>() as u128;
+    let sample_rate = u128::from(SAMPLE_RATE);
+    let start = u128::from(start_ms)
+        .saturating_mul(sample_rate)
+        .saturating_mul(BYTES_PER_SAMPLE)
+        / 1_000;
+    let end = u128::from(end_ms)
+        .saturating_mul(sample_rate)
+        .saturating_add(999)
+        / 1_000
+        * BYTES_PER_SAMPLE;
+    let start = u64::try_from(start).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "audio segment offset is too large",
+        )
+    })?;
+    let end = u64::try_from(end).unwrap_or(u64::MAX);
+    let aligned_file_len = file_len - file_len % size_of::<f32>() as u64;
+    let end = end.min(aligned_file_len);
+    if start >= end {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "audio segment is outside the recorded audio",
+        ));
+    }
+    Ok((start, end - start))
+}
+
+fn set_playback_button(button: &gtk::Button, playing: bool) {
+    let (icon, label) = if playing {
+        ("media-playback-stop-symbolic", "Stop playback")
+    } else {
+        ("media-playback-start-symbolic", "Play this audio segment")
+    };
+    button.set_icon_name(icon);
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+}
+
 impl SessionDetail {
     fn load(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.playback.stop();
         let session = Session::open(path)?;
         let manifest = session.read_manifest()?;
         *self.selected.borrow_mut() = Some(path.to_owned());
@@ -1873,7 +2147,9 @@ impl SessionDetail {
                 append_empty(&self.transcript, "The transcript is empty.");
             } else {
                 for utterance in utterances {
-                    self.transcript.append(&transcript_row(&utterance, self));
+                    let audio_path = session.audio_path(utterance.source);
+                    self.transcript
+                        .append(&transcript_row(&utterance, self, audio_path));
                 }
             }
         } else {
@@ -2025,7 +2301,7 @@ fn session_row(summary: &SessionSummary) -> gtk::ListBoxRow {
     row
 }
 
-fn transcript_row(utterance: &Utterance, detail: &SessionDetail) -> gtk::Box {
+fn transcript_row(utterance: &Utterance, detail: &SessionDetail, audio_path: PathBuf) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     row.add_css_class("transcript-row");
     let avatar = gtk::Image::from_icon_name("avatar-default-symbolic");
@@ -2058,6 +2334,19 @@ fn transcript_row(utterance: &Utterance, detail: &SessionDetail) -> gtk::Box {
     timestamp.add_css_class("dim-label");
     timestamp.add_css_class("caption");
     head.append(&timestamp);
+    let play = gtk::Button::new();
+    play.add_css_class("flat");
+    play.set_valign(gtk::Align::Center);
+    set_playback_button(&play, false);
+    let playback = detail.playback.clone();
+    let row_id = playback.allocate_id();
+    let window = detail.window.clone();
+    let start_ms = utterance.start_ms;
+    let end_ms = utterance.end_ms;
+    play.connect_clicked(move |button| {
+        playback.toggle(row_id, button, &window, &audio_path, start_ms, end_ms);
+    });
+    head.append(&play);
     if is_assignable_speaker(utterance) {
         let assign = gtk::Button::with_label("Assign…");
         assign.add_css_class("flat");
@@ -2410,18 +2699,49 @@ mod tests {
 
     #[test]
     fn decoder_metrics_are_human_readable() {
-        let (throughput, detail) = transcription_metrics_text(TranscriptionProgress {
+        let metrics = TranscriptionProgress {
             source: AudioSource::System,
-            chunk_percent: 75,
+            processed_seconds: 45.0,
+            total_seconds: 60.0,
             audio_seconds: 45.0,
             elapsed_seconds: 30.0,
             decoded_tokens: 420,
             tokens_per_second: Some(14.25),
-        });
+        };
+        let (throughput, detail) = transcription_metrics_text(metrics);
         assert_eq!(throughput, "14.2 tokens/s  ·  1.50× realtime");
+        assert_eq!(detail, "system · 45.0 s audio in 30.0 s · 420 tokens");
+        let progress = TranscriptionProgress {
+            processed_seconds: 1_498.0,
+            total_seconds: 1_986.0,
+            ..metrics
+        };
         assert_eq!(
-            detail,
-            "system · 75% of current chunk · 45.0 s audio in 30.0 s · 420 tokens"
+            transcription_progress_text(progress),
+            "1498 / 1986 s  ·  75%"
         );
+    }
+
+    #[test]
+    fn playback_range_uses_utterance_timestamps() {
+        assert_eq!(audio_byte_range(0, 1_000, 80_000).unwrap(), (0, 64_000));
+        assert_eq!(
+            audio_byte_range(1_250, 1_750, 200_000).unwrap(),
+            (80_000, 32_000)
+        );
+    }
+
+    #[test]
+    fn playback_range_clamps_to_complete_recorded_samples() {
+        assert_eq!(
+            audio_byte_range(1_000, 2_000, 80_003).unwrap(),
+            (64_000, 16_000)
+        );
+    }
+
+    #[test]
+    fn playback_range_rejects_empty_or_missing_audio() {
+        assert!(audio_byte_range(1_000, 1_000, 100_000).is_err());
+        assert!(audio_byte_range(2_000, 3_000, 100_000).is_err());
     }
 }

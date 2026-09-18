@@ -40,8 +40,8 @@ the recorded audio is preserved.
   preferring Level Zero and retrying through OpenCL before using CPU.
 - Recognizes enrolled voices while leaving uncertain matches anonymous.
 - Provides a native GTK interface with live capture meters, screenshot counts,
-  explicit processing stages, transcript-side speaker assignment, and editable
-  storage folders.
+  per-stage processing progress, transcript-side audio playback and speaker
+  assignment, and editable storage folders.
 - Learns an anonymous diarized voice when it is named in the transcript, or
   enrolls voices from clean WAV/raw samples on the Speakers page.
 - Keeps recording and inference offline under Snap confinement.

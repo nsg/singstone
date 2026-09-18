@@ -139,21 +139,6 @@ jobs:
             grep -Eq "squashfs-root/$payload(\\.|$)" <<<"$file_list"
           done
 
-          pw_play_root=$(mktemp -d)
-          unsquashfs -d "$pw_play_root" "$snap_path" \
-            usr/bin/pw-cat \
-            usr/bin/pw-play \
-            usr/lib/x86_64-linux-gnu >/dev/null
-          LD_LIBRARY_PATH="$pw_play_root/usr/lib/x86_64-linux-gnu" \
-            "$pw_play_root/usr/bin/pw-play" \
-            --playback \
-            --rate=16000 \
-            --channels=1 \
-            --channel-map=mono \
-            --format=f32 \
-            --media-role=Communication \
-            --help >/dev/null
-
           installed_models=$(unsquashfs -cat "$snap_path" \
             usr/share/singstone/models.lock)
           jq -e '

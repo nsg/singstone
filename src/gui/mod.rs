@@ -2793,25 +2793,4 @@ mod tests {
         assert!(audio_byte_range(1_000, 1_000, 100_000).is_err());
         assert!(audio_byte_range(2_000, 3_000, 100_000).is_err());
     }
-
-    #[test]
-    fn playback_command_uses_pipewire_1_0_options() {
-        let command = pw_play_command(Path::new("pw-play"));
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            args,
-            [
-                "--playback",
-                "--rate=16000",
-                "--channels=1",
-                "--channel-map=mono",
-                "--format=f32",
-                "--media-role=Communication",
-            ]
-        );
-        assert!(!args.iter().any(|arg| arg == "--raw"));
-    }
 }

@@ -141,8 +141,11 @@ jobs:
 
           pw_play_root=$(mktemp -d)
           unsquashfs -d "$pw_play_root" "$snap_path" \
-            usr/bin/pw-cat usr/bin/pw-play >/dev/null
-          "$pw_play_root/usr/bin/pw-play" \
+            usr/bin/pw-cat \
+            usr/bin/pw-play \
+            usr/lib/x86_64-linux-gnu >/dev/null
+          LD_LIBRARY_PATH="$pw_play_root/usr/lib/x86_64-linux-gnu" \
+            "$pw_play_root/usr/bin/pw-play" \
             --playback \
             --rate=16000 \
             --channels=1 \

@@ -33,7 +33,9 @@ kill -SEGV $$
 EOF
 cat >"$test_root/bin/probe-opencl" <<'EOF'
 #!/bin/sh
-if [ "${ONEAPI_DEVICE_SELECTOR:-}" = 'opencl:gpu' ]; then
+if [ "${ONEAPI_DEVICE_SELECTOR:-}" = 'opencl:gpu' ] \
+  && [ "${OCL_ICD_VENDORS:-}" = \
+    "$SNAP/usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so" ]; then
   printf '%s\n' 'Intel(R) Iris(R) Xe Graphics'
   exit 0
 fi

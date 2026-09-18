@@ -61,6 +61,9 @@ apps:
       SINGSTONE_SPEAKERS_DB: $SNAP_USER_COMMON/speakers.json
     plugs:
       - home
+      # Required for /dev/dri render nodes. The GNOME extension currently
+      # contributes this plug too, but keep the GPU requirement explicit.
+      - opengl
       - pipewire
     slots:
       - singstone-dbus
@@ -86,6 +89,37 @@ apps:
       - network-bind
 
 parts:
+  # Ubuntu 24.04 ships Level Zero loader 1.16.1. Its private tracing ABI is
+  # incompatible with the static Level Zero client in oneAPI 2026: the client
+  # passes one DDI table while the old loader writes through three arguments.
+  # Keep the modern loader in /lib, ahead of the distro copy in LD_LIBRARY_PATH.
+  level-zero-loader:
+    plugin: nil
+    source: https://github.com/oneapi-src/level-zero.git
+    source-type: git
+    source-commit: 934714b278f850d164627eeaaa043eee02785a9e
+    build-packages:
+      - build-essential
+      - cmake
+      - ninja-build
+    override-build: |
+      cmake \
+        -S "$CRAFT_PART_SRC" \
+        -B "$CRAFT_PART_BUILD/loader-build" \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_L0_LOADER_TESTS=OFF
+      cmake --build "$CRAFT_PART_BUILD/loader-build" \
+        --target ze_loader \
+        --parallel "$CRAFT_PARALLEL_BUILD_COUNT"
+      mkdir -p \
+        "$CRAFT_PART_INSTALL/lib" \
+        "$CRAFT_PART_INSTALL/usr/share/doc/singstone"
+      cp -a "$CRAFT_PART_BUILD/loader-build/lib/libze_loader.so"* \
+        "$CRAFT_PART_INSTALL/lib/"
+      install -Dm644 "$CRAFT_PART_SRC/LICENSE" \
+        "$CRAFT_PART_INSTALL/usr/share/doc/singstone/level-zero-LICENSE"
+
   onnxruntime:
     plugin: nil
     source: https://github.com/microsoft/onnxruntime.git
@@ -166,6 +200,7 @@ parts:
 
   singstone:
     after:
+      - level-zero-loader
       - sherpa-onnx
     plugin: rust
     source: .

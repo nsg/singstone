@@ -71,6 +71,7 @@ the unsigned build:
 curl -fLO https://github.com/nsg/singstone/releases/latest/download/singstone_amd64.snap
 sudo snap set system experimental.user-daemons=true
 sudo snap install --dangerous ./singstone_amd64.snap
+sudo snap connect singstone:opengl
 sudo snap connect singstone:pipewire
 ```
 
@@ -129,7 +130,7 @@ are `transcript.jsonl` for programs and `transcript.txt` for people.
 
 | Component | Access | Purpose |
 |---|---|---|
-| `singstone` | `home`, `pipewire`; no network | Recording, processing, and transcript output |
+| `singstone` | `home`, `opengl`, `pipewire`; no network | Recording, GPU inference, processing, and transcript output |
 | `model-download` | outbound network, private Unix socket | On-demand, per-user download of pinned models |
 
 The `singstone` launcher opens a small SYCL queue in a separate probe process.

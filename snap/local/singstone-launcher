@@ -12,7 +12,11 @@ probe_log="${SINGSTONE_GPU_PROBE_LOG:-$probe_state_dir/gpu-probe.log}"
 # whisper.cpp. A caller-supplied selector is tried alone; otherwise prefer
 # Level Zero and retry through OpenCL before falling back to CPU.
 requested_selector="${ONEAPI_DEVICE_SELECTOR:-}"
-export OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-$SNAP/etc/OpenCL/vendors}"
+intel_opencl_driver="$SNAP/usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so"
+# Ubuntu's intel.icd contains an absolute host path. Point the ICD loader at
+# the driver inside the snap so strict confinement cannot resolve the wrong
+# filesystem location.
+export OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-$intel_opencl_driver}"
 unset SINGSTONE_WHISPER_FALLBACK
 
 if [ "${SINGSTONE_DISABLE_GPU:-0}" != "1" ] \

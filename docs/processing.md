@@ -61,6 +61,8 @@ flushing the device name because some Level Zero runtime versions can fail
 during process teardown after GPU work has already completed. If probing still
 fails, the CPU backend description includes the reason and the log identifies
 the last completed discovery stage for both Level Zero and OpenCL attempts.
+The launcher points the OpenCL ICD loader directly at the driver bundled inside
+the strictly confined Snap rather than using Ubuntu's absolute host path.
 
 The stage performs these operations:
 

@@ -41,14 +41,15 @@ Intel ELF dependency closure and the dynamically loaded Level Zero and OpenCL
 Unified Runtime adapters. The packaged notices come from the same oneAPI
 installation.
 
-The Level Zero loader is built from pinned upstream source because Ubuntu
-Noble's 1.16 loader has an internal tracing ABI that is incompatible with
-oneAPI 2026. Ubuntu's `libze-intel-gpu1` and `intel-opencl-icd` packages provide
-the Intel compute drivers and OpenCL loader. The main app declares the
-`opengl` interface for `/dev/dri` access. A separate SYCL probe requires an
-Intel GPU with FP16 and a working queue before the launcher starts the
-GPU-linked executable. Level Zero is tried first, OpenCL second, and failure of
-both selects the independently built CPU binary.
+The Level Zero 1.21.9 loader is built from pinned upstream source because
+Ubuntu Noble's 1.16 loader has an internal tracing ABI that is incompatible
+with oneAPI 2026, while newer loader releases no longer initialize correctly
+with Noble's Intel compute runtime. Ubuntu's `libze-intel-gpu1` and
+`intel-opencl-icd` packages provide the Intel compute drivers and OpenCL
+loader. The main app declares the `opengl` interface for `/dev/dri` access. A
+separate SYCL probe requires an Intel GPU with FP16 and a working queue before
+the launcher starts the GPU-linked executable. Level Zero is tried first,
+OpenCL second, and failure of both selects the independently built CPU binary.
 
 ## Flagged items
 

@@ -15,7 +15,9 @@ requested_selector="${ONEAPI_DEVICE_SELECTOR:-}"
 intel_opencl_driver="$SNAP/usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so"
 # Ubuntu's intel.icd contains an absolute host path. Point the ICD loader at
 # the driver inside the snap so strict confinement cannot resolve the wrong
-# filesystem location.
+# filesystem location. oneAPI's Khronos loader uses OCL_ICD_FILENAMES, while
+# Ubuntu's ocl-icd loader accepts the direct path through OCL_ICD_VENDORS.
+export OCL_ICD_FILENAMES="${OCL_ICD_FILENAMES:-$intel_opencl_driver}"
 export OCL_ICD_VENDORS="${OCL_ICD_VENDORS:-$intel_opencl_driver}"
 unset SINGSTONE_WHISPER_FALLBACK
 

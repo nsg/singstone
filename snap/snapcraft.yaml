@@ -92,12 +92,14 @@ parts:
   # Ubuntu 24.04 ships Level Zero loader 1.16.1. Its private tracing ABI is
   # incompatible with the static Level Zero client in oneAPI 2026: the client
   # passes one DDI table while the old loader writes through three arguments.
-  # Keep the modern loader in /lib, ahead of the distro copy in LD_LIBRARY_PATH.
+  # Level Zero 1.21.9 is new enough for oneAPI's one-argument tracing ABI while
+  # remaining compatible with Noble's Intel compute runtime. Keep it in /lib,
+  # ahead of the distro copy in LD_LIBRARY_PATH.
   level-zero-loader:
     plugin: nil
     source: https://github.com/oneapi-src/level-zero.git
     source-type: git
-    source-commit: 934714b278f850d164627eeaaa043eee02785a9e
+    source-commit: 74997ed8856f0fa71ce06c788a176cebe9e7742d
     build-packages:
       - build-essential
       - cmake

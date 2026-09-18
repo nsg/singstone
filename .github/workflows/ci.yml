@@ -130,7 +130,7 @@ jobs:
             lib/libur_adapter_opencl.so \
             lib/libur_adapter_level_zero.so \
             lib/libur_loader.so \
-            lib/libze_loader.so.1.34.0 \
+            lib/libze_loader.so.1.21.9 \
             usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so; do
             grep -Eq "squashfs-root/$payload(\\.|$)" <<<"$file_list"
           done

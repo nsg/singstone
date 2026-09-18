@@ -92,14 +92,15 @@ parts:
   # Ubuntu 24.04 ships Level Zero loader 1.16.1. Its private tracing ABI is
   # incompatible with the static Level Zero client in oneAPI 2026: the client
   # passes one DDI table while the old loader writes through three arguments.
-  # Level Zero 1.21.9 is new enough for oneAPI's one-argument tracing ABI while
-  # remaining compatible with Noble's Intel compute runtime. Keep it in /lib,
-  # ahead of the distro copy in LD_LIBRARY_PATH.
+  # Build the 1.34 loader and its tracing/validation layers as one matched set.
+  # Keeping only the new loader beside Noble's 1.16 layers makes oneAPI 2026
+  # reject the old tracing DDI during enumeration. Keep the matched set in
+  # /lib, ahead of the distro copies in LD_LIBRARY_PATH.
   level-zero-loader:
     plugin: nil
     source: https://github.com/oneapi-src/level-zero.git
     source-type: git
-    source-commit: 74997ed8856f0fa71ce06c788a176cebe9e7742d
+    source-commit: 934714b278f850d164627eeaaa043eee02785a9e
     build-packages:
       - build-essential
       - cmake
@@ -112,12 +113,16 @@ parts:
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_L0_LOADER_TESTS=OFF
       cmake --build "$CRAFT_PART_BUILD/loader-build" \
-        --target ze_loader \
+        --target ze_loader ze_tracing_layer ze_validation_layer \
         --parallel "$CRAFT_PARALLEL_BUILD_COUNT"
       mkdir -p \
         "$CRAFT_PART_INSTALL/lib" \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone"
       cp -a "$CRAFT_PART_BUILD/loader-build/lib/libze_loader.so"* \
+        "$CRAFT_PART_INSTALL/lib/"
+      cp -a "$CRAFT_PART_BUILD/loader-build/lib/libze_tracing_layer.so"* \
+        "$CRAFT_PART_INSTALL/lib/"
+      cp -a "$CRAFT_PART_BUILD/loader-build/lib/libze_validation_layer.so"* \
         "$CRAFT_PART_INSTALL/lib/"
       install -Dm644 "$CRAFT_PART_SRC/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/singstone/level-zero-LICENSE"

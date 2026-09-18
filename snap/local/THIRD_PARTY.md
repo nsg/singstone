@@ -21,8 +21,9 @@ installed `models.lock` file.
 
 - Intel oneAPI DPC++/C++ and Unified Runtime 2026.1 provide the SYCL runtime.
 - Intel oneMKL 2026.1 provides the SYCL BLAS implementation used by ggml.
-- The Level Zero loader 1.21.9 is built from a pinned upstream source commit;
-  its MIT license is installed as `level-zero-LICENSE`.
+- The Level Zero loader and tracing/validation layers 1.34.0 are built from a
+  pinned upstream source commit; their MIT license is installed as
+  `level-zero-LICENSE`.
 - The OpenCL loader and Intel compute runtime come from Ubuntu Noble's
   `libze-intel-gpu1` and `intel-opencl-icd` packages. Their package copyright
   and license files are included under `/usr/share/doc`.

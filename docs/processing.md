@@ -31,8 +31,8 @@ runs.
 
 ```bash
 singstone transcribe SESSION \
-    --whisper-model ~/.local/share/singstone/models/ggml-large-v3-turbo.bin \
-    --language auto --threads 8
+    --whisper-model ~/.local/share/singstone/models/kb-whisper-small-q5_0.bin \
+    --language sv --threads 8
 ```
 
 **Input:** `manifest.json`, every enabled `audio/*.f32le` track, and a
@@ -40,12 +40,16 @@ whisper.cpp GGML model. The audio must be 16 kHz mono float PCM, as produced by
 `record`.
 
 **Model:** Whisper, through `whisper-rs`. The packaged
-`ggml-large-v3-turbo.bin` model is multilingual, and language detection is
-enabled by default. A specific Whisper language code can be supplied with
-`--language`; any compatible, correctly locked whisper.cpp GGML model can also
-be supplied. The same loaded model and inference state are reused for the
-microphone and system tracks. Each enabled raw track is read into memory before
-its transcription pass.
+`kb-whisper-small-q5_0.bin` is KBLab's Swedish-tuned Whisper Small model in the
+official GGML Q5_0 format. It is much smaller than large-v3-turbo and KBLab's
+Swedish evaluations report better word error rates than OpenAI large-v3. The
+Snap defaults to Swedish (`sv`) to match this model and avoid a language
+detection pass. Pass `--language auto` or another Whisper language code for an
+exceptional non-Swedish recording. Direct non-Snap builds still default to
+automatic detection. Any compatible, correctly locked whisper.cpp GGML model
+can also be supplied. The same loaded model and inference state are reused for
+the microphone and system tracks. Each enabled raw track is read into memory
+before its transcription pass.
 
 The Snap packages separate CPU and Intel SYCL builds. Its launcher selects the
 FP16 SYCL build when a probe can open an Intel GPU, including the Tiger Lake

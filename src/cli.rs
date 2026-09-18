@@ -97,7 +97,7 @@ pub struct ProcessArgs {
     #[arg(long)]
     pub skip_transcription: bool,
     /// Whisper language code (`auto` to detect).
-    #[arg(long, default_value = "auto")]
+    #[arg(long, env = "SINGSTONE_WHISPER_LANGUAGE", default_value = "auto")]
     pub language: String,
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]
@@ -129,7 +129,10 @@ impl ProcessArgs {
             diarize_mic: false,
             no_diarize: false,
             skip_transcription: false,
-            language: "auto".into(),
+            language: std::env::var("SINGSTONE_WHISPER_LANGUAGE")
+                .ok()
+                .filter(|language| !language.trim().is_empty())
+                .unwrap_or_else(|| "auto".into()),
             threads: None,
             speakers_db: std::env::var_os("SINGSTONE_SPEAKERS_DB").map(PathBuf::from),
             speaker_threshold: 0.6,
@@ -153,7 +156,7 @@ pub struct TranscribeArgs {
     #[arg(long)]
     pub allow_unverified_models: bool,
     /// Whisper language code (`auto` to detect).
-    #[arg(long, default_value = "auto")]
+    #[arg(long, env = "SINGSTONE_WHISPER_LANGUAGE", default_value = "auto")]
     pub language: String,
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]

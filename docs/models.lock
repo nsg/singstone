@@ -1,15 +1,15 @@
 {
   "models": [
     {
-      "name": "whisper-large-v3-turbo",
+      "name": "kb-whisper-small-q5_0",
       "purpose": "transcription",
-      "upstream": "ggerganov/whisper.cpp",
-      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo.bin",
-      "revision": "5359861c739e955e79d9a303bcbc70fb988958b1",
-      "license": "MIT",
-      "filename": "ggml-large-v3-turbo.bin",
-      "size": 1624555275,
-      "sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+      "upstream": "KBLab/kb-whisper-small",
+      "url": "https://huggingface.co/KBLab/kb-whisper-small/resolve/3564d61a42fc210ceaa55a22a96dd64478959c78/ggml-model-q5_0.bin",
+      "revision": "3564d61a42fc210ceaa55a22a96dd64478959c78",
+      "license": "Apache-2.0",
+      "filename": "kb-whisper-small-q5_0.bin",
+      "size": 175209680,
+      "sha256": "6768836a51abc902e420c613153e6d418c90ea2774e913274d02ab23170225b7"
     },
     {
       "name": "pyannote-segmentation-3.0-onnx",

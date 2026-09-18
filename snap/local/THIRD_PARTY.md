@@ -3,8 +3,9 @@
 The Snap's model setup service downloads and verifies these checksum-pinned
 files. The Snap itself contains their trusted manifest and notices:
 
-- `ggml-large-v3-turbo.bin`, from
-  [whisper.cpp](https://github.com/ggml-org/whisper.cpp), MIT.
+- `kb-whisper-small-q5_0.bin`, the standard Swedish KB-Whisper Small model
+  from [KBLab](https://huggingface.co/KBLab/kb-whisper-small), Apache 2.0. Its
+  license is installed as `licenses/kb-whisper-small.LICENSE`.
 - `segmentation.onnx`, the
   [pyannote segmentation 3.0](https://huggingface.co/pyannote/segmentation-3.0)
   model converted to ONNX by

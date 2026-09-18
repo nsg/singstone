@@ -133,9 +133,21 @@ jobs:
             lib/libze_loader.so.1.34.0 \
             lib/libze_tracing_layer.so.1.34.0 \
             lib/libze_validation_layer.so.1.34.0 \
-            usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so; do
+            usr/lib/x86_64-linux-gnu/intel-opencl/libigdrcl.so \
+            usr/share/singstone/licenses/kb-whisper-small.LICENSE; do
             grep -Eq "squashfs-root/$payload(\\.|$)" <<<"$file_list"
           done
+
+          installed_models=$(unsquashfs -cat "$snap_path" \
+            usr/share/singstone/models.lock)
+          jq -e '
+            .models[]
+            | select(.purpose == "transcription")
+            | .name == "kb-whisper-small-q5_0"
+              and .filename == "kb-whisper-small-q5_0.bin"
+              and .size == 175209680
+              and .sha256 == "6768836a51abc902e420c613153e6d418c90ea2774e913274d02ab23170225b7"
+          ' <<<"$installed_models"
 
           expanded_snap_yaml=$(unsquashfs -cat "$snap_path" meta/snap.yaml)
           ruby -ryaml -e '

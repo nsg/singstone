@@ -52,7 +52,8 @@ apps:
       PIPEWIRE_CONFIG_DIR: $SNAP/usr/share/pipewire
       PIPEWIRE_MODULE_DIR: $SNAP/usr/lib/x86_64-linux-gnu/pipewire-0.3
       PIPEWIRE_RUNTIME_DIR: /run/user/$SNAP_UID
-      SINGSTONE_WHISPER_MODEL: $SNAP_USER_COMMON/models/ggml-large-v3-turbo.bin
+      SINGSTONE_WHISPER_MODEL: $SNAP_USER_COMMON/models/kb-whisper-small-q5_0.bin
+      SINGSTONE_WHISPER_LANGUAGE: sv
       SINGSTONE_SEGMENTATION_MODEL: $SNAP_USER_COMMON/models/model.onnx
       SINGSTONE_EMBEDDING_MODEL: $SNAP_USER_COMMON/models/nemo_en_titanet_small.onnx
       SINGSTONE_MODELS_LOCK: $SNAP/usr/share/singstone/models.lock
@@ -302,3 +303,5 @@ parts:
         "$CRAFT_PART_INSTALL/usr/lib/singstone/model-download-service"
       install -Dm644 snap/local/licenses/pyannote-segmentation.LICENSE \
         "$CRAFT_PART_INSTALL/usr/share/singstone/licenses/pyannote-segmentation.LICENSE"
+      install -Dm644 snap/local/licenses/kb-whisper-small.LICENSE \
+        "$CRAFT_PART_INSTALL/usr/share/singstone/licenses/kb-whisper-small.LICENSE"

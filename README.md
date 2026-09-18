@@ -59,6 +59,8 @@ The Snap is tuned for the Intel Iris Xe GPU in the Core i7-1185G7 and other
 Intel GPUs with native FP16. It probes Level Zero at every launch, retries
 through Intel OpenCL if Level Zero fails, and otherwise uses the existing CPU
 build. Set `SINGSTONE_DISABLE_GPU=1` to force the CPU path for diagnosis.
+Swedish transcription uses KBLab's Swedish-tuned Whisper Small Q5_0 model and
+sets the Whisper language to `sv` by default.
 The probe writes its last completed stage and exit status to
 `~/snap/singstone/common/gpu-probe.log`; when GPU startup fails, the CPU
 indicator also shows the fallback reason.
@@ -116,11 +118,11 @@ singstone process ~/Meetings/session-20260914-103000
 ```
 
 The first model-backed command downloads all three pinned models, about
-1.6 GiB in total. Singstone displays percentage and byte progress, blocks until
+212 MiB in total. Singstone displays percentage and byte progress, blocks until
 the files pass verification, and then continues the command automatically:
 
 ```text
-Downloading models [=                       ] 4% 71/1593 MiB — whisper-large-v3-turbo
+Downloading models [=                       ] 4% 9/212 MiB — kb-whisper-small-q5_0
 ```
 
 Later commands reuse the cache. It survives Snap refreshes. The final outputs

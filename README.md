@@ -41,7 +41,7 @@ the recorded audio is preserved.
 - Recognizes enrolled voices while leaving uncertain matches anonymous.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback and speaker
-  assignment, and editable storage folders.
+  assignment, editable storage folders, and a one-click header Record button.
 - Learns an anonymous diarized voice when it is named in the transcript, or
   enrolls voices from clean WAV/raw samples on the Speakers page.
 - Keeps recording and inference offline under Snap confinement.

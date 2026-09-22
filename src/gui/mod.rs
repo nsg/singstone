@@ -40,6 +40,7 @@ const CSS: &str = r#"
 .pill-idle { color: @accent_fg_color; background: @accent_bg_color; }
 .pill-busy { color: @warning_fg_color; background: @warning_bg_color; }
 .recording-dot { color: #e01b24; }
+.record-button { border-radius: 999px; padding-left: 12px; padding-right: 12px; font-weight: 600; }
 .live-bar { background: alpha(#e01b24, 0.10); padding: 7px 12px; }
 .pill-button { border-radius: 999px; padding: 8px 26px; font-weight: 600; }
 .navigation-sidebar row { border-radius: 10px; margin: 2px 6px; }
@@ -127,8 +128,17 @@ fn build_window(app: &adw::Application) {
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
-    let new_recording = header_action_button("media-record-symbolic", "New recording");
-    new_recording.set_tooltip_text(Some("Create a new recording"));
+    let record_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    record_content.append(&gtk::Image::from_icon_name("media-record-symbolic"));
+    record_content.append(&gtk::Label::new(Some("Record")));
+    let quick_record = gtk::Button::builder().child(&record_content).build();
+    quick_record.add_css_class("destructive-action");
+    quick_record.add_css_class("record-button");
+    quick_record.set_tooltip_text(Some("Start recording now with the current settings"));
+    header.pack_start(&quick_record);
+    let new_recording = gtk::Button::from_icon_name("document-new-symbolic");
+    new_recording.add_css_class("flat");
+    new_recording.set_tooltip_text(Some("Set up a new recording"));
     header.pack_start(&new_recording);
     let speakers = header_action_button("system-users-symbolic", "Speakers");
     speakers.set_tooltip_text(Some("Manage enrolled speakers"));
@@ -257,6 +267,7 @@ fn build_window(app: &adw::Application) {
         &recording_page,
         &live_bar,
         &header_live,
+        &quick_record,
         &banner,
         &config,
         &session_list,
@@ -1301,6 +1312,7 @@ fn wire_recording(
     page: &RecordingPage,
     live: &LiveBar,
     header_live: &gtk::Box,
+    quick_record: &gtk::Button,
     banner: &adw::Banner,
     config: &Rc<RefCell<GuiConfig>>,
     session_list: &gtk::ListBox,
@@ -1358,12 +1370,8 @@ fn wire_recording(
     let live_mic_group = live.mic_group.clone();
     let live_system_group = live.system_group.clone();
     let header_live_for_start = header_live.clone();
-    page.button.connect_clicked(move |_| {
-        if let Some(active) = job.borrow().as_ref() {
-            active.stop.store(true, Ordering::Release);
-            button.set_label("Stopping…");
-            return;
-        }
+    let quick_record_for_start = quick_record.clone();
+    let start_recording = Rc::new(move || {
         let mic_target = selected_target(&mic, &mic_targets);
         let system_target = selected_target(&system, &system_targets);
         if mic_target == "none" && system_target == "none" {
@@ -1435,6 +1443,27 @@ fn wire_recording(
         live_system_group.set_visible(system_target != "none");
         live_root.set_visible(true);
         header_live_for_start.set_visible(true);
+        quick_record_for_start.set_visible(false);
+    });
+
+    let job_for_button = page.job.clone();
+    let button_for_click = page.button.clone();
+    let start_recording_for_button = start_recording.clone();
+    page.button.connect_clicked(move |_| {
+        if let Some(active) = job_for_button.borrow().as_ref() {
+            active.stop.store(true, Ordering::Release);
+            button_for_click.set_label("Stopping…");
+            return;
+        }
+        start_recording_for_button();
+    });
+
+    let session_list_for_quick = session_list.clone();
+    let stack_for_quick = stack.clone();
+    quick_record.connect_clicked(move |_| {
+        session_list_for_quick.unselect_all();
+        stack_for_quick.set_visible_child_name("new");
+        start_recording();
     });
 
     let time = live.time.clone();
@@ -1451,6 +1480,7 @@ fn wire_recording(
     let name_for_poll = page.name.clone();
     let live_for_poll = live.root.clone();
     let header_for_poll = header_live.clone();
+    let quick_record_for_poll = quick_record.clone();
     let window_for_poll = window.clone();
     let banner_for_poll = banner.clone();
     let config_for_poll = config.clone();
@@ -1503,6 +1533,7 @@ fn wire_recording(
         name_for_poll.set_sensitive(true);
         live_for_poll.set_visible(false);
         header_for_poll.set_visible(false);
+        quick_record_for_poll.set_visible(true);
         time.set_label("00:00");
         mic_level.set_value(0.0);
         system_level.set_value(0.0);

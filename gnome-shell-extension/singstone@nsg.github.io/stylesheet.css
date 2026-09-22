@@ -1,0 +1,32 @@
+.singstone-indicator {
+  spacing: 6px;
+}
+
+.singstone-record-icon {
+  color: #e01b24;
+}
+
+.singstone-elapsed {
+  min-width: 3em;
+}
+
+.singstone-meters {
+  spacing: 2px;
+}
+
+.singstone-meter-row {
+  spacing: 3px;
+}
+
+.singstone-meter-track {
+  width: 40px;
+  height: 5px;
+  border-radius: 3px;
+  background-color: rgba(127, 127, 127, 0.35);
+}
+
+.singstone-meter-fill {
+  height: 5px;
+  border-radius: 3px;
+  background-color: #e01b24;
+}

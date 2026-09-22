@@ -1,0 +1,7 @@
+{
+  "uuid": "singstone@nsg.github.io",
+  "name": "Singstone",
+  "description": "Start and stop Singstone recordings from the top bar and watch the live audio levels",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "url": "https://github.com/nsg/singstone"
+}

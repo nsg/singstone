@@ -35,6 +35,16 @@ jobs:
 
       - run: cargo audit
 
+      - name: Pack GNOME Shell extension
+        run: scripts/pack-gnome-extension.sh
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: singstone-gnome-shell-extension
+          path: dist/singstone-gnome-shell-extension.zip
+          if-no-files-found: error
+          retention-days: 7
+
   snap:
     name: Build snap
     runs-on: ubuntu-24.04
@@ -204,6 +214,11 @@ jobs:
           name: singstone-snap
           path: dist
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: singstone-gnome-shell-extension
+          path: dist
+
       - name: Prepare stable asset name
         run: |
           snap_path=$(find dist -maxdepth 1 -type f -name '*.snap' -print -quit)
@@ -244,13 +259,31 @@ jobs:
           The package is unsigned, so local installation requires `--dangerous`.
           Singstone remains strictly confined. Model weights download and are
           verified automatically when you first run a model-backed command.
+
+          ## GNOME top bar control (optional)
+
+          Install the Shell extension, then log out and back in (Wayland cannot load a
+          new extension into a running session):
+
+              curl -fLO https://github.com/nsg/singstone/releases/latest/download/singstone-gnome-shell-extension.zip
+              gnome-extensions install --force singstone-gnome-shell-extension.zip
+              # log out and in again
+              gnome-extensions enable singstone@nsg.github.io
+
+          The top bar then shows a Record button; while recording it shows the elapsed
+          time, live microphone and system-audio levels, and a stop button. Singstone
+          must be installed; it is launched automatically if it is not running.
+          The extension supports GNOME Shell 45 through 49.
           EOF
           } > release-notes.md
 
           # GitHub Releases require a tag. Reuse one fixed implementation tag;
           # the project does not create version tags or retain older releases.
           if gh release view latest >/dev/null 2>&1; then
-            gh release upload latest dist/singstone_amd64.snap --clobber
+            gh release upload latest \
+              dist/singstone_amd64.snap \
+              dist/singstone-gnome-shell-extension.zip \
+              --clobber
             gh api --method PATCH \
               "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" \
               -f sha="$GITHUB_SHA" \
@@ -272,7 +305,9 @@ jobs:
                 -f ref="refs/tags/latest" \
                 -f sha="$GITHUB_SHA" >/dev/null
             fi
-            gh release create latest dist/singstone_amd64.snap \
+            gh release create latest \
+              dist/singstone_amd64.snap \
+              dist/singstone-gnome-shell-extension.zip \
               --verify-tag \
               --title "Latest" \
               --notes-file release-notes.md \

@@ -42,6 +42,8 @@ the recorded audio is preserved.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback and speaker
   assignment, editable storage folders, and a one-click header Record button.
+- Optional GNOME Shell extension with a top-bar Record/Stop button and live
+  level meters.
 - Learns an anonymous diarized voice when it is named in the transcript, or
   enrolls voices from clean WAV/raw samples on the Speakers page.
 - Keeps recording and inference offline under Snap confinement.
@@ -99,6 +101,23 @@ The GTK4 interface records meetings, browses existing sessions, displays
 transcripts and timestamped screenshots, manages the local speaker list, and
 runs the offline processing pipeline. The command-line interface remains
 available for scripting and advanced processing.
+
+### GNOME top bar control
+
+The optional GNOME Shell extension adds a Record/Stop button and live audio
+level meters to the top bar; Singstone must be installed and is launched
+automatically when needed.
+The extension supports GNOME Shell 45 through 49.
+
+Install the extension, then log out and back in (Wayland cannot load a new
+extension into a running session):
+
+```bash
+curl -fLO https://github.com/nsg/singstone/releases/latest/download/singstone-gnome-shell-extension.zip
+gnome-extensions install --force singstone-gnome-shell-extension.zip
+# log out and in again
+gnome-extensions enable singstone@nsg.github.io
+```
 
 ### Record and process a meeting
 

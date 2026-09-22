@@ -1,4 +1,5 @@
 /target
+/dist/
 /third_party/
 /.snapcraft/
 /parts/

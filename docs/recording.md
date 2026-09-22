@@ -67,3 +67,11 @@ state from `recording` to `stopped`.
 An interrupted session keeps its append-only capture files. Processing can read
 recovered audio while the manifest still says `recording`, but finish recording
 before starting any processing stage to avoid races with growing files.
+
+## Remote control
+
+On the `io.github.nsg.Singstone` session bus name, `/io/github/nsg/Singstone/Recorder` implements `io.github.nsg.Singstone.Recorder`.
+
+| Methods | Signal | Status keys |
+|---|---|---|
+| `StartRecording`, `StopRecording`, `GetStatus` | `StatusChanged` | `recording`, `stopping`, `mic`, `system`, `mic_level`, `system_level`, `elapsed`, `screenshots` |

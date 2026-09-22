@@ -1,4 +1,5 @@
 mod config;
+mod remote;
 
 use crate::audio::{devices, record};
 use crate::cli::{Command, EnrollArgs, ProcessArgs, RecordArgs};
@@ -64,6 +65,8 @@ struct RecordingJob {
     result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
     started: Instant,
     telemetry: record::RecordingTelemetry,
+    mic: bool,
+    system: bool,
 }
 
 #[derive(Clone, Default)]
@@ -111,6 +114,11 @@ pub fn run() -> ExitCode {
 }
 
 fn build_window(app: &adw::Application) {
+    if let Some(window) = app.active_window() {
+        window.present();
+        return;
+    }
+
     install_css();
 
     let config = Rc::new(RefCell::new(GuiConfig::load().unwrap_or_default()));
@@ -262,7 +270,8 @@ fn build_window(app: &adw::Application) {
         &detail,
         &stack,
     );
-    wire_recording(
+    let recorder_connection = app.dbus_connection();
+    let recorder_handlers = wire_recording(
         &window,
         &recording_page,
         &live_bar,
@@ -276,6 +285,7 @@ fn build_window(app: &adw::Application) {
         &detail,
         &stack,
         &close_when_recording_stops,
+        recorder_connection.clone(),
     );
     wire_processing(
         &window,
@@ -358,6 +368,12 @@ fn build_window(app: &adw::Application) {
         }
         glib::Propagation::Proceed
     });
+
+    if let Some(connection) = recorder_connection.as_ref()
+        && let Err(error) = remote::register(connection, recorder_handlers)
+    {
+        eprintln!("Failed to register recorder D-Bus interface: {error}");
+    }
 
     window.present();
 }
@@ -1321,7 +1337,8 @@ fn wire_recording(
     detail: &SessionDetail,
     stack: &adw::ViewStack,
     close_when_stopped: &Rc<Cell<bool>>,
-) {
+    recorder_connection: Option<gio::DBusConnection>,
+) -> remote::RecorderHandlers {
     let updating_diarize_mic = Rc::new(Cell::new(false));
     let updating_diarize_mic_for_notify = updating_diarize_mic.clone();
     let config_for_diarize_mic = config.clone();
@@ -1345,13 +1362,18 @@ fn wire_recording(
         updating_diarize_mic_for_notify.set(false);
     });
 
-    let stop_for_button = page.job.clone();
-    let record_button_for_stop = page.button.clone();
-    live.stop.connect_clicked(move |_| {
-        if let Some(job) = stop_for_button.borrow().as_ref() {
+    let job_for_stop = page.job.clone();
+    let button_for_stop = page.button.clone();
+    let stop_recording: Rc<dyn Fn()> = Rc::new(move || {
+        if let Some(job) = job_for_stop.borrow().as_ref() {
             job.stop.store(true, Ordering::Release);
-            record_button_for_stop.set_label("Stopping…");
+            button_for_stop.set_label("Stopping…");
         }
+    });
+
+    let stop_recording_for_live = stop_recording.clone();
+    live.stop.connect_clicked(move |_| {
+        stop_recording_for_live();
     });
 
     let window_for_start = window.clone();
@@ -1371,7 +1393,8 @@ fn wire_recording(
     let live_system_group = live.system_group.clone();
     let header_live_for_start = header_live.clone();
     let quick_record_for_start = quick_record.clone();
-    let start_recording = Rc::new(move || {
+    let connection_for_start = recorder_connection.clone();
+    let start_recording: Rc<dyn Fn() -> bool> = Rc::new(move || {
         let mic_target = selected_target(&mic, &mic_targets);
         let system_target = selected_target(&system, &system_targets);
         if mic_target == "none" && system_target == "none" {
@@ -1380,7 +1403,7 @@ fn wire_recording(
                 "No audio source selected",
                 "Choose a microphone, system audio, or both.",
             );
-            return;
+            return false;
         }
         let stop = Arc::new(AtomicBool::new(false));
         let telemetry = record::RecordingTelemetry::default();
@@ -1392,7 +1415,7 @@ fn wire_recording(
                 "Your name is required",
                 "Enter the name to use for microphone speech in the transcript.",
             );
-            return;
+            return false;
         }
         {
             let mut config = config_for_start.borrow_mut();
@@ -1403,7 +1426,7 @@ fn wire_recording(
                     "Could not save settings",
                     &error.to_string(),
                 );
-                return;
+                return false;
             }
         }
         let args = RecordArgs {
@@ -1429,6 +1452,8 @@ fn wire_recording(
             result,
             started: Instant::now(),
             telemetry,
+            mic: mic_target != "none",
+            system: system_target != "none",
         });
         button.set_label("Stop recording");
         button.remove_css_class("suggested-action");
@@ -1444,15 +1469,19 @@ fn wire_recording(
         live_root.set_visible(true);
         header_live_for_start.set_visible(true);
         quick_record_for_start.set_visible(false);
+        if let Some(connection) = connection_for_start.as_ref() {
+            let status = recorder_status(job.borrow().as_ref());
+            remote::emit_status(connection, status);
+        }
+        true
     });
 
     let job_for_button = page.job.clone();
-    let button_for_click = page.button.clone();
     let start_recording_for_button = start_recording.clone();
+    let stop_recording_for_button = stop_recording.clone();
     page.button.connect_clicked(move |_| {
-        if let Some(active) = job_for_button.borrow().as_ref() {
-            active.stop.store(true, Ordering::Release);
-            button_for_click.set_label("Stopping…");
+        if job_for_button.borrow().is_some() {
+            stop_recording_for_button();
             return;
         }
         start_recording_for_button();
@@ -1460,10 +1489,11 @@ fn wire_recording(
 
     let session_list_for_quick = session_list.clone();
     let stack_for_quick = stack.clone();
+    let start_recording_for_quick = start_recording.clone();
     quick_record.connect_clicked(move |_| {
         session_list_for_quick.unselect_all();
         stack_for_quick.set_visible_child_name("new");
-        start_recording();
+        start_recording_for_quick();
     });
 
     let time = live.time.clone();
@@ -1490,8 +1520,9 @@ fn wire_recording(
     let detail_for_poll = detail.clone();
     let stack_for_poll = stack.clone();
     let close_when_stopped = close_when_stopped.clone();
+    let connection_for_poll = recorder_connection.clone();
     glib::timeout_add_local(Duration::from_millis(200), move || {
-        let completed = {
+        let (completed, status) = {
             let jobs = job_for_poll.borrow();
             let Some(active) = jobs.as_ref() else {
                 return glib::ControlFlow::Continue;
@@ -1509,12 +1540,19 @@ fn wire_recording(
                 "{count} screenshot{}",
                 if count == 1 { "" } else { "s" }
             ));
-            active.result.lock().expect("record result mutex").take()
+            let completed = active.result.lock().expect("record result mutex").take();
+            (completed, recorder_status(Some(active)))
         };
+        if let Some(connection) = connection_for_poll.as_ref() {
+            remote::emit_status(connection, status);
+        }
         let Some(result) = completed else {
             return glib::ControlFlow::Continue;
         };
         job_for_poll.borrow_mut().take();
+        if let Some(connection) = connection_for_poll.as_ref() {
+            remote::emit_status(connection, remote::RecorderStatus::default());
+        }
         if close_when_stopped.replace(false) {
             window_for_poll.close();
             return glib::ControlFlow::Break;
@@ -1558,6 +1596,47 @@ fn wire_recording(
         }
         glib::ControlFlow::Continue
     });
+
+    let job_for_remote_start = page.job.clone();
+    let session_list_for_remote = session_list.clone();
+    let stack_for_remote = stack.clone();
+    let start_recording_for_remote = start_recording.clone();
+    let remote_start: Rc<dyn Fn() -> bool> = Rc::new(move || {
+        if job_for_remote_start.borrow().is_some() {
+            return true;
+        }
+        session_list_for_remote.unselect_all();
+        stack_for_remote.set_visible_child_name("new");
+        start_recording_for_remote()
+    });
+    let job_for_status = page.job.clone();
+    let status: Rc<dyn Fn() -> remote::RecorderStatus> =
+        Rc::new(move || recorder_status(job_for_status.borrow().as_ref()));
+
+    remote::RecorderHandlers {
+        start: remote_start,
+        stop: stop_recording,
+        status,
+    }
+}
+
+fn recorder_status(job: Option<&RecordingJob>) -> remote::RecorderStatus {
+    let Some(job) = job else {
+        return remote::RecorderStatus::default();
+    };
+    remote::RecorderStatus {
+        recording: true,
+        stopping: job.stop.load(Ordering::Acquire),
+        mic: job.mic,
+        system: job.system,
+        mic_level: f64::from(record::RecordingTelemetry::level(&job.telemetry.mic_level)),
+        system_level: f64::from(record::RecordingTelemetry::level(
+            &job.telemetry.system_level,
+        )),
+        elapsed: u32::try_from(job.started.elapsed().as_secs()).unwrap_or(u32::MAX),
+        screenshots: u32::try_from(job.telemetry.screenshots.load(Ordering::Relaxed))
+            .unwrap_or(u32::MAX),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

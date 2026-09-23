@@ -9,6 +9,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import {RecorderClient} from './recorder.js';
+import {UpdateManager} from './updater.js';
 
 const METER_WIDTH = 40;
 const METER_HEIGHT = 5;
@@ -59,9 +60,10 @@ class LevelMeter {
 
 const SingstoneButton = GObject.registerClass(
 class SingstoneButton extends PanelMenu.Button {
-    _init(client) {
+    _init(client, updater) {
         super._init(0.0, 'Singstone');
         this._client = client;
+        this._updater = updater;
 
         this._box = new St.BoxLayout({
             style_class: 'panel-status-menu-box singstone-indicator',
@@ -98,6 +100,23 @@ class SingstoneButton extends PanelMenu.Button {
         });
         this._box.add_child(this._stopIcon);
 
+        this._updateIcon = new St.Icon({
+            icon_name: 'software-update-available-symbolic',
+            style_class: 'system-status-icon singstone-update-icon',
+            reactive: true,
+            track_hover: true,
+        });
+        this._updateIcon.connect('button-press-event', () => {
+            this.menu.toggle();
+            return Clutter.EVENT_STOP;
+        });
+        this._updateIcon.connect('touch-event', (_actor, event) => {
+            if (event.type() === Clutter.EventType.TOUCH_BEGIN)
+                this.menu.toggle();
+            return Clutter.EVENT_STOP;
+        });
+        this._box.add_child(this._updateIcon);
+
         this._recordingItem = new PopupMenu.PopupMenuItem('Start recording');
         this._recordingItem.connect('activate', () => this._toggleRecording());
         this.menu.addMenuItem(this._recordingItem);
@@ -105,17 +124,77 @@ class SingstoneButton extends PanelMenu.Button {
         const openItem = new PopupMenu.PopupMenuItem('Open Singstone');
         openItem.connect('activate', () => this._client.openApp());
         this.menu.addMenuItem(openItem);
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
+        this._snapUpdateItem = new PopupMenu.PopupMenuItem('Reinstall Singstone');
+        this._snapUpdateItem.connect('activate', () => {
+            if (this._client.status.recording) {
+                Main.notify(
+                    'Singstone',
+                    'Stop the recording before updating Singstone'
+                );
+                return;
+            }
+            this._updater.updateSnap({
+                beforeInstall: async () => {
+                    if (!this._client.available)
+                        return false;
+                    this._client.quit();
+                    await this._client.waitUntilUnavailable(15_000);
+                    return true;
+                },
+                afterInstall: wasRunning => {
+                    if (wasRunning)
+                        this._client.openApp();
+                },
+            });
+        });
+        this.menu.addMenuItem(this._snapUpdateItem);
+
+        this._extensionUpdateItem = new PopupMenu.PopupMenuItem(
+            'Reinstall extension'
+        );
+        this._extensionUpdateItem.connect(
+            'activate', () => this._updater.updateExtension()
+        );
+        this.menu.addMenuItem(this._extensionUpdateItem);
+
+        this._checkUpdateItem = new PopupMenu.PopupMenuItem(
+            'Check for updates'
+        );
+        this._checkUpdateItem.connect(
+            'activate', () => this._updater.check({manual: true})
+        );
+        this.menu.addMenuItem(this._checkUpdateItem);
 
         this._statusChangedId = this._client.connect(
             'status-changed', () => this._sync()
+        );
+        this._updatesChangedId = this._updater.connect(
+            'changed', () => this._syncUpdates()
+        );
+        this._menuOpenId = this.menu.connect(
+            'open-state-changed', (_menu, open) => {
+                if (open)
+                    this._updater.checkIfStale();
+            }
         );
         this.connect('destroy', () => {
             if (this._statusChangedId) {
                 this._client.disconnect(this._statusChangedId);
                 this._statusChangedId = 0;
             }
+            if (this._updatesChangedId) {
+                this._updater.disconnect(this._updatesChangedId);
+                this._updatesChangedId = 0;
+            }
+            if (this._menuOpenId) {
+                this.menu.disconnect(this._menuOpenId);
+                this._menuOpenId = 0;
+            }
         });
         this._sync();
+        this._syncUpdates();
     }
 
     vfunc_event(event) {
@@ -173,7 +252,75 @@ class SingstoneButton extends PanelMenu.Button {
         this._recordingItem.label.text = 'Stop recording';
         this._recordingItem.setSensitive(!status.stopping);
     }
+
+    _syncUpdates() {
+        const snapTask = this._updater.snapTask;
+        this._snapUpdateItem.visible = this._updater.snapInstalled;
+        if (snapTask?.phase === 'checking') {
+            this._snapUpdateItem.label.text = 'Checking for updates…';
+            this._snapUpdateItem.setSensitive(false);
+        } else if (snapTask?.phase === 'downloading') {
+            this._snapUpdateItem.label.text = downloadLabel(
+                'Downloading Singstone…', snapTask.progress
+            );
+            this._snapUpdateItem.setSensitive(false);
+        } else if (snapTask?.phase === 'installing') {
+            this._snapUpdateItem.label.text = 'Installing Singstone…';
+            this._snapUpdateItem.setSensitive(false);
+        } else if (snapTask?.phase === 'stopping') {
+            this._snapUpdateItem.label.text = 'Stopping Singstone…';
+            this._snapUpdateItem.setSensitive(false);
+        } else {
+            this._snapUpdateItem.label.text = this._updater.snapUpdateAvailable
+                ? `Update Singstone to ${shortCommit(this._updater.remote.commit)}`
+                : 'Reinstall Singstone';
+            this._snapUpdateItem.setSensitive(!this._updater.checking);
+        }
+
+        const extensionTask = this._updater.extensionTask;
+        if (extensionTask?.phase === 'checking') {
+            this._extensionUpdateItem.label.text = 'Checking for updates…';
+            this._extensionUpdateItem.setSensitive(false);
+        } else if (extensionTask?.phase === 'downloading') {
+            this._extensionUpdateItem.label.text = downloadLabel(
+                'Downloading extension…', extensionTask.progress
+            );
+            this._extensionUpdateItem.setSensitive(false);
+        } else if (extensionTask?.phase === 'installing') {
+            this._extensionUpdateItem.label.text = 'Installing extension…';
+            this._extensionUpdateItem.setSensitive(false);
+        } else if (this._updater.extensionRestartPending &&
+            !this._updater.extensionUpdateAvailable) {
+            this._extensionUpdateItem.label.text =
+                'Extension updated; log out to load it';
+            this._extensionUpdateItem.setSensitive(false);
+        } else {
+            this._extensionUpdateItem.label.text =
+                this._updater.extensionUpdateAvailable
+                    ? `Update extension to ${shortCommit(this._updater.remote.commit)}`
+                    : 'Reinstall extension';
+            this._extensionUpdateItem.setSensitive(!this._updater.checking);
+        }
+
+        this._checkUpdateItem.label.text = this._updater.checking
+            ? 'Checking for updates…'
+            : 'Check for updates';
+        this._checkUpdateItem.setSensitive(!this._updater.checking);
+        this._updateIcon.visible = this._updater.snapUpdateAvailable ||
+            this._updater.extensionUpdateAvailable ||
+            this._updater.extensionRestartPending;
+    }
 });
+
+function shortCommit(commit) {
+    return commit?.slice(0, 7) ?? '';
+}
+
+function downloadLabel(label, progress) {
+    if (progress < 0)
+        return label;
+    return `${label} ${Math.round(progress * 100)}%`;
+}
 
 function formatElapsed(elapsed) {
     const seconds = Math.max(0, Math.floor(Number(elapsed) || 0));
@@ -189,6 +336,11 @@ function formatElapsed(elapsed) {
 
 export default class SingstoneExtension extends Extension {
     enable() {
+        this._updater = new UpdateManager({
+            extensionPath: this.path,
+            metadata: this.metadata,
+            notify: message => Main.notify('Singstone', message),
+        });
         this._client = new RecorderClient({
             onError: message => Main.notify('Singstone', message),
             launch: desktopId => {
@@ -199,14 +351,16 @@ export default class SingstoneExtension extends Extension {
                 return true;
             },
         });
-        this._button = new SingstoneButton(this._client);
+        this._button = new SingstoneButton(this._client, this._updater);
         Main.panel.addToStatusArea('singstone', this._button, 0, 'right');
     }
 
     disable() {
         this._button?.destroy();
+        this._updater?.destroy();
         this._client?.destroy();
         this._button = null;
+        this._updater = null;
         this._client = null;
     }
 }

@@ -48,19 +48,23 @@ export const RecorderClient = GObject.registerClass({
         'status-changed': {},
     },
 }, class RecorderClient extends GObject.Object {
-    _init({onError = () => {}, launch = null} = {}) {
+    _init({onError = () => {}, launch = null, subscribeSignals = true} = {}) {
         super._init();
 
         this.status = idleStatus();
+        this.statusSource = 'idle';
         this.available = false;
         this._onError = onError;
         this._launch = launch;
+        this._subscribeSignals = subscribeSignals;
         this._proxyClass = Gio.DBusProxy.makeProxyWrapper(RECORDER_XML);
         this._proxy = null;
         this._proxySignalId = 0;
         this._proxyCancellable = null;
         this._connection = null;
         this._proxyGeneration = 0;
+        this._statusPollId = 0;
+        this._statusRequestProxy = null;
         this._startPending = false;
         this._startWatchdogId = 0;
         this._timeoutIds = new Set();
@@ -194,9 +198,9 @@ export const RecorderClient = GObject.registerClass({
             Gio.bus_unwatch_name(this._watchId);
             this._watchId = 0;
         }
-        this._clearTimeouts();
         this._cancelProxyConstruction();
         this._dropProxy();
+        this._clearTimeouts();
         this._connection = null;
         this._onError = null;
         this._launch = null;
@@ -234,10 +238,16 @@ export const RecorderClient = GObject.registerClass({
             }
 
             this._proxy = proxy;
-            this._proxySignalId = proxy.connectSignal(
-                'StatusChanged',
-                (_source, _sender, [status]) => this._applyStatus(status)
-            );
+            if (this._subscribeSignals) {
+                this._proxySignalId = proxy.connectSignal(
+                    'StatusChanged',
+                    (_source, _sender, [status]) => {
+                        if (this._destroyed || this._proxy !== proxy)
+                            return;
+                        this._applyStatus(status, 'signal');
+                    }
+                );
+            }
             this._fetchStatus(proxy);
 
             if (this._startPending) {
@@ -257,12 +267,13 @@ export const RecorderClient = GObject.registerClass({
         this._startPending = false;
         this._clearStartWatchdog();
         this._proxyGeneration++;
-        this._clearTimeouts();
         this._cancelProxyConstruction();
         this._dropProxy();
+        this._clearTimeouts();
         this._connection = null;
         this._setAvailable(false);
         this.status = idleStatus();
+        this.statusSource = 'idle';
         this.emit('status-changed');
     }
 
@@ -275,6 +286,8 @@ export const RecorderClient = GObject.registerClass({
     }
 
     _dropProxy() {
+        this._clearStatusPoll();
+        this._statusRequestProxy = null;
         if (this._proxy && this._proxySignalId)
             this._proxy.disconnectSignal(this._proxySignalId);
         this._proxySignalId = 0;
@@ -287,17 +300,37 @@ export const RecorderClient = GObject.registerClass({
     }
 
     _fetchStatus(proxy) {
+        this._requestStatus(proxy, 'fetch');
+    }
+
+    _pollStatus(proxy) {
+        this._requestStatus(proxy, 'poll');
+    }
+
+    _requestStatus(proxy, source) {
+        if (this._destroyed || this._proxy !== proxy)
+            return;
+        if (this._statusRequestProxy === proxy) {
+            this._scheduleStatusPoll(proxy);
+            return;
+        }
+
+        this._statusRequestProxy = proxy;
         proxy.GetStatusRemote((result, error) => {
+            if (this._statusRequestProxy === proxy)
+                this._statusRequestProxy = null;
             if (this._destroyed || this._proxy !== proxy)
                 return;
-            if (error)
+            if (error) {
+                this._scheduleStatusPoll(proxy);
                 return;
+            }
 
-            this._applyStatus(result[0]);
+            this._applyStatus(result[0], source);
         });
     }
 
-    _applyStatus(statusVariant) {
+    _applyStatus(statusVariant, source) {
         if (this._destroyed)
             return;
 
@@ -313,7 +346,32 @@ export const RecorderClient = GObject.registerClass({
             elapsed: Number(value('elapsed')),
             screenshots: Number(value('screenshots')),
         };
+        this.statusSource = source;
+        this._scheduleStatusPoll(this._proxy);
         this.emit('status-changed');
+    }
+
+    _scheduleStatusPoll(proxy) {
+        this._clearStatusPoll();
+        if (this._destroyed || !proxy || this._proxy !== proxy)
+            return;
+
+        const interval = this.status.recording ? 250 : 2000;
+        this._statusPollId = this._addTimeout(interval, () => {
+            this._statusPollId = 0;
+            if (this._destroyed || this._proxy !== proxy)
+                return;
+            this._pollStatus(proxy);
+        });
+    }
+
+    _clearStatusPoll() {
+        if (!this._statusPollId)
+            return;
+
+        GLib.Source.remove(this._statusPollId);
+        this._timeoutIds.delete(this._statusPollId);
+        this._statusPollId = 0;
     }
 
     _startRecording(proxy, retryDelays) {

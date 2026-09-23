@@ -222,6 +222,9 @@ class SingstoneButton extends PanelMenu.Button {
     _sync() {
         const status = this._client.status;
         if (!status.recording) {
+            this._recordIcon.remove_style_class_name(
+                'singstone-record-icon-live'
+            );
             this._elapsedLabel.text = 'Record';
             this._meters.hide();
             this._stopIcon.hide();
@@ -232,6 +235,7 @@ class SingstoneButton extends PanelMenu.Button {
             return;
         }
 
+        this._recordIcon.add_style_class_name('singstone-record-icon-live');
         this._elapsedLabel.text = status.stopping
             ? 'Stopping…'
             : formatElapsed(status.elapsed);

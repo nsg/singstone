@@ -109,6 +109,8 @@ available for scripting and advanced processing.
 The optional GNOME Shell extension adds a Record/Stop button and live audio
 level meters to the top bar; Singstone must be installed and is launched
 automatically when needed.
+The panel polls the recorder status over D-Bus, so it does not depend on
+session-bus signals reaching GNOME Shell.
 The extension supports GNOME Shell 45 through 49.
 
 Right-click the Record button to open its menu. An update icon appears when a

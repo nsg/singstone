@@ -255,6 +255,17 @@ embedding failures. Recognition is performed separately for the microphone and
 system sources, and the same enrolled name may legitimately match more than one
 cluster.
 
+### Manual assignment and correction
+
+Naming an anonymous cluster in the app writes its `speaker` assignment. When
+the embedding model is configured, Singstone also adds the cluster embedding
+to that name in `speakers.json`.
+
+Reassigning a cluster replaces `speaker`, learns the cluster under the new
+name, and removes near-identical embeddings (cosine similarity at least
+`0.999`) from the previous name. Without the embedding model, either change is
+limited to the current session.
+
 ## 4. Render: intermediate artifacts to the final transcript
 
 ```bash

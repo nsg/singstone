@@ -71,6 +71,18 @@ impl SpeakerDatabase {
         ))
     }
 
+    pub fn forget_matching(&mut self, name: &str, embedding: &[f32], min_similarity: f32) -> usize {
+        let Some(record) = self.speakers.get_mut(name) else {
+            return 0;
+        };
+        let before = record.embeddings.len();
+        record.embeddings.retain(|candidate| {
+            !crate::speaker::embedding::cosine(candidate, embedding)
+                .is_some_and(|similarity| similarity >= min_similarity)
+        });
+        before - record.embeddings.len()
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let parent = path
             .parent()
@@ -139,6 +151,39 @@ mod tests {
             .validate_identity(&identity_with("abc", 256))
             .unwrap_err();
         assert!(dimension_error.to_string().contains("dimension 256"));
+    }
+
+    #[test]
+    fn forgets_matching_embeddings_and_keeps_speaker_records() {
+        let mut database = SpeakerDatabase::empty(identity_with("abc", 3));
+        database.speakers.insert(
+            "Alice".into(),
+            SpeakerRecord {
+                embeddings: vec![vec![0.9999, 0.014, 0.0], vec![0.0, 1.0, 0.0]],
+            },
+        );
+        database.speakers.insert(
+            "Bob".into(),
+            SpeakerRecord {
+                embeddings: vec![vec![1.0, 0.0, 0.0]],
+            },
+        );
+
+        assert_eq!(
+            database.forget_matching("Alice", &[1.0, 0.0, 0.0], 0.999),
+            1
+        );
+        assert_eq!(
+            database.speakers["Alice"].embeddings,
+            vec![vec![0.0, 1.0, 0.0]]
+        );
+        assert_eq!(
+            database.forget_matching("Unknown", &[1.0, 0.0, 0.0], 0.999),
+            0
+        );
+        assert_eq!(database.forget_matching("Bob", &[1.0, 0.0, 0.0], 0.999), 1);
+        assert!(database.speakers.contains_key("Bob"));
+        assert!(database.speakers["Bob"].embeddings.is_empty());
     }
 
     #[test]

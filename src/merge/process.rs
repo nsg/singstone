@@ -340,11 +340,13 @@ pub fn run_render(args: RenderArgs) -> Result<(), Box<dyn std::error::Error>> {
     render_artifacts_with_segments(&session, &manifest, diarize_mic, segments)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentOutcome {
     /// Whether the cluster embedding was also added to the persistent speaker
     /// database, allowing later sessions to recognize the voice.
     pub learned: bool,
+    pub previous: Option<String>,
+    pub forgotten: usize,
 }
 
 /// Assign a diarized cluster from the transcript and, when the embedding model
@@ -391,13 +393,28 @@ pub fn assign_speaker(
                 format!("speaker cluster {speaker_id} is not in this session"),
             )
         })?;
+    let previous = assignment.speaker.clone();
+    let unchanged = previous
+        .as_deref()
+        .is_some_and(|previous| previous.trim() == name);
     assignment.speaker = Some(name.to_owned());
 
-    let learned = match learn_cluster(&args, &session, source, cluster, name) {
-        Ok(learned) => learned,
-        Err(error) => {
-            eprintln!("warning: assigned {speaker_id} but could not learn its voice: {error}");
-            false
+    let (learned, forgotten) = if unchanged {
+        (false, 0)
+    } else {
+        match learn_cluster(
+            &args,
+            &session,
+            source,
+            cluster,
+            name,
+            previous.as_deref().map(str::trim),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                eprintln!("warning: assigned {speaker_id} but could not learn its voice: {error}");
+                (false, 0)
+            }
         }
     };
     if learned {
@@ -414,7 +431,11 @@ pub fn assign_speaker(
         session: session.dir,
         diarize_mic: None,
     })?;
-    Ok(AssignmentOutcome { learned })
+    Ok(AssignmentOutcome {
+        learned,
+        previous,
+        forgotten,
+    })
 }
 
 fn parse_speaker_id(value: &str) -> Option<(AudioSource, u32)> {
@@ -436,9 +457,10 @@ fn learn_cluster(
     source: AudioSource,
     cluster: u32,
     name: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+    previous: Option<&str>,
+) -> Result<(bool, usize), Box<dyn std::error::Error>> {
     let Some(model) = args.embedding_model.as_deref() else {
-        return Ok(false);
+        return Ok((false, 0));
     };
     models::verify_model(
         model,
@@ -456,7 +478,7 @@ fn learn_cluster(
     let samples = session.read_audio(source)?;
     let Some(embedding) = embed_clusters(&extractor, &samples, &source_segments).remove(&cluster)
     else {
-        return Ok(false);
+        return Ok((false, 0));
     };
     let identity = database::identity(model, extractor.dimension())?;
     let path = args
@@ -468,6 +490,11 @@ fn learn_cluster(
         Err(error) if error.kind() == io::ErrorKind::NotFound => SpeakerDatabase::empty(identity),
         Err(error) => return Err(error.into()),
     };
+    let forgotten = previous
+        .filter(|previous| *previous != name)
+        .map_or(0, |previous| {
+            database.forget_matching(previous, &embedding, 0.999)
+        });
     database
         .speakers
         .entry(name.to_owned())
@@ -475,7 +502,7 @@ fn learn_cluster(
         .embeddings
         .push(embedding);
     database.save(&path)?;
-    Ok(true)
+    Ok((true, forgotten))
 }
 
 fn stage_process_args(session: PathBuf) -> ProcessArgs {
@@ -1893,10 +1920,9 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
-    #[test]
-    fn manual_assignment_rerenders_without_a_voice_model() {
+    fn assignment_fixture(label: &str, speaker: Option<&str>) -> (PathBuf, Session) {
         let root = std::env::temp_dir().join(format!(
-            "singstone-manual-assignment-{}-{}",
+            "singstone-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1941,14 +1967,50 @@ mod tests {
                     cluster: 7,
                     best_candidate: None,
                     score: None,
-                    speaker: None,
+                    speaker: speaker.map(str::to_owned),
                 }],
             },
         )
         .expect("write assignments");
+        (root, session)
+    }
+
+    #[test]
+    fn manual_assignment_rerenders_without_a_voice_model() {
+        let (root, session) = assignment_fixture("manual-assignment", None);
         let outcome = assign_speaker(stage_process_args(session.dir.clone()), "spk_7", "Carol")
             .expect("assign speaker");
         assert!(!outcome.learned);
+        assert_eq!(outcome.previous, None);
+        assert_eq!(outcome.forgotten, 0);
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read transcript");
+        assert_eq!(transcript[0].speaker, "Carol");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn reassigns_named_cluster_without_a_voice_model() {
+        let (root, session) = assignment_fixture("speaker-reassignment", Some("Carol"));
+        let outcome = assign_speaker(stage_process_args(session.dir.clone()), "spk_7", "Dave")
+            .expect("reassign speaker");
+        assert!(!outcome.learned);
+        assert_eq!(outcome.previous.as_deref(), Some("Carol"));
+        assert_eq!(outcome.forgotten, 0);
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read transcript");
+        assert_eq!(transcript[0].speaker, "Dave");
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn assigning_same_name_again_still_renders() {
+        let (root, session) = assignment_fixture("same-speaker-assignment", Some("Carol"));
+        let outcome = assign_speaker(stage_process_args(session.dir.clone()), "spk_7", " Carol ")
+            .expect("assign same speaker");
+        assert!(!outcome.learned);
+        assert_eq!(outcome.previous.as_deref(), Some("Carol"));
+        assert_eq!(outcome.forgotten, 0);
         let transcript: Vec<Utterance> =
             jsonl::read_all(&session.transcript_path()).expect("read transcript");
         assert_eq!(transcript[0].speaker, "Carol");

@@ -38,6 +38,10 @@ jobs:
       - name: Pack GNOME Shell extension
         run: scripts/pack-gnome-extension.sh
 
+      - name: Verify GNOME Shell extension commit
+        run: |
+          test "$(unzip -p dist/singstone-gnome-shell-extension.zip metadata.json | jq -er '.commit')" = "$GITHUB_SHA"
+
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: singstone-gnome-shell-extension
@@ -173,6 +177,7 @@ jobs:
             abort "generated singstone app is missing opengl" unless plugs.include?("opengl")
             abort "generated singstone app is missing pipewire" unless plugs.include?("pipewire")
           ' <<<"$expanded_snap_yaml"
+          grep -Eq "^version: .*\\+git\\.${GITHUB_SHA::7}" <<<"$expanded_snap_yaml"
 
       - name: Smoke-test Level Zero loader ABI
         run: |
@@ -308,6 +313,7 @@ jobs:
             gh release create latest \
               dist/singstone_amd64.snap \
               dist/singstone-gnome-shell-extension.zip \
+              --target "$GITHUB_SHA" \
               --verify-tag \
               --title "Latest" \
               --notes-file release-notes.md \

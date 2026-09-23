@@ -1,6 +1,6 @@
 name: singstone
 title: Singstone
-version: "0.1.0"
+adopt-info: singstone
 base: core24
 grade: stable
 confinement: strict
@@ -220,6 +220,7 @@ parts:
     build-packages:
       - clang
       - cmake
+      - git
       - intel-oneapi-compiler-dpcpp-cpp-2026.1
       - intel-oneapi-mkl-sycl-devel-2026.1
       - libclang-dev
@@ -242,6 +243,14 @@ parts:
       - SHERPA_ONNX_LIB_DIR: $CRAFT_STAGE/lib
       - LD_LIBRARY_PATH: $CRAFT_STAGE/lib
     override-build: |
+      base_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+      test -n "$base_version"
+      commit=$(git -c safe.directory='*' -C "$CRAFT_PROJECT_DIR" rev-parse --short=7 HEAD 2>/dev/null || true)
+      if [ -n "$commit" ]; then
+        craftctl set version="${base_version}+git.${commit}"
+      else
+        craftctl set version="$base_version"
+      fi
       cargo clippy --release --all-targets --locked -- -D warnings
       cargo test --release --locked
       craftctl default

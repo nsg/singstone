@@ -1612,10 +1612,13 @@ fn wire_recording(
     let job_for_status = page.job.clone();
     let status: Rc<dyn Fn() -> remote::RecorderStatus> =
         Rc::new(move || recorder_status(job_for_status.borrow().as_ref()));
+    let window_for_remote_quit = window.clone();
+    let quit: Rc<dyn Fn()> = Rc::new(move || window_for_remote_quit.close());
 
     remote::RecorderHandlers {
         start: remote_start,
         stop: stop_recording,
+        quit,
         status,
     }
 }

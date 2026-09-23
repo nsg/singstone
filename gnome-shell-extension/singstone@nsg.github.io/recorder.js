@@ -14,11 +14,13 @@ const RECORDER_XML = `
     <method name="GetStatus">
       <arg type="a{sv}" name="status" direction="out"/>
     </method>
+    <method name="Quit"/>
     <signal name="StatusChanged">
       <arg type="a{sv}" name="status"/>
     </signal>
   </interface>
-</node>`;
+</node>
+`;
 
 function idleStatus() {
     return {
@@ -62,6 +64,7 @@ export const RecorderClient = GObject.registerClass({
         this._startPending = false;
         this._startWatchdogId = 0;
         this._timeoutIds = new Set();
+        this._unavailableWaiters = new Set();
         this._destroyed = false;
 
         this._watchId = Gio.bus_watch_name(
@@ -115,6 +118,41 @@ export const RecorderClient = GObject.registerClass({
         });
     }
 
+    quit() {
+        if (this._destroyed || !this._proxy)
+            return;
+
+        this._proxy.QuitRemote((_result, error) => {
+            if (error)
+                this._reportError(error);
+        });
+    }
+
+    waitUntilUnavailable(timeoutMs) {
+        if (this._destroyed)
+            return Promise.reject(new Error('Recorder client was destroyed'));
+        if (!this.available)
+            return Promise.resolve();
+
+        return new Promise((resolve, reject) => {
+            const waiter = {signalId: 0, timeoutId: 0, resolve, reject};
+            waiter.signalId = this.connect(
+                'available-changed', (_source, available) => {
+                    if (!available)
+                        this._settleUnavailableWaiter(waiter);
+                }
+            );
+            waiter.timeoutId = this._addTimeout(timeoutMs, () => {
+                waiter.timeoutId = 0;
+                this._settleUnavailableWaiter(
+                    waiter,
+                    new Error('Singstone did not quit')
+                );
+            });
+            this._unavailableWaiters.add(waiter);
+        });
+    }
+
     openApp() {
         if (this._destroyed)
             return;
@@ -143,6 +181,12 @@ export const RecorderClient = GObject.registerClass({
             return;
 
         this._destroyed = true;
+        for (const waiter of [...this._unavailableWaiters]) {
+            this._settleUnavailableWaiter(
+                waiter,
+                new Error('Recorder client was destroyed')
+            );
+        }
         this._startPending = false;
         this._clearStartWatchdog();
         this._proxyGeneration++;
@@ -366,5 +410,23 @@ export const RecorderClient = GObject.registerClass({
         for (const sourceId of this._timeoutIds)
             GLib.Source.remove(sourceId);
         this._timeoutIds.clear();
+        for (const waiter of this._unavailableWaiters)
+            waiter.timeoutId = 0;
+    }
+
+    _settleUnavailableWaiter(waiter, error = null) {
+        if (!this._unavailableWaiters.delete(waiter))
+            return;
+
+        if (waiter.signalId)
+            this.disconnect(waiter.signalId);
+        if (waiter.timeoutId) {
+            GLib.Source.remove(waiter.timeoutId);
+            this._timeoutIds.delete(waiter.timeoutId);
+        }
+        if (error)
+            waiter.reject(error);
+        else
+            waiter.resolve();
     }
 });

@@ -10,6 +10,7 @@ pub const XML: &str = r#"
     <method name="GetStatus">
       <arg type="a{sv}" name="status" direction="out"/>
     </method>
+    <method name="Quit"/>
     <signal name="StatusChanged">
       <arg type="a{sv}" name="status"/>
     </signal>
@@ -49,6 +50,7 @@ impl RecorderStatus {
 pub struct RecorderHandlers {
     pub start: Rc<dyn Fn() -> bool>,
     pub stop: Rc<dyn Fn()>,
+    pub quit: Rc<dyn Fn()>,
     pub status: Rc<dyn Fn() -> RecorderStatus>,
 }
 
@@ -79,6 +81,10 @@ pub fn register(
                     (handlers.stop)();
                     invocation.return_value(None);
                 }
+                "Quit" => {
+                    invocation.return_value(None);
+                    (handlers.quit)();
+                }
                 "GetStatus" => {
                     let status = (handlers.status)().to_variant();
                     let result = glib::Variant::tuple_from_iter([status]);
@@ -108,6 +114,20 @@ pub fn emit_status(connection: &gio::DBusConnection, status: RecorderStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_interface_exposes_expected_methods() {
+        let node = gio::DBusNodeInfo::for_xml(XML).expect("valid recorder interface XML");
+        let interface = node
+            .lookup_interface(INTERFACE)
+            .expect("recorder D-Bus interface");
+        for method in ["StartRecording", "StopRecording", "GetStatus", "Quit"] {
+            assert!(
+                interface.lookup_method(method).is_some(),
+                "missing recorder method {method}"
+            );
+        }
+    }
 
     #[test]
     fn status_variant_contains_all_fields() {

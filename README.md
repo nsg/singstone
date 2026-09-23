@@ -40,8 +40,10 @@ the recorded audio is preserved.
   preferring Level Zero and retrying through OpenCL before using CPU.
 - Recognizes enrolled voices while leaving uncertain matches anonymous.
 - Provides a native GTK interface with live capture meters, screenshot counts,
-  per-stage processing progress, transcript-side audio playback and speaker
-  assignment, editable storage folders, and a one-click header Record button.
+  per-stage processing progress, transcript-side audio playback, editable
+  storage folders, and a one-click header Record button.
+- Names speakers from the transcript: one-click shortcuts for people already
+  in the meeting, and reassignment when a voice was matched to the wrong person.
 - Optional GNOME Shell extension with a top-bar Record/Stop button and live
   level meters.
 - Learns an anonymous diarized voice when it is named in the transcript, or

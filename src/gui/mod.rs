@@ -1,5 +1,6 @@
 mod config;
 mod remote;
+mod wrap_layout;
 
 use crate::audio::{devices, record};
 use crate::cli::{Command, EnrollArgs, ProcessArgs, RecordArgs};
@@ -16,6 +17,7 @@ use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -26,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use self::config::GuiConfig;
+use self::wrap_layout::WrapLayout;
 
 const APP_ID: &str = "io.github.nsg.Singstone";
 
@@ -48,6 +51,7 @@ const CSS: &str = r#"
 .shot-card { padding: 8px; border-radius: 12px; background: alpha(currentColor, 0.05); }
 .mono-button { font-family: monospace; font-size: 12px; }
 .transcript-row { padding: 8px 12px; }
+.speaker-shortcut { border: 1px solid alpha(@accent_color, 0.28); border-radius: 999px; padding: 1px 7px; color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
 "#;
 
 #[derive(Clone)]
@@ -2308,10 +2312,11 @@ impl SessionDetail {
             if utterances.is_empty() {
                 append_empty(&self.transcript, "The transcript is empty.");
             } else {
-                for utterance in utterances {
+                let frequent = Rc::new(frequent_speakers(&utterances, 3));
+                for utterance in &utterances {
                     let audio_path = session.audio_path(utterance.source);
                     self.transcript
-                        .append(&transcript_row(&utterance, self, audio_path));
+                        .append(&transcript_row(utterance, self, audio_path, &frequent));
                 }
             }
         } else {
@@ -2463,13 +2468,18 @@ fn session_row(summary: &SessionSummary) -> gtk::ListBoxRow {
     row
 }
 
-fn transcript_row(utterance: &Utterance, detail: &SessionDetail, audio_path: PathBuf) -> gtk::Box {
+fn transcript_row(
+    utterance: &Utterance,
+    detail: &SessionDetail,
+    audio_path: PathBuf,
+    frequent: &Rc<Vec<String>>,
+) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     row.add_css_class("transcript-row");
     let avatar = gtk::Image::from_icon_name("avatar-default-symbolic");
     avatar.set_pixel_size(28);
     avatar.add_css_class("speaker-avatar");
-    if utterance.speaker.starts_with("SPEAKER_") || utterance.speaker == "unknown" {
+    if is_anonymous_speaker(utterance) {
         avatar.add_css_class("speaker-unknown");
     } else if utterance.source == AudioSource::Mic {
         avatar.add_css_class("speaker-2");
@@ -2485,10 +2495,11 @@ fn transcript_row(utterance: &Utterance, detail: &SessionDetail, audio_path: Pat
     row.append(&avatar);
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
     column.set_hexpand(true);
-    let head = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    head.set_layout_manager(Some(WrapLayout::new(8, 4)));
     let speaker = gtk::Label::new(Some(&utterance.speaker));
     speaker.add_css_class("heading");
-    if utterance.speaker.starts_with("SPEAKER_") || utterance.speaker == "unknown" {
+    if is_anonymous_speaker(utterance) {
         speaker.add_css_class("warning-text");
     }
     head.append(&speaker);
@@ -2520,14 +2531,39 @@ fn transcript_row(utterance: &Utterance, detail: &SessionDetail, audio_path: Pat
         playback.toggle(row_id, button, &window, &audio_path, start_ms, end_ms);
     });
     head.append(&play);
-    if is_assignable_speaker(utterance) {
-        let assign = gtk::Button::with_label("Assign…");
-        assign.add_css_class("flat");
-        assign.add_css_class("caption");
-        let detail = detail.clone();
-        let speaker_id = utterance.speaker_id.clone();
-        assign.connect_clicked(move |_| show_assignment_dialog(&detail, &speaker_id));
-        head.append(&assign);
+    if has_assignable_id(utterance) {
+        if is_anonymous_speaker(utterance) {
+            for name in frequent.iter() {
+                let shortcut = shortcut_button(name);
+                shortcut.set_tooltip_text(Some(&format!("Assign this voice to {name}")));
+                let detail = detail.clone();
+                let speaker_id = utterance.speaker_id.clone();
+                let name = name.clone();
+                shortcut.connect_clicked(move |_| {
+                    start_assignment(&detail, speaker_id.clone(), name.clone());
+                });
+                head.append(&shortcut);
+            }
+            let assign = caption_button("Assign…");
+            let detail = detail.clone();
+            let speaker_id = utterance.speaker_id.clone();
+            let frequent = frequent.clone();
+            assign.connect_clicked(move |_| {
+                show_assignment_dialog(&detail, &speaker_id, None, &frequent);
+            });
+            head.append(&assign);
+        } else {
+            let change = caption_button("Change…");
+            change.set_tooltip_text(Some("Reassign this voice to someone else"));
+            let detail = detail.clone();
+            let speaker_id = utterance.speaker_id.clone();
+            let current = utterance.speaker.clone();
+            let frequent = frequent.clone();
+            change.connect_clicked(move |_| {
+                show_assignment_dialog(&detail, &speaker_id, Some(&current), &frequent);
+            });
+            head.append(&change);
+        }
     }
     column.append(&head);
     let text = gtk::Label::new(Some(&utterance.text));
@@ -2539,61 +2575,149 @@ fn transcript_row(utterance: &Utterance, detail: &SessionDetail, audio_path: Pat
     row
 }
 
-fn is_assignable_speaker(utterance: &Utterance) -> bool {
-    (utterance.speaker.starts_with("SPEAKER_") || utterance.speaker == "unknown")
-        && (utterance
-            .speaker_id
-            .rsplit_once('_')
-            .is_some_and(|(prefix, cluster)| {
-                matches!(prefix, "mic" | "spk") && cluster.parse::<u32>().is_ok()
-            })
-            || utterance
-                .speaker_id
-                .strip_prefix("speaker-")
-                .is_some_and(|cluster| cluster.parse::<u32>().is_ok()))
+fn caption_button(text: &str) -> gtk::Button {
+    let label = gtk::Label::new(Some(text));
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(14);
+    let button = gtk::Button::new();
+    button.set_child(Some(&label));
+    button.add_css_class("flat");
+    button.add_css_class("caption");
+    button
 }
 
-fn show_assignment_dialog(detail: &SessionDetail, speaker_id: &str) {
-    let dialog = adw::AlertDialog::new(
-        Some("Who is this speaker?"),
-        Some(
-            "The name updates this transcript. When the local voice model is available, Singstone also learns this voice for future meetings.",
-        ),
-    );
+fn shortcut_button(name: &str) -> gtk::Button {
+    let button = caption_button(name);
+    button.add_css_class("speaker-shortcut");
+    button
+}
+
+fn is_anonymous_speaker(utterance: &Utterance) -> bool {
+    utterance.speaker.starts_with("SPEAKER_") || utterance.speaker == "unknown"
+}
+
+fn has_assignable_id(utterance: &Utterance) -> bool {
+    utterance
+        .speaker_id
+        .rsplit_once('_')
+        .is_some_and(|(prefix, cluster)| {
+            matches!(prefix, "mic" | "spk") && cluster.parse::<u32>().is_ok()
+        })
+        || utterance
+            .speaker_id
+            .strip_prefix("speaker-")
+            .is_some_and(|cluster| cluster.parse::<u32>().is_ok())
+}
+
+fn frequent_speakers(utterances: &[Utterance], limit: usize) -> Vec<String> {
+    let mut durations = BTreeMap::new();
+    for utterance in utterances {
+        if is_anonymous_speaker(utterance) || utterance.speaker_id == "local" {
+            continue;
+        }
+        let duration = utterance.end_ms.saturating_sub(utterance.start_ms);
+        let total = durations.entry(utterance.speaker.clone()).or_insert(0u64);
+        *total = total.saturating_add(duration);
+    }
+    let mut ranked = durations.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(name, _)| name)
+        .collect()
+}
+
+fn show_assignment_dialog(
+    detail: &SessionDetail,
+    speaker_id: &str,
+    current: Option<&str>,
+    frequent: &[String],
+) {
+    let (heading, body) = if let Some(current) = current {
+        (
+            "Change this speaker",
+            format!(
+                "Currently {current}. The new name updates every line of this voice in the transcript. When the local voice model is available, Singstone learns the voice under the new name and forgets it under the old one."
+            ),
+        )
+    } else {
+        (
+            "Who is this speaker?",
+            "The name updates this transcript. When the local voice model is available, Singstone also learns this voice for future meetings.".to_owned(),
+        )
+    };
+    let dialog = adw::AlertDialog::new(Some(heading), Some(&body));
     let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let entry = gtk::Entry::builder()
         .placeholder_text("Speaker name")
         .activates_default(true)
         .build();
+    let meeting_names = frequent
+        .iter()
+        .filter(|name| current != Some(name.as_str()))
+        .collect::<Vec<_>>();
+    if !meeting_names.is_empty() {
+        let meeting = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        meeting.set_layout_manager(Some(WrapLayout::new(8, 4)));
+        let label = gtk::Label::new(Some("In this meeting:"));
+        label.add_css_class("dim-label");
+        label.add_css_class("caption");
+        meeting.append(&label);
+        for name in meeting_names {
+            let shortcut = shortcut_button(name);
+            shortcut.set_tooltip_text(Some(&format!("Use {name}")));
+            let entry = entry.clone();
+            let name = name.clone();
+            shortcut.connect_clicked(move |_| entry.set_text(&name));
+            meeting.append(&shortcut);
+        }
+        content.append(&meeting);
+    }
     let database_path = std::env::var_os("SINGSTONE_SPEAKERS_DB")
         .map(PathBuf::from)
         .unwrap_or_else(database::default_path);
     if let Ok(database) = SpeakerDatabase::load(&database_path)
         && !database.speakers.is_empty()
     {
-        let names = database.speakers.keys().cloned().collect::<Vec<_>>();
+        let names = database
+            .speakers
+            .keys()
+            .filter(|name| current != Some(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
         let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-        let choices = gtk::DropDown::from_strings(&refs);
-        choices.set_tooltip_text(Some("Choose an enrolled speaker"));
-        if let Some(first) = names.first() {
-            entry.set_text(first);
-        }
-        let entry_for_choice = entry.clone();
-        choices.connect_selected_notify(move |choices| {
-            if let Some(value) = choices.selected_item().and_downcast::<gtk::StringObject>() {
-                entry_for_choice.set_text(&value.string());
+        if !refs.is_empty() {
+            let choices = gtk::DropDown::from_strings(&refs);
+            choices.set_tooltip_text(Some("Choose an enrolled speaker"));
+            if current.is_some() {
+                choices.set_selected(gtk::INVALID_LIST_POSITION);
+            } else if let Some(first) = names.first() {
+                entry.set_text(first);
             }
-        });
-        content.append(&choices);
+            let entry_for_choice = entry.clone();
+            choices.connect_selected_notify(move |choices| {
+                if let Some(value) = choices.selected_item().and_downcast::<gtk::StringObject>() {
+                    entry_for_choice.set_text(&value.string());
+                }
+            });
+            content.append(&choices);
+        }
     }
     content.append(&entry);
     dialog.set_extra_child(Some(&content));
-    dialog.add_responses(&[("cancel", "Cancel"), ("assign", "Assign and learn")]);
+    let response = if current.is_some() {
+        "Reassign and learn"
+    } else {
+        "Assign and learn"
+    };
+    dialog.add_responses(&[("cancel", "Cancel"), ("assign", response)]);
     dialog.set_default_response(Some("assign"));
     dialog.set_close_response("cancel");
     dialog.set_response_appearance("assign", adw::ResponseAppearance::Suggested);
     let detail_for_response = detail.clone();
     let speaker_id = speaker_id.to_owned();
+    let current = current.map(str::to_owned);
     dialog.connect_response(Some("assign"), move |_, _| {
         let name = entry.text().trim().to_owned();
         if name.is_empty() {
@@ -2601,6 +2725,17 @@ fn show_assignment_dialog(detail: &SessionDetail, speaker_id: &str) {
                 &detail_for_response.window,
                 "Speaker name required",
                 "Enter or choose a name for this voice.",
+            );
+            return;
+        }
+        if current
+            .as_deref()
+            .is_some_and(|current| current.trim() == name)
+        {
+            show_error(
+                &detail_for_response.window,
+                "Same name",
+                "Choose a different name to reassign this voice.",
             );
             return;
         }
@@ -2660,12 +2795,12 @@ fn start_assignment(detail: &SessionDetail, speaker_id: String, name: String) {
                     let _ = detail.load(&path);
                 }
                 if !outcome.learned {
-                    let notice = adw::AlertDialog::new(
-                        Some("Speaker assigned"),
-                        Some(
-                            "The transcript was updated. The voice model was unavailable, so this name applies to this session only.",
-                        ),
-                    );
+                    let body = if outcome.previous.is_some() {
+                        "The transcript was updated. The voice model was unavailable, so the voice was not relearned; the change applies to this session only."
+                    } else {
+                        "The transcript was updated. The voice model was unavailable, so this name applies to this session only."
+                    };
+                    let notice = adw::AlertDialog::new(Some("Speaker assigned"), Some(body));
                     notice.add_response("close", "Close");
                     notice.present(Some(&detail.window));
                 }
@@ -2851,6 +2986,36 @@ fn show_about(parent: &adw::ApplicationWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn utterance(speaker: &str, speaker_id: &str, start_ms: u64, end_ms: u64) -> Utterance {
+        Utterance {
+            start_ms,
+            end_ms,
+            source: AudioSource::System,
+            speaker_id: speaker_id.into(),
+            speaker: speaker.into(),
+            text: "text".into(),
+        }
+    }
+
+    #[test]
+    fn frequent_speakers_rank_duration_then_name() {
+        let utterances = vec![
+            utterance("Alice", "spk_1", 0, 500),
+            utterance("Alice", "spk_1", 700, 900),
+            utterance("Bob", "spk_2", 0, 700),
+            utterance("Carol", "spk_3", 0, 600),
+            utterance("Dana", "spk_4", 0, 550),
+            utterance("SPEAKER_00", "spk_5", 0, 2_000),
+            utterance("unknown", "spk_6", 0, 2_000),
+            utterance("Local owner", "local", 0, 2_000),
+        ];
+
+        assert_eq!(
+            frequent_speakers(&utterances, 3),
+            vec!["Alice", "Bob", "Carol"]
+        );
+    }
 
     #[test]
     fn session_paths_cannot_escape_the_session() {

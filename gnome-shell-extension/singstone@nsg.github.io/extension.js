@@ -202,7 +202,7 @@ class SingstoneButton extends PanelMenu.Button {
             this._recordIcon.remove_style_class_name(
                 'singstone-record-icon-live'
             );
-            this._elapsedLabel.text = 'Record';
+            this._elapsedLabel.text = this._updateProgressText() ?? 'Record';
             this._meters.hide();
             this._stopIcon.hide();
             this._micMeter.reset();
@@ -290,6 +290,16 @@ class SingstoneButton extends PanelMenu.Button {
         this._updateIcon.visible = this._updater.snapUpdateAvailable ||
             this._updater.extensionUpdateAvailable ||
             this._updater.extensionRestartPending;
+        this._sync();
+    }
+
+    _updateProgressText() {
+        const task = this._updater.snapTask ?? this._updater.extensionTask;
+        if (!task)
+            return null;
+        if (task.phase === 'downloading')
+            return downloadLabel('Updating', task.progress);
+        return 'Updating…';
     }
 });
 

@@ -103,17 +103,6 @@ class SingstoneButton extends PanelMenu.Button {
         this._updateIcon = new St.Icon({
             icon_name: 'software-update-available-symbolic',
             style_class: 'system-status-icon singstone-update-icon',
-            reactive: true,
-            track_hover: true,
-        });
-        this._updateIcon.connect('button-press-event', () => {
-            this.menu.toggle();
-            return Clutter.EVENT_STOP;
-        });
-        this._updateIcon.connect('touch-event', (_actor, event) => {
-            if (event.type() === Clutter.EventType.TOUCH_BEGIN)
-                this.menu.toggle();
-            return Clutter.EVENT_STOP;
         });
         this._box.add_child(this._updateIcon);
 
@@ -195,18 +184,6 @@ class SingstoneButton extends PanelMenu.Button {
         });
         this._sync();
         this._syncUpdates();
-    }
-
-    vfunc_event(event) {
-        const type = event.type();
-        const leftClick = type === Clutter.EventType.BUTTON_PRESS &&
-            event.get_button() === 1;
-        if (leftClick || type === Clutter.EventType.TOUCH_BEGIN) {
-            this._toggleRecording();
-            return Clutter.EVENT_STOP;
-        }
-
-        return super.vfunc_event(event);
     }
 
     _toggleRecording() {

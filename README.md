@@ -113,14 +113,14 @@ The panel polls the recorder status over D-Bus, so it does not depend on
 session-bus signals reaching GNOME Shell.
 The extension supports GNOME Shell 45 through 49.
 
-Right-click the Record button to open its menu. An update icon appears when a
-newer build is available; use **Update Singstone** to download and install the
-snap. It closes Singstone if it is running (stop any recording first), installs
-the snap after the password prompt, and reopens Singstone. Use **Update
-extension** to install the new zip, then log out and back in to load it. Update
-checks query the GitHub API at most every six hours, plus when the menu is
-opened after 15 minutes. Nothing is installed without clicking an update
-action.
+Click the Record button to open its menu and start or stop a recording. An
+update icon appears when a newer build is available; use **Update Singstone**
+to download and install the snap. It closes Singstone if it is running (stop
+any recording first), installs the snap after the password prompt, and reopens
+Singstone. Use **Update extension** to install the new zip, then log out and
+back in to load it. Update checks query the GitHub API at most every six
+hours, plus when the menu is opened after 15 minutes. Nothing is installed
+without clicking an update action.
 
 Install the extension, then log out and back in (Wayland cannot load a new
 extension into a running session):

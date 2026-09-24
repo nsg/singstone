@@ -26,6 +26,9 @@ const FIRST_CHECK_DELAY = 60;
 const CHECK_INTERVAL = 6 * 60 * 60;
 const STALE_AFTER = 15 * 60 * GLib.USEC_PER_SEC;
 const DOWNLOAD_CHUNK_SIZE = 256 * 1024;
+const DOWNLOAD_STALL_TIMEOUT = 60;
+const DOWNLOAD_MAX_ATTEMPTS = 5;
+const DOWNLOAD_RETRY_DELAY = 2;
 const PROGRESS_INTERVAL = 250 * 1000;
 
 export function commitsMatch(a, b) {
@@ -303,7 +306,9 @@ export const UpdateManager = GObject.registerClass({
             if (!this._destroyed) {
                 // Reopen the app when it was closed for an install that failed.
                 afterInstall?.(context);
-                this._notify(`Singstone update failed: ${this._errorMessage(error)}`);
+                this._notify(
+                    `Singstone update failed: ${this._errorMessage(error)}`
+                );
             }
         } finally {
             if (!this._destroyed) {
@@ -368,7 +373,9 @@ export const UpdateManager = GObject.registerClass({
         } catch (error) {
             this._unlink(path);
             if (!this._destroyed) {
-                this._notify(`Extension update failed: ${this._errorMessage(error)}`);
+                this._notify(
+                    `Extension update failed: ${this._errorMessage(error)}`
+                );
             }
         } finally {
             if (!this._destroyed) {
@@ -382,89 +389,229 @@ export const UpdateManager = GObject.registerClass({
         if (this._destroyed)
             throw new Error('Update manager was destroyed');
 
+        const managerCancellable = this._cancellable;
         const useApiUrl = typeof asset.apiUrl === 'string';
         const url = useApiUrl ? asset.apiUrl : asset.url;
-        const message = Soup.Message.new('GET', url);
-        if (useApiUrl) {
-            message.get_request_headers().append(
-                'Accept', 'application/octet-stream'
-            );
-        }
-        const input = await this._session.send_async(
-            message,
-            GLib.PRIORITY_DEFAULT,
-            this._cancellable
-        );
-        if (this._destroyed)
-            throw new Error('Update manager was destroyed');
-
-        const status = message.get_status();
-        if (status !== 200)
-            throw new Error(`Download failed with HTTP status ${status}`);
-
         let size = Number(asset.size);
-        if (!Number.isFinite(size) || size <= 0) {
-            size = Number(message.get_response_headers().get_content_length());
-            if (!Number.isFinite(size) || size <= 0)
-                throw new Error('Download size is unknown');
-        }
-
         const file = Gio.File.new_for_path(path);
         let output = await file.replace_async(
             null,
             false,
             Gio.FileCreateFlags.REPLACE_DESTINATION,
             GLib.PRIORITY_DEFAULT,
-            this._cancellable
+            managerCancellable
         );
-        if (this._destroyed)
-            throw new Error('Update manager was destroyed');
-
         let written = 0;
         let lastProgress = GLib.get_monotonic_time();
+        let lastError = null;
         try {
-            while (true) {
-                const bytes = await input.read_bytes_async(
-                    DOWNLOAD_CHUNK_SIZE,
-                    GLib.PRIORITY_DEFAULT,
-                    this._cancellable
+            if (this._destroyed)
+                throw new Error('Update manager was destroyed');
+
+            for (let number = 1; number <= DOWNLOAD_MAX_ATTEMPTS; number++) {
+                const attempt = new Gio.Cancellable();
+                const cancellationId = managerCancellable.connect(
+                    () => attempt.cancel()
                 );
-                if (this._destroyed)
-                    throw new Error('Update manager was destroyed');
+                let watchdogId = 0;
+                let stalled = false;
+                let retryable = true;
+                let complete = false;
 
-                const chunkSize = bytes.get_size();
-                if (chunkSize === 0)
-                    break;
-
-                const data = bytes.get_data();
-                let offset = 0;
-                while (offset < chunkSize) {
-                    const remaining = offset === 0
-                        ? bytes
-                        : new GLib.Bytes(data.slice(offset));
-                    const count = await output.write_bytes_async(
-                        remaining,
+                const armWatchdog = () => {
+                    if (watchdogId)
+                        GLib.source_remove(watchdogId);
+                    watchdogId = GLib.timeout_add_seconds(
                         GLib.PRIORITY_DEFAULT,
-                        this._cancellable
+                        DOWNLOAD_STALL_TIMEOUT,
+                        () => {
+                            watchdogId = 0;
+                            stalled = true;
+                            attempt.cancel();
+                            return GLib.SOURCE_REMOVE;
+                        }
+                    );
+                };
+
+                try {
+                    const message = Soup.Message.new('GET', url);
+                    if (typeof message.set_force_http1 === 'function')
+                        message.set_force_http1(true);
+                    const headers = message.get_request_headers();
+                    if (useApiUrl) {
+                        headers.append(
+                            'Accept', 'application/octet-stream'
+                        );
+                    }
+                    const requestedRange = written > 0;
+                    if (requestedRange)
+                        headers.append('Range', `bytes=${written}-`);
+
+                    armWatchdog();
+                    const input = await this._session.send_async(
+                        message,
+                        GLib.PRIORITY_DEFAULT,
+                        attempt
                     );
                     if (this._destroyed)
                         throw new Error('Update manager was destroyed');
-                    if (count <= 0)
-                        throw new Error('Download failed while writing the file');
-                    offset += count;
-                    written += count;
+
+                    const status = message.get_status();
+                    if (status !== 200 && status !== 206 &&
+                        !(status === 416 && written === size)) {
+                        retryable = false;
+                        throw new Error(
+                            `Download failed with HTTP status ${status}`
+                        );
+                    }
+                    if ((!Number.isFinite(size) || size <= 0) &&
+                        number === 1 && status === 200) {
+                        size = Number(message.get_response_headers()
+                            .get_content_length());
+                    }
+                    if (!Number.isFinite(size) || size <= 0) {
+                        retryable = false;
+                        throw new Error('Download size is unknown');
+                    }
+
+                    if (status === 416 && written === size) {
+                        complete = true;
+                    } else if (status === 206) {
+                        // The server accepted the requested range.
+                    } else if (status === 200 && requestedRange) {
+                        output.truncate(0, null);
+                        output.seek(0, GLib.SeekType.SET, null);
+                        written = 0;
+                    }
+
+                    if (number > 1) {
+                        onProgress(Math.min(written / size, 1));
+                        lastProgress = GLib.get_monotonic_time();
+                    }
+
+                    while (!complete) {
+                        const bytes = await input.read_bytes_async(
+                            DOWNLOAD_CHUNK_SIZE,
+                            GLib.PRIORITY_DEFAULT,
+                            attempt
+                        );
+                        if (this._destroyed) {
+                            throw new Error(
+                                'Update manager was destroyed'
+                            );
+                        }
+
+                        const chunkSize = bytes.get_size();
+                        if (chunkSize === 0) {
+                            if (written === size)
+                                complete = true;
+                            else
+                                throw new Error(
+                                    `Downloaded ${written} bytes, ` +
+                                    `expected ${size}`
+                                );
+                            break;
+                        }
+                        armWatchdog();
+
+                        const data = bytes.get_data();
+                        let offset = 0;
+                        while (offset < chunkSize) {
+                            const remaining = offset === 0
+                                ? bytes
+                                : new GLib.Bytes(data.slice(offset));
+                            const count = await output.write_bytes_async(
+                                remaining,
+                                GLib.PRIORITY_DEFAULT,
+                                attempt
+                            );
+                            if (this._destroyed) {
+                                throw new Error(
+                                    'Update manager was destroyed'
+                                );
+                            }
+                            if (count <= 0) {
+                                throw new Error(
+                                    'Download failed while writing the file'
+                                );
+                            }
+                            offset += count;
+                            written += count;
+                        }
+
+                        const now = GLib.get_monotonic_time();
+                        if (now - lastProgress >= PROGRESS_INTERVAL) {
+                            onProgress(Math.min(written / size, 1));
+                            lastProgress = now;
+                        }
+                    }
+                } catch (error) {
+                    if (this._destroyed ||
+                        managerCancellable.is_cancelled()) {
+                        throw error;
+                    }
+                    if (!retryable)
+                        throw error;
+                    lastError = stalled
+                        ? new Error(
+                            `No download data received for ` +
+                            `${DOWNLOAD_STALL_TIMEOUT} seconds`
+                        )
+                        : error;
+                } finally {
+                    if (watchdogId)
+                        GLib.source_remove(watchdogId);
+                    managerCancellable.disconnect(cancellationId);
                 }
 
-                const now = GLib.get_monotonic_time();
-                if (now - lastProgress >= PROGRESS_INTERVAL) {
-                    onProgress(size > 0 ? Math.min(written / size, 1) : -1);
-                    lastProgress = now;
+                if (complete)
+                    break;
+                if (number === DOWNLOAD_MAX_ATTEMPTS) {
+                    throw new Error(
+                        `Download stalled after ${DOWNLOAD_MAX_ATTEMPTS} ` +
+                        `attempts: ${this._errorMessage(lastError)}`
+                    );
+                }
+
+                let retryTimeoutId = 0;
+                let retryCancellationId = 0;
+                try {
+                    await new Promise((resolve, reject) => {
+                        retryCancellationId = managerCancellable.connect(
+                            () => {
+                                if (retryTimeoutId) {
+                                    GLib.source_remove(retryTimeoutId);
+                                    retryTimeoutId = 0;
+                                }
+                                reject(new Error(
+                                    'Update manager was destroyed'
+                                ));
+                            }
+                        );
+                        retryTimeoutId = GLib.timeout_add_seconds(
+                            GLib.PRIORITY_DEFAULT,
+                            DOWNLOAD_RETRY_DELAY,
+                            () => {
+                                retryTimeoutId = 0;
+                                resolve();
+                                return GLib.SOURCE_REMOVE;
+                            }
+                        );
+                    });
+                } finally {
+                    if (retryTimeoutId)
+                        GLib.source_remove(retryTimeoutId);
+                    if (retryCancellationId) {
+                        managerCancellable.disconnect(
+                            retryCancellationId
+                        );
+                    }
                 }
             }
 
             await output.close_async(
                 GLib.PRIORITY_DEFAULT,
-                this._cancellable
+                managerCancellable
             );
             output = null;
             if (this._destroyed)
@@ -482,7 +629,7 @@ export const UpdateManager = GObject.registerClass({
                 try {
                     await output.close_async(
                         GLib.PRIORITY_DEFAULT,
-                        this._cancellable
+                        managerCancellable
                     );
                 } catch (_error) {
                     // Preserve the original download error.

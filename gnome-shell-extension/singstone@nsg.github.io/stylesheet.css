@@ -15,7 +15,7 @@
 }
 
 .singstone-meters {
-  spacing: 2px;
+  spacing: 1px;
 }
 
 .singstone-meter-row {
@@ -24,13 +24,13 @@
 
 .singstone-meter-track {
   width: 40px;
-  height: 5px;
+  height: 4px;
   border-radius: 3px;
   background-color: rgba(127, 127, 127, 0.35);
 }
 
 .singstone-meter-fill {
-  height: 5px;
+  height: 4px;
   border-radius: 3px;
   background-color: #e01b24;
 }

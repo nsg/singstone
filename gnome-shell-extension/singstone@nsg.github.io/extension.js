@@ -12,17 +12,18 @@ import {RecorderClient} from './recorder.js';
 import {UpdateManager} from './updater.js';
 
 const METER_WIDTH = 40;
-const METER_HEIGHT = 5;
+const METER_HEIGHT = 4;
 
 class LevelMeter {
     constructor(iconName) {
         this.actor = new St.BoxLayout({
             style_class: 'singstone-meter-row',
             x_align: Clutter.ActorAlign.START,
+            y_align: Clutter.ActorAlign.CENTER,
         });
         this.actor.add_child(new St.Icon({
             icon_name: iconName,
-            icon_size: 12,
+            icon_size: 10,
         }));
 
         this._track = new St.Widget({
@@ -73,6 +74,7 @@ class SingstoneButton extends PanelMenu.Button {
         this._recordIcon = new St.Icon({
             icon_name: 'media-record-symbolic',
             style_class: 'system-status-icon singstone-record-icon',
+            y_align: Clutter.ActorAlign.CENTER,
         });
         this._box.add_child(this._recordIcon);
 
@@ -83,7 +85,11 @@ class SingstoneButton extends PanelMenu.Button {
         });
         this._box.add_child(this._elapsedLabel);
 
-        this._meters = new St.BoxLayout({style_class: 'singstone-meters'});
+        this._meters = new St.BoxLayout({
+            style_class: 'singstone-meters',
+            y_align: Clutter.ActorAlign.CENTER,
+            y_expand: false,
+        });
         if (this._meters.orientation !== undefined)
             this._meters.orientation = Clutter.Orientation.VERTICAL;
         else
@@ -97,6 +103,7 @@ class SingstoneButton extends PanelMenu.Button {
         this._updateIcon = new St.Icon({
             icon_name: 'software-update-available-symbolic',
             style_class: 'system-status-icon singstone-update-icon',
+            y_align: Clutter.ActorAlign.CENTER,
         });
         this._box.add_child(this._updateIcon);
 

@@ -94,12 +94,6 @@ class SingstoneButton extends PanelMenu.Button {
         this._meters.add_child(this._systemMeter.actor);
         this._box.add_child(this._meters);
 
-        this._stopIcon = new St.Icon({
-            icon_name: 'media-playback-stop-symbolic',
-            style_class: 'system-status-icon',
-        });
-        this._box.add_child(this._stopIcon);
-
         this._updateIcon = new St.Icon({
             icon_name: 'software-update-available-symbolic',
             style_class: 'system-status-icon singstone-update-icon',
@@ -204,7 +198,6 @@ class SingstoneButton extends PanelMenu.Button {
             );
             this._elapsedLabel.text = this._updateProgressText() ?? 'Record';
             this._meters.hide();
-            this._stopIcon.hide();
             this._micMeter.reset();
             this._systemMeter.reset();
             this._recordingItem.label.text = 'Start recording';
@@ -217,7 +210,6 @@ class SingstoneButton extends PanelMenu.Button {
             ? 'Stopping…'
             : formatElapsed(status.elapsed);
         this._meters.show();
-        this._stopIcon.visible = !status.stopping;
 
         this._micMeter.actor.visible = status.mic;
         this._systemMeter.actor.visible = status.system;

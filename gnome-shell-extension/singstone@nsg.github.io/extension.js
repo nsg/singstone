@@ -116,7 +116,9 @@ class SingstoneButton extends PanelMenu.Button {
         this.menu.addMenuItem(openItem);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this._snapUpdateItem = new PopupMenu.PopupMenuItem('Reinstall Singstone');
+        this._snapUpdateItem = new PopupMenu.PopupMenuItem(
+            'Reinstall Singstone'
+        );
         this._snapUpdateItem.connect('activate', () => {
             if (this._client.status.recording) {
                 Main.notify(
@@ -252,7 +254,9 @@ class SingstoneButton extends PanelMenu.Button {
             this._snapUpdateItem.setSensitive(false);
         } else {
             this._snapUpdateItem.label.text = this._updater.snapUpdateAvailable
-                ? `Update Singstone to ${shortCommit(this._updater.remote.commit)}`
+                ? `Update Singstone to ${shortCommit(
+                    this._updater.remote.commit
+                )}`
                 : 'Reinstall Singstone';
             this._snapUpdateItem.setSensitive(!this._updater.checking);
         }
@@ -277,7 +281,9 @@ class SingstoneButton extends PanelMenu.Button {
         } else {
             this._extensionUpdateItem.label.text =
                 this._updater.extensionUpdateAvailable
-                    ? `Update extension to ${shortCommit(this._updater.remote.commit)}`
+                    ? `Update extension to ${shortCommit(
+                        this._updater.remote.commit
+                    )}`
                     : 'Reinstall extension';
             this._extensionUpdateItem.setSensitive(!this._updater.checking);
         }

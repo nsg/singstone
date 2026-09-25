@@ -74,9 +74,9 @@ pub struct ProcessArgs {
     /// Meeting details file to validate and copy into the session.
     #[arg(long)]
     pub meeting: Option<PathBuf>,
-    /// Folder of Singstone meeting-context JSON files.
-    #[arg(long, env = "SINGSTONE_CONTEXT_DIR")]
-    pub context_dir: Option<PathBuf>,
+    /// Singstone meeting-context JSON file (or a folder of them) to match by session start.
+    #[arg(long, alias = "context-dir", env = "SINGSTONE_CONTEXT_FILE")]
+    pub context_file: Option<PathBuf>,
     /// Path to a whisper.cpp GGML model.
     #[arg(long, env = "SINGSTONE_WHISPER_MODEL")]
     pub whisper_model: Option<PathBuf>,
@@ -128,7 +128,9 @@ impl ProcessArgs {
         Self {
             session,
             meeting: None,
-            context_dir: std::env::var_os("SINGSTONE_CONTEXT_DIR").map(PathBuf::from),
+            context_file: std::env::var_os("SINGSTONE_CONTEXT_FILE")
+                .or_else(|| std::env::var_os("SINGSTONE_CONTEXT_DIR"))
+                .map(PathBuf::from),
             whisper_model: std::env::var_os("SINGSTONE_WHISPER_MODEL").map(PathBuf::from),
             segmentation_model: std::env::var_os("SINGSTONE_SEGMENTATION_MODEL").map(PathBuf::from),
             embedding_model: std::env::var_os("SINGSTONE_EMBEDDING_MODEL").map(PathBuf::from),

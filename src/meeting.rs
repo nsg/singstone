@@ -121,12 +121,9 @@ pub fn write_details_atomic(path: &Path, details: &MeetingDetails) -> io::Result
     fs::rename(temporary, path)
 }
 
-pub fn match_context(dir: &Path, started_wallclock: &str) -> Option<MeetingDetails> {
-    match_context_with_source(dir, started_wallclock).map(|(details, _)| details)
-}
-
+/// `source` is either one meeting-context JSON file or a folder of them.
 pub fn match_context_with_source(
-    dir: &Path,
+    source: &Path,
     started_wallclock: &str,
 ) -> Option<(MeetingDetails, PathBuf)> {
     let session_start = match parse_rfc3339(started_wallclock) {
@@ -136,23 +133,27 @@ pub fn match_context_with_source(
             return None;
         }
     };
-    let mut files = match fs::read_dir(dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
-                    && path
-                        .extension()
-                        .is_some_and(|extension| extension == "json")
-            })
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            eprintln!(
-                "warning: cannot read meeting context folder {}: {error}",
-                dir.display()
-            );
-            return None;
+    let mut files = if source.is_file() {
+        vec![source.to_path_buf()]
+    } else {
+        match fs::read_dir(source) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|extension| extension == "json")
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                eprintln!(
+                    "warning: cannot read meeting context {}: {error}",
+                    source.display()
+                );
+                return None;
+            }
         }
     };
     files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
@@ -438,6 +439,32 @@ mod tests {
         ] {
             assert!(parse_rfc3339(invalid).is_err(), "accepted {invalid}");
         }
+    }
+
+    fn match_context(source: &Path, started_wallclock: &str) -> Option<MeetingDetails> {
+        match_context_with_source(source, started_wallclock).map(|(details, _)| details)
+    }
+
+    #[test]
+    fn matches_a_single_file_and_reports_it() {
+        let dir = test_dir("single-file");
+        write_context(
+            &dir,
+            "other.json",
+            serde_json::json!([{"title":"Other","start":"2026-09-25T10:00:00Z"}]),
+        );
+        write_context(
+            &dir,
+            "chosen.json",
+            serde_json::json!([{"title":"Chosen","start":"2026-09-25T10:00:00Z"}]),
+        );
+        let file = dir.join("chosen.json");
+        let (details, source) =
+            match_context_with_source(&file, "2026-09-25T10:00:00Z").expect("match");
+        assert_eq!(details.title, "Chosen");
+        assert_eq!(source, file);
+        assert!(match_context(&dir.join("missing.json"), "2026-09-25T10:00:00Z").is_none());
+        fs::remove_dir_all(dir).expect("remove fixture");
     }
 
     #[test]

@@ -177,10 +177,10 @@ app stores the result as `meeting.json` inside that session. Use **Meeting
 details…** on a processed session to revise it and re-render the transcript.
 An empty title keeps the session's date-based default title.
 
-Set **Meeting context folder** in Settings to prefill the dialog from files
-created by calendar-export scripts or other local tools. Singstone reads its
-own interchange format only; it does not parse calendar-provider formats or
-execute scripts. Each `*.json` file directly in the folder has this schema:
+Set **Meeting context file** in Settings to prefill the dialog from a JSON
+file created by calendar-export scripts or other local tools. Singstone reads
+its own interchange format only; it does not parse calendar-provider formats or
+execute scripts. The file has this schema:
 
 ```json
 {
@@ -206,8 +206,8 @@ entries are warned about and skipped without blocking processing.
 
 The session start must fall between 15 minutes before the meeting start and
 the meeting end. Without `end`, the window ends 60 minutes after the start.
-If several entries match, the closest start wins; ties use file name and then
-entry order. Existing session details take precedence over the context folder.
+If several entries match, the closest start wins; ties use entry order.
+Existing session details take precedence over the context file.
 
 The per-session file used by processing is:
 
@@ -230,9 +230,10 @@ are also marked as echo. Echo lines stay in both transcript formats, carry
 metadata in `transcript.jsonl`, and can be hidden temporarily in the app.
 
 For command-line processing, `--meeting FILE` validates and copies a
-`meeting.json`-shaped file into the session. `--context-dir DIR` (or
-`SINGSTONE_CONTEXT_DIR`) searches a context folder only when the session has no
-details yet. Both may be supplied; `--meeting` wins.
+`meeting.json`-shaped file into the session. `--context-file FILE` (or
+`SINGSTONE_CONTEXT_FILE`) searches a context file only when the session has no
+details yet. Both may be supplied; `--meeting` wins. A folder of `*.json`
+files is also accepted; ties between files then use the file name.
 
 ## Snap behavior
 
@@ -274,7 +275,7 @@ snap logs -n=100 singstone.model-download
 | `gui` | Launch the GTK4 interface (also the default with no command) |
 | `devices` | List selectable PipeWire sources and sinks |
 | `record` | Capture audio and optional screenshots into a session |
-| `process` | Run the pipeline, optionally with `--meeting` or `--context-dir` details |
+| `process` | Run the pipeline, optionally with `--meeting` or `--context-file` details |
 | `transcribe` | Produce word-level text and timestamps |
 | `diarize` | Produce anonymous speaker intervals |
 | `recognize` | Match speaker clusters to enrolled voices |

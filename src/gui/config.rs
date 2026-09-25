@@ -12,8 +12,8 @@ pub struct GuiConfig {
     pub meetings_dir: PathBuf,
     pub screenshots_dir: PathBuf,
     pub local_speaker: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_dir: Option<PathBuf>,
+    #[serde(alias = "context_dir", skip_serializing_if = "Option::is_none")]
+    pub context_file: Option<PathBuf>,
     pub swedish_transcription: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dark_mode: Option<bool>,
@@ -32,7 +32,9 @@ impl Default for GuiConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("Pictures/Screenshots")),
             local_speaker: "Me".into(),
-            context_dir: std::env::var_os("SINGSTONE_CONTEXT_DIR").map(PathBuf::from),
+            context_file: std::env::var_os("SINGSTONE_CONTEXT_FILE")
+                .or_else(|| std::env::var_os("SINGSTONE_CONTEXT_DIR"))
+                .map(PathBuf::from),
             swedish_transcription: true,
             dark_mode: None,
         }
@@ -105,7 +107,7 @@ mod tests {
         )
         .expect("deserialize legacy GUI config");
 
-        assert_eq!(config.context_dir, None);
+        assert_eq!(config.context_file, None);
         assert!(config.swedish_transcription);
         assert_eq!(config.dark_mode, None);
     }

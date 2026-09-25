@@ -1100,19 +1100,19 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
     shots.add_suffix(&screenshots_change);
     storage.add(&shots);
     let context = adw::ActionRow::builder()
-        .title("Meeting context folder")
+        .title("Meeting context file")
         .subtitle(
             config
-                .context_dir
+                .context_file
                 .as_ref()
                 .map_or_else(|| "Not set".into(), |path| path.display().to_string()),
         )
         .build();
-    context.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
+    context.add_prefix(&gtk::Image::from_icon_name("text-x-generic-symbolic"));
     let context_clear = gtk::Button::from_icon_name("edit-clear-symbolic");
-    context_clear.set_tooltip_text(Some("Clear meeting context folder"));
+    context_clear.set_tooltip_text(Some("Clear meeting context file"));
     context_clear.set_valign(gtk::Align::Center);
-    context_clear.set_sensitive(config.context_dir.is_some());
+    context_clear.set_sensitive(config.context_file.is_some());
     context.add_suffix(&context_clear);
     let context_change = gtk::Button::with_label("Change…");
     context_change.set_valign(gtk::Align::Center);
@@ -1307,20 +1307,30 @@ fn wire_settings(
     let row_for_context = page.context.clone();
     let clear_for_context = page.context_clear.clone();
     page.context_change.connect_clicked(move |_| {
+        let json_filter = gtk::FileFilter::new();
+        json_filter.set_name(Some("JSON files"));
+        json_filter.add_suffix("json");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&json_filter);
         let chooser = gtk::FileDialog::builder()
-            .title("Choose meeting context folder")
-            .accept_label("Use folder")
+            .title("Choose meeting context file")
+            .accept_label("Use file")
             .modal(true)
+            .filters(&filters)
+            .default_filter(&json_filter)
             .build();
+        if let Some(current) = config_for_context.borrow().context_file.as_deref() {
+            chooser.set_initial_file(Some(&gio::File::for_path(current)));
+        }
         let parent_for_result = parent.clone();
         let config = config_for_context.clone();
         let row = row_for_context.clone();
         let clear = clear_for_context.clone();
-        chooser.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
-            let Ok(folder) = result else { return };
-            let Some(path) = folder.path() else { return };
+        chooser.open(Some(&parent), None::<&gio::Cancellable>, move |result| {
+            let Ok(file) = result else { return };
+            let Some(path) = file.path() else { return };
             let mut updated = config.borrow().clone();
-            updated.context_dir = Some(path.clone());
+            updated.context_file = Some(path.clone());
             if let Err(error) = updated.save() {
                 show_error(
                     &parent_for_result,
@@ -1341,7 +1351,7 @@ fn wire_settings(
     let clear_for_context = page.context_clear.clone();
     page.context_clear.connect_clicked(move |_| {
         let mut updated = config_for_context.borrow().clone();
-        updated.context_dir = None;
+        updated.context_file = None;
         if let Err(error) = updated.save() {
             show_error(&parent, "Could not save settings", &error.to_string());
             return;
@@ -1835,9 +1845,9 @@ fn meeting_prefill(
         return Ok((details, Some("Previous details".into())));
     }
     let manifest = session.read_manifest()?;
-    if let Some(context_dir) = config.context_dir.as_deref()
+    if let Some(context_file) = config.context_file.as_deref()
         && let Some((details, source)) =
-            meeting::match_context_with_source(context_dir, &manifest.started_wallclock)
+            meeting::match_context_with_source(context_file, &manifest.started_wallclock)
     {
         let filename = source.file_name().map_or_else(
             || source.display().to_string(),

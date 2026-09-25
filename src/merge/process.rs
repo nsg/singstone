@@ -515,7 +515,7 @@ fn stage_process_args(session: PathBuf) -> ProcessArgs {
     ProcessArgs {
         session,
         meeting: None,
-        context_dir: None,
+        context_file: None,
         whisper_model: None,
         segmentation_model: None,
         embedding_model: None,
@@ -548,11 +548,12 @@ fn prepare_meeting(
         meeting::write_details_atomic(&session.meeting_path(), &details)?;
         eprintln!("meeting details: copied {}", path.display());
     } else if !session.meeting_path().is_file()
-        && let Some(dir) = args.context_dir.as_deref()
-        && let Some(details) = meeting::match_context(dir, &manifest.started_wallclock)
+        && let Some(source) = args.context_file.as_deref()
+        && let Some((details, matched)) =
+            meeting::match_context_with_source(source, &manifest.started_wallclock)
     {
         meeting::write_details_atomic(&session.meeting_path(), &details)?;
-        eprintln!("meeting details: matched context folder {}", dir.display());
+        eprintln!("meeting details: matched {}", matched.display());
     }
     Ok(())
 }
@@ -1888,7 +1889,7 @@ mod tests {
         let args = ProcessArgs {
             session: session.dir.clone(),
             meeting: None,
-            context_dir: None,
+            context_file: None,
             whisper_model: Some(models.join("ggml-base.en.bin")),
             segmentation_model: Some(
                 models.join("sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
@@ -1921,7 +1922,7 @@ mod tests {
         run(ProcessArgs {
             session: session.dir.clone(),
             meeting: None,
-            context_dir: None,
+            context_file: None,
             whisper_model: None,
             segmentation_model: Some(root.join("missing-segmentation.onnx")),
             embedding_model: Some(root.join("missing-embedding.onnx")),
@@ -1941,7 +1942,7 @@ mod tests {
         run(ProcessArgs {
             session: session.dir.clone(),
             meeting: None,
-            context_dir: None,
+            context_file: None,
             whisper_model: None,
             segmentation_model: Some(root.join("missing-segmentation.onnx")),
             embedding_model: Some(root.join("missing-embedding.onnx")),
@@ -2003,7 +2004,7 @@ mod tests {
         run(ProcessArgs {
             session: session.dir.clone(),
             meeting: None,
-            context_dir: None,
+            context_file: None,
             whisper_model: None,
             segmentation_model: None,
             embedding_model: None,

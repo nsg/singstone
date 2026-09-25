@@ -39,6 +39,8 @@ the recorded audio is preserved.
 - Automatically accelerates Whisper with Intel SYCL on a compatible Intel GPU,
   preferring Level Zero and retrying through OpenCL before using CPU.
 - Recognizes enrolled voices while leaving uncertain matches anonymous.
+- Uses per-meeting attendee details to guide speaker counts and recognition,
+  and marks likely microphone echo without deleting it.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback, editable
   storage folders, and a one-click header Record button.
@@ -167,6 +169,71 @@ Downloading models [=                       ] 2% 9/393 MiB — kb-whisper-small-
 Later commands reuse the cache. It survives Snap refreshes. The final outputs
 are `transcript.jsonl` for programs and `transcript.txt` for people.
 
+## Meeting details
+
+When processing starts in the app, the **Meeting details** dialog asks for a
+title and the known and unnamed people in the room and on the remote end. The
+app stores the result as `meeting.json` inside that session. Use **Meeting
+details…** on a processed session to revise it and re-render the transcript.
+An empty title keeps the session's date-based default title.
+
+Set **Meeting context folder** in Settings to prefill the dialog from files
+created by calendar-export scripts or other local tools. Singstone reads its
+own interchange format only; it does not parse calendar-provider formats or
+execute scripts. Each `*.json` file directly in the folder has this schema:
+
+```json
+{
+  "format_version": 1,
+  "meetings": [
+    {
+      "title": "Weekly planning",
+      "start": "2026-09-25T10:00:00+02:00",
+      "end": "2026-09-25T11:00:00+02:00",
+      "local": { "known": ["Me", "Anna"], "unknown": 0 },
+      "remote": { "known": ["Bob", "Carol"], "unknown": 2 }
+    }
+  ]
+}
+```
+
+`format_version`, a non-empty `title`, and an RFC 3339 `start` with seconds
+and either `Z` or a numeric offset are required. `end` is optional. `local`
+and `remote` are optional; within each, `known` defaults to `[]` and `unknown`
+defaults to `0`. Names are trimmed and duplicate or empty names are ignored.
+Unknown members are reserved for forward compatibility. Bad files and bad
+entries are warned about and skipped without blocking processing.
+
+The session start must fall between 15 minutes before the meeting start and
+the meeting end. Without `end`, the window ends 60 minutes after the start.
+If several entries match, the closest start wins; ties use file name and then
+entry order. Existing session details take precedence over the context folder.
+
+The per-session file used by processing is:
+
+```json
+{
+  "format_version": 1,
+  "title": "Weekly planning",
+  "local": { "known": ["Me", "Anna"], "unknown": 0 },
+  "remote": { "known": ["Bob", "Carol"], "unknown": 2 }
+}
+```
+
+Remote attendee count fixes system-audio clustering unless
+`--num-speakers` was supplied. Known names narrow voice-recognition candidates
+when that end has no unnamed attendees; microphone recognition also includes
+known remote names so echo can be detected. A recognized remote voice on the
+microphone is marked as echo. When every named local attendee has been found
+and there are no unnamed local people, remaining anonymous microphone voices
+are also marked as echo. Echo lines stay in both transcript formats, carry
+metadata in `transcript.jsonl`, and can be hidden temporarily in the app.
+
+For command-line processing, `--meeting FILE` validates and copies a
+`meeting.json`-shaped file into the session. `--context-dir DIR` (or
+`SINGSTONE_CONTEXT_DIR`) searches a context folder only when the session has no
+details yet. Both may be supplied; `--meeting` wins.
+
 ## Snap behavior
 
 | Component | Access | Purpose |
@@ -207,7 +274,7 @@ snap logs -n=100 singstone.model-download
 | `gui` | Launch the GTK4 interface (also the default with no command) |
 | `devices` | List selectable PipeWire sources and sinks |
 | `record` | Capture audio and optional screenshots into a session |
-| `process` | Run the complete processing pipeline |
+| `process` | Run the pipeline, optionally with `--meeting` or `--context-dir` details |
 | `transcribe` | Produce word-level text and timestamps |
 | `diarize` | Produce anonymous speaker intervals |
 | `recognize` | Match speaker clusters to enrolled voices |

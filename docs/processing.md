@@ -135,8 +135,9 @@ singstone diarize SESSION \
     --cluster-threshold 1.0
 ```
 
-**Input:** `manifest.json`, the system audio track, and two ONNX models. The
-microphone track is also processed when `--diarize-mic` is supplied.
+**Input:** `manifest.json`, the optional per-session `meeting.json`, the system
+audio track, and two ONNX models. The microphone track is also processed when
+`--diarize-mic` is supplied.
 `words.jsonl` is not an input, so this stage can run before or in parallel with
 transcription.
 
@@ -152,9 +153,12 @@ readily clusters are combined. Lower values usually produce more speakers;
 values around 0.9 to 1.1 have worked best with
 the documented TitaNet model on the tested AMI sample. `--num-speakers N`
 replaces automatic speaker-count estimation with that fixed count separately
-for each enabled source. Cluster numbers are local implementation labels, not
-persistent identities: cluster `2` from one diarization run need not represent
-cluster `2` after changing a model or threshold.
+for each enabled source. Without that flag, a nonzero remote attendee count in
+`meeting.json` fixes the system track's speaker count. It never fixes the
+microphone count because remote echo can create extra microphone clusters.
+Cluster numbers are local implementation labels, not persistent identities:
+cluster `2` from one diarization run need not represent cluster `2` after
+changing a model or threshold.
 
 The result is sorted by meeting time and written to `diarization.jsonl`:
 
@@ -180,6 +184,8 @@ inherit that policy automatically.
   "diarize_mic": false,
   "cluster_threshold": 1.0,
   "num_speakers": null,
+  "mic_num_speakers": null,
+  "system_num_speakers": 4,
   "threads": 8
 }
 ```
@@ -202,7 +208,8 @@ singstone recognize SESSION \
 **Input:** `diarization.jsonl`, the referenced raw audio tracks, a sherpa-onnx
 speaker embedding model, and a database created by `singstone enroll`. The
 model's exact SHA-256 digest and embedding dimension must match those recorded
-when the database was enrolled.
+when the database was enrolled. When present, `meeting.json` also controls the
+candidate names considered for each source.
 
 **Model:** any compatible sherpa-onnx speaker embedding model that matches the
 enrollment database. It will usually be the model used for diarization, and the
@@ -224,6 +231,12 @@ For every distinct `(source, cluster)` pair, the stage:
    `--speaker-threshold`. A lower threshold names more clusters but raises the
    chance of a false match. The default is `0.6`.
 
+For system clusters, known remote attendees are the allowed candidates. For
+microphone clusters, known local and remote attendees are allowed (remote names
+are needed for echo detection). A source remains unrestricted when its attendee
+list is empty or its corresponding end has unnamed people. This is a filtered
+view of the enrollment database; the database on disk is unchanged.
+
 The versioned `speaker-assignments.json` contains every diarized cluster, even
 when it has no usable embedding or confident match:
 
@@ -235,6 +248,7 @@ when it has no usable embedding or confident match:
     "diarization_sha256": "...",
     "embedding_model_sha256": "...",
     "speakers_database_sha256": "...",
+    "meeting_sha256": "...",
     "speaker_threshold": 0.6
   },
   "assignments": [
@@ -272,9 +286,10 @@ limited to the current session.
 singstone render SESSION
 ```
 
-**Input:** `manifest.json`, `words.jsonl`, `diarization.jsonl`, their metadata
-sidecars when present, optionally `speaker-assignments.json`, and the raw audio
-tracks when both are available. Missing assignment data is allowed, but
+**Input:** `manifest.json`, optional `meeting.json`, `words.jsonl`,
+`diarization.jsonl`, their metadata sidecars when present, optionally
+`speaker-assignments.json`, and the raw audio tracks when both are available.
+Missing assignment data is allowed, but
 malformed or unsupported assignment metadata or diarization metadata is an
 error. This stage uses no ML model and is fast.
 
@@ -315,6 +330,15 @@ order. `NN` is a display counter rather than the cluster number. Recognized
 names replace only the display name; the source and numeric cluster remain
 visible through IDs such as `spk_3` or `mic_1`.
 
+After leakage suppression, meeting details can mark diarized microphone
+utterances as echo without deleting them. A microphone cluster assigned to a
+known remote attendee gets `"echo":"remote_attendee"`. If there are no unnamed
+local attendees and every known local attendee appears on a recognized
+microphone cluster, remaining anonymous microphone utterances get
+`"echo":"local_roster"`. Named people outside either roster are left alone,
+system utterances are never marked, and no echo rule runs when the microphone
+was not diarized. The text transcript adds `[echo]` after the speaker name.
+
 Adjacent words are grouped into utterances. A new utterance starts when the
 speaker changes, the silence between words exceeds one second, or an utterance
 has reached 15 seconds and ends with sentence punctuation. Whitespace and
@@ -351,7 +375,11 @@ of those inputs.
 | Manually edited words | `render` |
 | Manually edited speaker segments | `recognize`, then `render`; or only `render` for anonymous names |
 | Anonymous transcript with no enrollment database | Skip `recognize`; run `render` |
-| Several people share the local microphone | `diarize --diarize-mic`, `recognize`, then `render` |
+| Multiple people are listed in the room | Save meeting details, then `diarize --diarize-mic`, `recognize`, and `render` |
+| Changed who was in the meeting | `render` |
+
+Changing attendee names also changes the recognition candidate set, so rerun
+`recognize` before `render` when those names should be matched automatically.
 
 The VAD thresholds and chunk sizes described above are currently fixed. Whisper
 chunks do not overlap and do not share text context, so transcription quality

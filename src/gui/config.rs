@@ -12,7 +12,8 @@ pub struct GuiConfig {
     pub meetings_dir: PathBuf,
     pub screenshots_dir: PathBuf,
     pub local_speaker: String,
-    pub diarize_mic: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_dir: Option<PathBuf>,
     pub swedish_transcription: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dark_mode: Option<bool>,
@@ -31,7 +32,7 @@ impl Default for GuiConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("Pictures/Screenshots")),
             local_speaker: "Me".into(),
-            diarize_mic: true,
+            context_dir: std::env::var_os("SINGSTONE_CONTEXT_DIR").map(PathBuf::from),
             swedish_transcription: true,
             dark_mode: None,
         }
@@ -88,23 +89,23 @@ mod tests {
     fn defaults_have_a_nonempty_identity() {
         let config = GuiConfig::default();
         assert!(!config.local_speaker.trim().is_empty());
-        assert!(config.diarize_mic);
         assert!(config.swedish_transcription);
         assert_eq!(config.dark_mode, None);
     }
 
     #[test]
-    fn legacy_config_enables_microphone_diarization() {
+    fn old_config_with_diarize_mic_still_loads() {
         let config: GuiConfig = serde_json::from_str(
             r#"{
                 "meetings_dir": "/meetings",
                 "screenshots_dir": "/screenshots",
-                "local_speaker": "Alice"
+                "local_speaker": "Alice",
+                "diarize_mic": false
             }"#,
         )
         .expect("deserialize legacy GUI config");
 
-        assert!(config.diarize_mic);
+        assert_eq!(config.context_dir, None);
         assert!(config.swedish_transcription);
         assert_eq!(config.dark_mode, None);
     }

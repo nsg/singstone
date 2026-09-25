@@ -5,6 +5,7 @@ mod cli;
 mod diarization;
 mod format;
 mod gui;
+mod meeting;
 mod merge;
 mod model_setup;
 mod models;

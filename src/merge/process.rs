@@ -2,6 +2,7 @@ use crate::cli::{DiarizeArgs, ProcessArgs, RecognizeArgs, RenderArgs, Transcribe
 use crate::diarization::Diarizer;
 use crate::diarization::sherpa::SherpaDiarizer;
 use crate::format::jsonl;
+use crate::meeting::{self, MeetingDetails};
 use crate::merge::leakage::{self, AudioEnvelopes};
 use crate::merge::utterances::{self, DEFAULT_NEAREST_TOLERANCE_MS};
 use crate::models;
@@ -119,6 +120,10 @@ struct DiarizationMetadata {
     diarize_mic: bool,
     cluster_threshold: f32,
     num_speakers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mic_num_speakers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_num_speakers: Option<u32>,
     threads: usize,
 }
 
@@ -158,6 +163,7 @@ pub fn run_with_control_and_metrics(
     ));
     ensure_not_cancelled(&cancelled)?;
     let (session, manifest) = open_session(&args.session)?;
+    prepare_meeting(&args, &session, &manifest)?;
     let threads = thread_count(args.threads);
     if args.skip_transcription {
         let words: Vec<TimedWord> = read_jsonl_artifact(&session.words_path(), "word input")?;
@@ -508,6 +514,8 @@ fn learn_cluster(
 fn stage_process_args(session: PathBuf) -> ProcessArgs {
     ProcessArgs {
         session,
+        meeting: None,
+        context_dir: None,
         whisper_model: None,
         segmentation_model: None,
         embedding_model: None,
@@ -523,6 +531,30 @@ fn stage_process_args(session: PathBuf) -> ProcessArgs {
         cluster_threshold: 1.0,
         num_speakers: None,
     }
+}
+
+fn prepare_meeting(
+    args: &ProcessArgs,
+    session: &Session,
+    manifest: &Manifest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(path) = args.meeting.as_deref() {
+        let details = meeting::read_details(path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("meeting details {} do not exist", path.display()),
+            )
+        })?;
+        meeting::write_details_atomic(&session.meeting_path(), &details)?;
+        eprintln!("meeting details: copied {}", path.display());
+    } else if !session.meeting_path().is_file()
+        && let Some(dir) = args.context_dir.as_deref()
+        && let Some(details) = meeting::match_context(dir, &manifest.started_wallclock)
+    {
+        meeting::write_details_atomic(&session.meeting_path(), &details)?;
+        eprintln!("meeting details: matched context folder {}", dir.display());
+    }
+    Ok(())
 }
 
 fn open_session(path: &Path) -> Result<(Session, Manifest), Box<dyn std::error::Error>> {
@@ -732,6 +764,7 @@ fn diarize_sources(
             return Ok(Vec::new());
         }
     }
+    let meeting = meeting::read_details(&session.meeting_path())?;
     let mut all_segments = Vec::new();
     for (source, enabled) in [
         (AudioSource::System, manifest.system.enabled),
@@ -752,13 +785,17 @@ fn diarize_sources(
             }
         };
         let started = Instant::now();
+        let num_speakers = effective_num_speakers(args, meeting.as_ref(), source);
+        if let Some(num_speakers) = num_speakers {
+            eprintln!("diarize {source}: fixed speaker count {num_speakers}");
+        }
         let result = SherpaDiarizer::new(
             segmentation_model,
             embedding_model,
             source,
             threads,
             args.cluster_threshold,
-            args.num_speakers,
+            num_speakers,
         )
         .and_then(|mut diarizer| diarizer.diarize(&samples));
         match result {
@@ -776,6 +813,19 @@ fn diarize_sources(
         }
     }
     Ok(all_segments)
+}
+
+fn effective_num_speakers(
+    args: &ProcessArgs,
+    meeting: Option<&MeetingDetails>,
+    source: AudioSource,
+) -> Option<u32> {
+    args.num_speakers.or_else(|| {
+        (source == AudioSource::System)
+            .then(|| meeting.map(MeetingDetails::remote_count))
+            .flatten()
+            .filter(|count| *count > 0)
+    })
 }
 
 #[derive(Default)]
@@ -887,6 +937,7 @@ fn recognize_speakers(
         return Ok(RecognitionResult::default());
     }
 
+    let meeting = meeting::read_details(&session.meeting_path())?;
     let total_clusters = segments
         .iter()
         .filter(|segment| segment.end_ms.saturating_sub(segment.start_ms) >= 1_500)
@@ -925,11 +976,21 @@ fn recognize_speakers(
                     progress(completed_clusters as f64 / total_clusters as f64);
                 }
             });
+        let allowed = meeting
+            .as_ref()
+            .and_then(|meeting| allowed_candidate_names(meeting, source));
         let mut candidates = Vec::new();
         eprintln!("speaker recognition ({source}):");
+        if let Some(allowed) = &allowed {
+            let mut names = allowed.iter().cloned().collect::<Vec<_>>();
+            names.sort();
+            eprintln!("candidates\t{}", names.join(", "));
+        } else {
+            eprintln!("candidates\tall enrolled speakers");
+        }
         eprintln!("cluster\tbest candidate\tscore\tassigned");
         for (cluster, embedding) in cluster_embeddings {
-            let best = best_candidate(&database, &embedding);
+            let best = best_candidate_filtered(&database, &embedding, allowed.as_ref());
             match best {
                 Some((name, score)) => {
                     let assigned = if score >= args.speaker_threshold {
@@ -953,6 +1014,33 @@ fn recognize_speakers(
         }
     }
     Ok(result)
+}
+
+fn allowed_candidate_names(
+    meeting: &MeetingDetails,
+    source: AudioSource,
+) -> Option<HashSet<String>> {
+    match source {
+        AudioSource::System if meeting.remote.unknown == 0 && !meeting.remote.known.is_empty() => {
+            Some(meeting.remote.known.iter().cloned().collect())
+        }
+        AudioSource::Mic
+            if meeting.local_count() > 0
+                && meeting.local.unknown == 0
+                && !meeting.local.known.is_empty() =>
+        {
+            Some(
+                meeting
+                    .local
+                    .known
+                    .iter()
+                    .chain(&meeting.remote.known)
+                    .cloned()
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
 }
 
 fn write_transcription_metadata(
@@ -986,6 +1074,7 @@ fn write_diarization_metadata(
     manifest: &Manifest,
     threads: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let meeting = meeting::read_details(&session.meeting_path())?;
     let optional_hash = |path: Option<&Path>| {
         path.filter(|path| path.is_file())
             .map(models::sha256_file)
@@ -1008,6 +1097,12 @@ fn write_diarization_metadata(
             diarize_mic: args.diarize_mic,
             cluster_threshold: args.cluster_threshold,
             num_speakers: args.num_speakers,
+            mic_num_speakers: effective_num_speakers(args, meeting.as_ref(), AudioSource::Mic),
+            system_num_speakers: effective_num_speakers(
+                args,
+                meeting.as_ref(),
+                AudioSource::System,
+            ),
             threads,
         },
     )?;
@@ -1069,6 +1164,11 @@ fn write_speaker_assignments(
                 .is_file()
                 .then(|| models::sha256_file(&database))
                 .transpose()?,
+            meeting_sha256: session
+                .meeting_path()
+                .is_file()
+                .then(|| models::sha256_file(&session.meeting_path()))
+                .transpose()?,
             speaker_threshold: args.speaker_threshold,
         },
         assignments,
@@ -1121,6 +1221,7 @@ fn render_artifacts_with_segments_and_hook(
         }
     };
     let leakage = leakage::suppress_leaked_mic_words(&words, audio.as_ref());
+    let meeting = meeting::read_details(&session.meeting_path())?;
     let utterances = utterances::build_utterances(
         &leakage.words,
         &segments,
@@ -1128,6 +1229,7 @@ fn render_artifacts_with_segments_and_hook(
         &manifest.local_speaker,
         diarize_mic,
         DEFAULT_NEAREST_TOLERANCE_MS,
+        meeting.as_ref(),
     );
     before_write();
     jsonl::write_all_atomic(&session.leakage_suppressions_path(), &leakage.suppressions)?;
@@ -1138,9 +1240,14 @@ fn render_artifacts_with_segments_and_hook(
         .iter()
         .map(|suppression| suppression.suppressed_words)
         .sum::<usize>();
+    let echo_utterances = utterances
+        .iter()
+        .filter(|utterance| utterance.echo.is_some())
+        .count();
     eprintln!(
-        "merge: {} utterance(s), suppressed {} leaked microphone word(s) in {} region(s), in {:.1} s",
+        "merge: {} utterance(s), {} echo utterance(s), suppressed {} leaked microphone word(s) in {} region(s), in {:.1} s",
         utterances.len(),
+        echo_utterances,
         suppressed_words,
         leakage.suppressions.len(),
         merge_started.elapsed().as_secs_f64()
@@ -1437,10 +1544,15 @@ fn embed_clusters_with_progress(
     output
 }
 
-fn best_candidate(database: &SpeakerDatabase, cluster: &[f32]) -> Option<(String, f32)> {
+fn best_candidate_filtered(
+    database: &SpeakerDatabase,
+    cluster: &[f32],
+    allowed: Option<&HashSet<String>>,
+) -> Option<(String, f32)> {
     database
         .speakers
         .iter()
+        .filter(|(name, _)| allowed.is_none_or(|allowed| allowed.contains(*name)))
         .flat_map(|(name, speaker)| {
             speaker.embeddings.iter().filter_map(move |enrolled| {
                 let mut enrolled = enrolled.clone();
@@ -1494,9 +1606,14 @@ fn write_transcript_text(path: &Path, utterances: &[Utterance]) -> io::Result<()
         for utterance in utterances {
             writeln!(
                 file,
-                "[{}] {}: {}",
+                "[{}] {}{}: {}",
                 format_timestamp(utterance.start_ms),
                 utterance.speaker,
+                if utterance.echo.is_some() {
+                    " [echo]"
+                } else {
+                    ""
+                },
                 utterance.text
             )?;
         }
@@ -1559,9 +1676,94 @@ mod tests {
                 ),
             ]),
         };
-        let (name, score) = best_candidate(&database, &[0.0, 1.0]).expect("candidate");
+        let (name, score) =
+            best_candidate_filtered(&database, &[0.0, 1.0], None).expect("candidate");
         assert_eq!(name, "Alice");
         assert!((score - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn meeting_speaker_count_only_applies_to_system_and_explicit_wins() {
+        let mut args = stage_process_args(PathBuf::from("session"));
+        let meeting = MeetingDetails::new(
+            String::new(),
+            crate::meeting::Attendees {
+                known: vec!["Laura".into()],
+                unknown: 0,
+            },
+            crate::meeting::Attendees {
+                known: vec!["Andrew".into(), "Craig".into()],
+                unknown: 1,
+            },
+        );
+        assert_eq!(
+            effective_num_speakers(&args, Some(&meeting), AudioSource::System),
+            Some(3)
+        );
+        assert_eq!(
+            effective_num_speakers(&args, Some(&meeting), AudioSource::Mic),
+            None
+        );
+        args.num_speakers = Some(4);
+        assert_eq!(
+            effective_num_speakers(&args, Some(&meeting), AudioSource::System),
+            Some(4)
+        );
+        assert_eq!(
+            effective_num_speakers(&args, Some(&meeting), AudioSource::Mic),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn meeting_candidate_restriction_filters_database_names() {
+        let meeting = MeetingDetails::new(
+            String::new(),
+            crate::meeting::Attendees {
+                known: vec!["Laura".into()],
+                unknown: 0,
+            },
+            crate::meeting::Attendees {
+                known: vec!["Bob".into()],
+                unknown: 0,
+            },
+        );
+        assert_eq!(
+            allowed_candidate_names(&meeting, AudioSource::System),
+            Some(HashSet::from(["Bob".into()]))
+        );
+        assert_eq!(
+            allowed_candidate_names(&meeting, AudioSource::Mic),
+            Some(HashSet::from(["Bob".into(), "Laura".into()]))
+        );
+        let database = SpeakerDatabase {
+            embedding_model: EmbeddingModelIdentity {
+                name: "m".into(),
+                sha256: "x".into(),
+                dimension: 2,
+            },
+            speakers: BTreeMap::from([
+                (
+                    "Alice".into(),
+                    SpeakerRecord {
+                        embeddings: vec![vec![1.0, 0.0]],
+                    },
+                ),
+                (
+                    "Bob".into(),
+                    SpeakerRecord {
+                        embeddings: vec![vec![0.0, 1.0]],
+                    },
+                ),
+            ]),
+        };
+        let allowed = HashSet::from(["Bob".into()]);
+        assert_eq!(
+            best_candidate_filtered(&database, &[1.0, 0.0], Some(&allowed))
+                .expect("filtered candidate")
+                .0,
+            "Bob"
+        );
     }
 
     #[test]
@@ -1606,6 +1808,7 @@ mod tests {
                 speaker_id: "spk_3".into(),
                 speaker: "SPEAKER_00".into(),
                 text: "hello".into(),
+                echo: None,
             }],
         );
         round_trip(
@@ -1684,6 +1887,8 @@ mod tests {
         let manifest = session.read_manifest().expect("manifest");
         let args = ProcessArgs {
             session: session.dir.clone(),
+            meeting: None,
+            context_dir: None,
             whisper_model: Some(models.join("ggml-base.en.bin")),
             segmentation_model: Some(
                 models.join("sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
@@ -1715,6 +1920,8 @@ mod tests {
         jsonl::write_all_atomic::<TimedWord>(&session.words_path(), &[]).expect("write words");
         run(ProcessArgs {
             session: session.dir.clone(),
+            meeting: None,
+            context_dir: None,
             whisper_model: None,
             segmentation_model: Some(root.join("missing-segmentation.onnx")),
             embedding_model: Some(root.join("missing-embedding.onnx")),
@@ -1733,6 +1940,8 @@ mod tests {
         .expect("process with skipped stages");
         run(ProcessArgs {
             session: session.dir.clone(),
+            meeting: None,
+            context_dir: None,
             whisper_model: None,
             segmentation_model: Some(root.join("missing-segmentation.onnx")),
             embedding_model: Some(root.join("missing-embedding.onnx")),
@@ -1793,6 +2002,8 @@ mod tests {
 
         run(ProcessArgs {
             session: session.dir.clone(),
+            meeting: None,
+            context_dir: None,
             whisper_model: None,
             segmentation_model: None,
             embedding_model: None,
@@ -1870,6 +2081,7 @@ mod tests {
                     .expect("hash diarization"),
                 embedding_model_sha256: Some("model-hash".into()),
                 speakers_database_sha256: Some("database-hash".into()),
+                meeting_sha256: None,
                 speaker_threshold: 0.6,
             },
             assignments: vec![
@@ -1960,6 +2172,7 @@ mod tests {
                         .expect("hash diarization"),
                     embedding_model_sha256: None,
                     speakers_database_sha256: None,
+                    meeting_sha256: None,
                     speaker_threshold: 0.6,
                 },
                 assignments: vec![SpeakerAssignment {
@@ -2145,6 +2358,8 @@ mod tests {
                 diarize_mic: true,
                 cluster_threshold: 1.0,
                 num_speakers: None,
+                mic_num_speakers: None,
+                system_num_speakers: None,
                 threads: 1,
             },
         )

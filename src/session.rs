@@ -98,6 +98,9 @@ impl Session {
     pub fn speaker_assignments_path(&self) -> PathBuf {
         self.dir.join("speaker-assignments.json")
     }
+    pub fn meeting_path(&self) -> PathBuf {
+        self.dir.join("meeting.json")
+    }
     pub fn leakage_suppressions_path(&self) -> PathBuf {
         self.dir.join("leakage-suppressions.jsonl")
     }

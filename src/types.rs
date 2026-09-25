@@ -72,6 +72,8 @@ pub struct SpeakerAssignmentProvenance {
     pub embedding_model_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speakers_database_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_sha256: Option<String>,
     pub speaker_threshold: f32,
 }
 
@@ -84,6 +86,13 @@ pub struct SpeakerAssignments {
 }
 
 /// One line of `transcript.jsonl`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EchoEvidence {
+    RemoteAttendee,
+    LocalRoster,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Utterance {
     pub start_ms: u64,
@@ -92,6 +101,8 @@ pub struct Utterance {
     pub speaker_id: String,
     pub speaker: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub echo: Option<EchoEvidence>,
 }
 
 /// One line of `screenshots.jsonl`.

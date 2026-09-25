@@ -3,15 +3,18 @@ mod remote;
 mod wrap_layout;
 
 use crate::audio::{devices, record};
-use crate::cli::{Command, EnrollArgs, ProcessArgs, RecordArgs};
+use crate::cli::{Command, EnrollArgs, ProcessArgs, RecordArgs, RenderArgs};
 use crate::format::jsonl;
+use crate::meeting::{self, Attendees, MeetingDetails};
 use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
 use crate::model_setup;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase};
 use crate::speaker::enroll;
 use crate::transcription::{TranscriptionProgress, backend};
-use crate::types::{AudioSource, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance};
+use crate::types::{
+    AudioSource, EchoEvidence, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance,
+};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
@@ -51,6 +54,7 @@ const CSS: &str = r#"
 .shot-card { padding: 8px; border-radius: 12px; background: alpha(currentColor, 0.05); }
 .mono-button { font-family: monospace; font-size: 12px; }
 .transcript-row { padding: 8px 12px; }
+.echo-row { opacity: 0.55; }
 .speaker-shortcut { border: 1px solid alpha(@accent_color, 0.28); border-radius: 999px; padding: 1px 7px; color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
 "#;
 
@@ -101,6 +105,8 @@ struct SessionDetail {
     subtitle: gtk::Label,
     status: gtk::Label,
     process_button: gtk::Button,
+    meeting_button: gtk::Button,
+    hide_echo: gtk::ToggleButton,
     transcript: gtk::Box,
     screenshots: gtk::FlowBox,
     metadata: gtk::Box,
@@ -431,7 +437,6 @@ fn build_sidebar(search: &gtk::SearchEntry, list: &gtk::ListBox) -> gtk::Box {
 struct RecordingPage {
     root: gtk::Box,
     mic: adw::ComboRow,
-    diarize_mic: adw::SwitchRow,
     system: adw::ComboRow,
     screenshots: adw::SwitchRow,
     name: adw::EntryRow,
@@ -477,18 +482,11 @@ fn build_recording_page(config: &GuiConfig) -> RecordingPage {
         "Default (WirePlumber)",
         "None",
     ])));
-    let diarize_mic = adw::SwitchRow::builder()
-        .title("Several people share the microphone")
-        .subtitle("Separate microphone speech by speaker during processing")
-        .active(config.diarize_mic)
-        .build();
-    diarize_mic.add_prefix(&gtk::Image::from_icon_name("system-users-symbolic"));
     system.set_model(Some(&gtk::StringList::new(&[
         "Default (WirePlumber)",
         "None",
     ])));
     audio.add(&mic);
-    audio.add(&diarize_mic);
     audio.add(&system);
     body.append(&audio);
 
@@ -506,7 +504,7 @@ fn build_recording_page(config: &GuiConfig) -> RecordingPage {
 
     let identity = adw::PreferencesGroup::builder()
         .title("Speaker label")
-        .description("Used when microphone speaker separation is off")
+        .description("Default name in the meeting details dialog")
         .build();
     let name = adw::EntryRow::builder()
         .title("Your name in the transcript")
@@ -545,7 +543,6 @@ fn build_recording_page(config: &GuiConfig) -> RecordingPage {
     let page = RecordingPage {
         root,
         mic,
-        diarize_mic,
         system,
         screenshots,
         name,
@@ -701,6 +698,9 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     process_button.add_css_class("suggested-action");
     process_button.set_visible(false);
     top.append(&process_button);
+    let meeting_button = gtk::Button::with_label("Meeting details…");
+    meeting_button.set_visible(false);
+    top.append(&meeting_button);
     heading.append(&top);
     let subtitle = gtk::Label::new(Some("Recorded meetings appear in the sidebar."));
     subtitle.set_xalign(0.0);
@@ -718,11 +718,18 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     paned.set_shrink_end_child(false);
     let transcript_frame = gtk::Box::new(gtk::Orientation::Vertical, 6);
     transcript_frame.set_margin_top(12);
+    let transcript_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    transcript_header.set_margin_start(16);
+    transcript_header.set_margin_end(16);
     let transcript_heading = gtk::Label::new(Some("Transcript"));
     transcript_heading.add_css_class("title-4");
     transcript_heading.set_xalign(0.0);
-    transcript_heading.set_margin_start(16);
-    transcript_frame.append(&transcript_heading);
+    transcript_heading.set_hexpand(true);
+    transcript_header.append(&transcript_heading);
+    let hide_echo = gtk::ToggleButton::with_label("Hide echo");
+    hide_echo.set_visible(false);
+    transcript_header.append(&hide_echo);
+    transcript_frame.append(&transcript_header);
     let transcript = gtk::Box::new(gtk::Orientation::Vertical, 0);
     transcript_frame.append(
         &gtk::ScrolledWindow::builder()
@@ -731,6 +738,16 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
             .build(),
     );
     paned.set_start_child(Some(&transcript_frame));
+    let transcript_for_toggle = transcript.clone();
+    hide_echo.connect_toggled(move |button| {
+        let mut child = transcript_for_toggle.first_child();
+        while let Some(row) = child {
+            if row.has_css_class("echo-row") {
+                row.set_visible(!button.is_active());
+            }
+            child = row.next_sibling();
+        }
+    });
 
     let side = gtk::Box::new(gtk::Orientation::Vertical, 14);
     side.set_margin_top(12);
@@ -775,6 +792,8 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         subtitle,
         status,
         process_button,
+        meeting_button,
+        hide_echo,
         transcript,
         screenshots,
         metadata,
@@ -1042,9 +1061,12 @@ struct SettingsPage {
     root: gtk::Box,
     meetings: adw::ActionRow,
     screenshots: adw::ActionRow,
+    context: adw::ActionRow,
     swedish_transcription: gtk::Switch,
     meetings_change: gtk::Button,
     screenshots_change: gtk::Button,
+    context_change: gtk::Button,
+    context_clear: gtk::Button,
 }
 
 fn build_settings_page(config: &GuiConfig) -> SettingsPage {
@@ -1077,6 +1099,25 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
     screenshots_change.set_valign(gtk::Align::Center);
     shots.add_suffix(&screenshots_change);
     storage.add(&shots);
+    let context = adw::ActionRow::builder()
+        .title("Meeting context folder")
+        .subtitle(
+            config
+                .context_dir
+                .as_ref()
+                .map_or_else(|| "Not set".into(), |path| path.display().to_string()),
+        )
+        .build();
+    context.add_prefix(&gtk::Image::from_icon_name("folder-symbolic"));
+    let context_clear = gtk::Button::from_icon_name("edit-clear-symbolic");
+    context_clear.set_tooltip_text(Some("Clear meeting context folder"));
+    context_clear.set_valign(gtk::Align::Center);
+    context_clear.set_sensitive(config.context_dir.is_some());
+    context.add_suffix(&context_clear);
+    let context_change = gtk::Button::with_label("Change…");
+    context_change.set_valign(gtk::Align::Center);
+    context.add_suffix(&context_change);
+    storage.add(&context);
     body.append(&storage);
 
     let compute_group = adw::PreferencesGroup::builder()
@@ -1158,9 +1199,12 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
         root,
         meetings,
         screenshots: shots,
+        context,
         swedish_transcription,
         meetings_change,
         screenshots_change,
+        context_change,
+        context_clear,
     }
 }
 
@@ -1259,6 +1303,55 @@ fn wire_settings(
     });
 
     let parent = window.clone();
+    let config_for_context = config.clone();
+    let row_for_context = page.context.clone();
+    let clear_for_context = page.context_clear.clone();
+    page.context_change.connect_clicked(move |_| {
+        let chooser = gtk::FileDialog::builder()
+            .title("Choose meeting context folder")
+            .accept_label("Use folder")
+            .modal(true)
+            .build();
+        let parent_for_result = parent.clone();
+        let config = config_for_context.clone();
+        let row = row_for_context.clone();
+        let clear = clear_for_context.clone();
+        chooser.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
+            let Ok(folder) = result else { return };
+            let Some(path) = folder.path() else { return };
+            let mut updated = config.borrow().clone();
+            updated.context_dir = Some(path.clone());
+            if let Err(error) = updated.save() {
+                show_error(
+                    &parent_for_result,
+                    "Could not save settings",
+                    &error.to_string(),
+                );
+                return;
+            }
+            *config.borrow_mut() = updated;
+            row.set_subtitle(&path.display().to_string());
+            clear.set_sensitive(true);
+        });
+    });
+
+    let parent = window.clone();
+    let config_for_context = config.clone();
+    let row_for_context = page.context.clone();
+    let clear_for_context = page.context_clear.clone();
+    page.context_clear.connect_clicked(move |_| {
+        let mut updated = config_for_context.borrow().clone();
+        updated.context_dir = None;
+        if let Err(error) = updated.save() {
+            show_error(&parent, "Could not save settings", &error.to_string());
+            return;
+        }
+        *config_for_context.borrow_mut() = updated;
+        row_for_context.set_subtitle("Not set");
+        clear_for_context.set_sensitive(false);
+    });
+
+    let parent = window.clone();
     let config_for_language = config.clone();
     let changing_language = Rc::new(Cell::new(false));
     let changing_language_for_notify = changing_language.clone();
@@ -1343,29 +1436,6 @@ fn wire_recording(
     close_when_stopped: &Rc<Cell<bool>>,
     recorder_connection: Option<gio::DBusConnection>,
 ) -> remote::RecorderHandlers {
-    let updating_diarize_mic = Rc::new(Cell::new(false));
-    let updating_diarize_mic_for_notify = updating_diarize_mic.clone();
-    let config_for_diarize_mic = config.clone();
-    let window_for_diarize_mic = window.clone();
-    page.diarize_mic.connect_active_notify(move |row| {
-        if updating_diarize_mic_for_notify.replace(true) {
-            return;
-        }
-        let mut updated = config_for_diarize_mic.borrow().clone();
-        updated.diarize_mic = row.is_active();
-        if let Err(error) = updated.save() {
-            show_error(
-                &window_for_diarize_mic,
-                "Could not save settings",
-                &error.to_string(),
-            );
-            row.set_active(config_for_diarize_mic.borrow().diarize_mic);
-        } else {
-            *config_for_diarize_mic.borrow_mut() = updated;
-        }
-        updating_diarize_mic_for_notify.set(false);
-    });
-
     let job_for_stop = page.job.clone();
     let button_for_stop = page.button.clone();
     let stop_recording: Rc<dyn Fn()> = Rc::new(move || {
@@ -1383,7 +1453,6 @@ fn wire_recording(
     let window_for_start = window.clone();
     let config_for_start = config.clone();
     let mic = page.mic.clone();
-    let diarize_mic = page.diarize_mic.clone();
     let system = page.system.clone();
     let screenshots = page.screenshots.clone();
     let name = page.name.clone();
@@ -1464,7 +1533,6 @@ fn wire_recording(
         button.add_css_class("destructive-action");
         hint.set_label("Recording… press Stop when the meeting is finished");
         mic.set_sensitive(false);
-        diarize_mic.set_sensitive(false);
         system.set_sensitive(false);
         screenshots.set_sensitive(false);
         name.set_sensitive(false);
@@ -1508,7 +1576,6 @@ fn wire_recording(
     let button_for_poll = page.button.clone();
     let hint_for_poll = page.hint.clone();
     let mic_for_poll = page.mic.clone();
-    let diarize_mic_for_poll = page.diarize_mic.clone();
     let system_for_poll = page.system.clone();
     let shots_for_poll = page.screenshots.clone();
     let name_for_poll = page.name.clone();
@@ -1569,7 +1636,6 @@ fn wire_recording(
             config_for_poll.borrow().meetings_dir.display()
         ));
         mic_for_poll.set_sensitive(true);
-        diarize_mic_for_poll.set_sensitive(true);
         system_for_poll.set_sensitive(true);
         shots_for_poll.set_sensitive(true);
         name_for_poll.set_sensitive(true);
@@ -1646,6 +1712,155 @@ fn recorder_status(job: Option<&RecordingJob>) -> remote::RecorderStatus {
     }
 }
 
+struct MeetingDetailsDialog {
+    dialog: adw::Dialog,
+    title: adw::EntryRow,
+    local_names: adw::EntryRow,
+    local_unknown: adw::SpinRow,
+    remote_names: adw::EntryRow,
+    remote_unknown: adw::SpinRow,
+    primary: gtk::Button,
+}
+
+impl MeetingDetailsDialog {
+    fn details(&self) -> MeetingDetails {
+        MeetingDetails::new(
+            self.title.text().to_string(),
+            Attendees {
+                known: comma_separated_names(&self.local_names.text()),
+                unknown: self.local_unknown.value() as u32,
+            },
+            Attendees {
+                known: comma_separated_names(&self.remote_names.text()),
+                unknown: self.remote_unknown.value() as u32,
+            },
+        )
+    }
+}
+
+fn meeting_details_dialog(
+    details: &MeetingDetails,
+    prefill_caption: Option<&str>,
+    primary_label: &str,
+) -> MeetingDetailsDialog {
+    let dialog = adw::Dialog::builder()
+        .title("Meeting details")
+        .content_width(520)
+        .follows_content_size(true)
+        .presentation_mode(adw::DialogPresentationMode::Floating)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    body.set_margin_top(24);
+    body.set_margin_bottom(24);
+    body.set_margin_start(24);
+    body.set_margin_end(24);
+
+    let title_group = adw::PreferencesGroup::new();
+    let title = adw::EntryRow::builder()
+        .title("Meeting title")
+        .text(&details.title)
+        .build();
+    title_group.add(&title);
+    body.append(&title_group);
+
+    let local_group = adw::PreferencesGroup::builder()
+        .title("In the room (microphone)")
+        .build();
+    let local_names = adw::EntryRow::builder()
+        .title("Names, comma separated")
+        .text(details.local.known.join(", "))
+        .build();
+    local_group.add(&local_names);
+    let local_unknown = adw::SpinRow::with_range(0.0, 50.0, 1.0);
+    local_unknown.set_title("Unnamed people");
+    local_unknown.set_value(f64::from(details.local.unknown));
+    local_group.add(&local_unknown);
+    body.append(&local_group);
+
+    let remote_group = adw::PreferencesGroup::builder()
+        .title("Remote (system audio)")
+        .build();
+    let remote_names = adw::EntryRow::builder()
+        .title("Names, comma separated")
+        .text(details.remote.known.join(", "))
+        .build();
+    remote_group.add(&remote_names);
+    let remote_unknown = adw::SpinRow::with_range(0.0, 50.0, 1.0);
+    remote_unknown.set_title("Unnamed people");
+    remote_unknown.set_value(f64::from(details.remote.unknown));
+    remote_group.add(&remote_unknown);
+    body.append(&remote_group);
+
+    if let Some(caption) = prefill_caption {
+        let caption = gtk::Label::new(Some(caption));
+        caption.set_xalign(0.0);
+        caption.add_css_class("dim-label");
+        caption.add_css_class("caption");
+        body.append(&caption);
+    }
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let dialog_for_cancel = dialog.clone();
+    cancel.connect_clicked(move |_| {
+        dialog_for_cancel.close();
+    });
+    actions.append(&cancel);
+    let primary = gtk::Button::with_label(primary_label);
+    primary.add_css_class("suggested-action");
+    actions.append(&primary);
+    body.append(&actions);
+    dialog.set_child(Some(&body));
+    MeetingDetailsDialog {
+        dialog,
+        title,
+        local_names,
+        local_unknown,
+        remote_names,
+        remote_unknown,
+        primary,
+    }
+}
+
+fn comma_separated_names(value: &str) -> Vec<String> {
+    value.split(',').map(str::trim).map(str::to_owned).collect()
+}
+
+fn meeting_prefill(
+    session_path: &Path,
+    config: &GuiConfig,
+) -> Result<(MeetingDetails, Option<String>), Box<dyn std::error::Error>> {
+    let session = Session::open(session_path)?;
+    if let Some(details) = meeting::read_details(&session.meeting_path())? {
+        return Ok((details, Some("Previous details".into())));
+    }
+    let manifest = session.read_manifest()?;
+    if let Some(context_dir) = config.context_dir.as_deref()
+        && let Some((details, source)) =
+            meeting::match_context_with_source(context_dir, &manifest.started_wallclock)
+    {
+        let filename = source.file_name().map_or_else(
+            || source.display().to_string(),
+            |name| name.to_string_lossy().into(),
+        );
+        return Ok((
+            details,
+            Some(format!("From meeting-context file {filename}")),
+        ));
+    }
+    Ok((
+        MeetingDetails::new(
+            String::new(),
+            Attendees {
+                known: vec![config.local_speaker.clone()],
+                unknown: 0,
+            },
+            Attendees::default(),
+        ),
+        None,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wire_processing(
     window: &adw::ApplicationWindow,
@@ -1658,6 +1873,7 @@ fn wire_processing(
 ) {
     let busy = Rc::new(Cell::new(false));
     let confirmed_reprocess = Rc::new(Cell::new(false));
+    let confirmed_details = Rc::new(Cell::new(false));
     let selected = detail.selected.clone();
     let parent = window.clone();
     let detail_for_done = detail.clone();
@@ -1666,15 +1882,16 @@ fn wire_processing(
     let list_for_done = list.clone();
     let paths_for_done = paths.clone();
     let search_for_done = search.clone();
+    let busy_for_process = busy.clone();
     detail.process_button.connect_clicked(move |button| {
-        if busy.get() {
+        if busy_for_process.get() {
             return;
         }
         let Some(session_path) = selected.borrow().clone() else {
             return;
         };
         if session_path.join("transcript.jsonl").is_file()
-            && !confirmed_reprocess.replace(false)
+            && !confirmed_reprocess.get()
         {
             let dialog = adw::AlertDialog::new(
                 Some("Reprocess this recording?"),
@@ -1695,7 +1912,57 @@ fn wire_processing(
             dialog.present(Some(&parent));
             return;
         }
-        busy.set(true);
+        if !confirmed_details.get() {
+            let (prefill, caption) = match meeting_prefill(
+                &session_path,
+                &config_for_done.borrow(),
+            ) {
+                Ok(prefill) => prefill,
+                Err(error) => {
+                    show_error(&parent, "Could not read meeting details", &error.to_string());
+                    return;
+                }
+            };
+            let meeting_dialog = Rc::new(meeting_details_dialog(
+                &prefill,
+                caption.as_deref(),
+                "Process",
+            ));
+            let confirmed_reprocess_for_close = confirmed_reprocess.clone();
+            let confirmed_details_for_close = confirmed_details.clone();
+            meeting_dialog.dialog.connect_closed(move |_| {
+                if !confirmed_details_for_close.get() {
+                    confirmed_reprocess_for_close.set(false);
+                }
+            });
+            let session_path_for_save = session_path.clone();
+            let button = button.clone();
+            let confirmed_details = confirmed_details.clone();
+            let dialog_for_save = meeting_dialog.clone();
+            let parent_for_save = parent.clone();
+            meeting_dialog.primary.connect_clicked(move |_| {
+                let details = dialog_for_save.details();
+                match Session::open(&session_path_for_save).and_then(|session| {
+                    meeting::write_details_atomic(&session.meeting_path(), &details)
+                }) {
+                    Ok(()) => {
+                        confirmed_details.set(true);
+                        dialog_for_save.dialog.force_close();
+                        button.emit_clicked();
+                    }
+                    Err(error) => show_error(
+                        &parent_for_save,
+                        "Could not save meeting details",
+                        &error.to_string(),
+                    ),
+                }
+            });
+            meeting_dialog.dialog.present(Some(&parent));
+            return;
+        }
+        confirmed_reprocess.set(false);
+        confirmed_details.set(false);
+        busy_for_process.set(true);
         let dialog = processing_dialog(&backend::current());
         let progress = Arc::new(Mutex::new(ProcessingProgress {
             stage: ProcessingStage::Preparing,
@@ -1708,14 +1975,15 @@ fn wire_processing(
         let thread_transcription_metrics = transcription_metrics.clone();
         let thread_result = result.clone();
         let thread_cancelled = cancelled.clone();
-        let (diarize_mic, swedish_transcription) = {
-            let config = config_for_done.borrow();
-            (config.diarize_mic, config.swedish_transcription)
-        };
+        let swedish_transcription = config_for_done.borrow().swedish_transcription;
         std::thread::spawn(move || {
             let prepared = (|| -> Result<ProcessArgs, String> {
                 let mut args = ProcessArgs::for_session(session_path);
-                args.diarize_mic = diarize_mic;
+                args.diarize_mic = Session::open(&args.session)
+                    .and_then(|session| session.read_manifest())
+                    .map_err(|error| error.to_string())?
+                    .mic
+                    .enabled;
                 let model_env = if swedish_transcription {
                     "SINGSTONE_WHISPER_MODEL_SWEDISH"
                 } else {
@@ -1776,7 +2044,7 @@ fn wire_processing(
             label_for_cancel.set_label("Cancelling after the current stage…");
         });
         let processing_dialog = dialog.dialog.clone();
-        let busy_for_poll = busy.clone();
+        let busy_for_poll = busy_for_process.clone();
         let parent_for_poll = parent.clone();
         let detail_for_poll = detail_for_done.clone();
         let banner_for_poll = banner_for_done.clone();
@@ -1850,6 +2118,136 @@ fn wire_processing(
             glib::ControlFlow::Break
         });
         dialog.dialog.present(Some(&parent));
+    });
+
+    let selected = detail.selected.clone();
+    let parent = window.clone();
+    let detail_for_save = detail.clone();
+    let config_for_save = config.clone();
+    let banner_for_save = banner.clone();
+    let list_for_save = list.clone();
+    let paths_for_save = paths.clone();
+    let search_for_save = search.clone();
+    detail.meeting_button.connect_clicked(move |_| {
+        if busy.get() {
+            return;
+        }
+        let Some(session_path) = selected.borrow().clone() else {
+            return;
+        };
+        let (prefill, caption) = match meeting_prefill(&session_path, &config_for_save.borrow()) {
+            Ok(prefill) => prefill,
+            Err(error) => {
+                show_error(
+                    &parent,
+                    "Could not read meeting details",
+                    &error.to_string(),
+                );
+                return;
+            }
+        };
+        let meeting_dialog = Rc::new(meeting_details_dialog(
+            &prefill,
+            caption.as_deref(),
+            "Save and re-render",
+        ));
+        let dialog_for_save = meeting_dialog.clone();
+        let parent_for_save = parent.clone();
+        let detail_for_done = detail_for_save.clone();
+        let config_for_done = config_for_save.clone();
+        let banner_for_done = banner_for_save.clone();
+        let list_for_done = list_for_save.clone();
+        let paths_for_done = paths_for_save.clone();
+        let search_for_done = search_for_save.clone();
+        let busy_for_save = busy.clone();
+        meeting_dialog.primary.connect_clicked(move |_| {
+            let details = dialog_for_save.details();
+            let session = match Session::open(&session_path) {
+                Ok(session) => session,
+                Err(error) => {
+                    show_error(
+                        &parent_for_save,
+                        "Could not open session",
+                        &error.to_string(),
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = meeting::write_details_atomic(&session.meeting_path(), &details) {
+                show_error(
+                    &parent_for_save,
+                    "Could not save meeting details",
+                    &error.to_string(),
+                );
+                return;
+            }
+            dialog_for_save.dialog.force_close();
+            busy_for_save.set(true);
+            let progress = gtk::Window::builder()
+                .title("Rendering transcript")
+                .transient_for(&parent_for_save)
+                .modal(true)
+                .deletable(false)
+                .default_width(360)
+                .build();
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            body.set_margin_top(24);
+            body.set_margin_bottom(24);
+            body.set_margin_start(24);
+            body.set_margin_end(24);
+            let spinner = gtk::Spinner::new();
+            spinner.set_spinning(true);
+            body.append(&spinner);
+            body.append(&gtk::Label::new(Some(
+                "Saving meeting details and re-rendering the transcript…",
+            )));
+            progress.set_child(Some(&body));
+            progress.present();
+
+            let result = Arc::new(Mutex::new(None));
+            let thread_result = result.clone();
+            let render_session = session_path.clone();
+            std::thread::spawn(move || {
+                let value = process::run_render(RenderArgs {
+                    session: render_session,
+                    diarize_mic: None,
+                })
+                .map_err(|error| error.to_string());
+                *thread_result.lock().expect("render result mutex") = Some(value);
+            });
+            let parent = parent_for_save.clone();
+            let detail = detail_for_done.clone();
+            let config = config_for_done.clone();
+            let banner = banner_for_done.clone();
+            let list = list_for_done.clone();
+            let paths = paths_for_done.clone();
+            let search = search_for_done.clone();
+            let busy = busy_for_save.clone();
+            let reload_session = session_path.clone();
+            glib::timeout_add_local(Duration::from_millis(150), move || {
+                let Some(result) = result.lock().expect("render result mutex").take() else {
+                    return glib::ControlFlow::Continue;
+                };
+                busy.set(false);
+                progress.close();
+                match result {
+                    Ok(()) => {
+                        let _ = detail.load(&reload_session);
+                        populate_sessions(
+                            &list,
+                            &paths,
+                            &config.borrow().meetings_dir,
+                            &search.text(),
+                        );
+                        banner.set_title("Meeting details saved and transcript re-rendered");
+                        banner.set_revealed(true);
+                    }
+                    Err(error) => show_error(&parent, "Could not re-render transcript", &error),
+                }
+                glib::ControlFlow::Break
+            });
+        });
+        meeting_dialog.dialog.present(Some(&parent));
     });
 }
 
@@ -2278,8 +2676,14 @@ impl SessionDetail {
         self.playback.stop();
         let session = Session::open(path)?;
         let manifest = session.read_manifest()?;
+        let meeting = meeting::read_details(&session.meeting_path())?;
         *self.selected.borrow_mut() = Some(path.to_owned());
-        self.title.set_label(&session_title(path));
+        let title = meeting
+            .as_ref()
+            .map(|details| details.title.clone())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| session_title(path));
+        self.title.set_label(&title);
         let duration = session_duration_ms(&session, &manifest);
         self.subtitle.set_label(&format!(
             "{} · {}",
@@ -2305,10 +2709,15 @@ impl SessionDetail {
         }));
         self.process_button
             .set_visible(manifest.state != SessionState::Recording);
+        self.meeting_button
+            .set_visible(processed && manifest.state != SessionState::Recording);
+        self.hide_echo.set_active(false);
 
         clear_box(&self.transcript);
         if processed {
             let utterances: Vec<Utterance> = jsonl::read_all(&session.transcript_path())?;
+            self.hide_echo
+                .set_visible(utterances.iter().any(|utterance| utterance.echo.is_some()));
             if utterances.is_empty() {
                 append_empty(&self.transcript, "The transcript is empty.");
             } else {
@@ -2320,6 +2729,7 @@ impl SessionDetail {
                 }
             }
         } else {
+            self.hide_echo.set_visible(false);
             append_empty(
                 &self.transcript,
                 "This recording has not been processed yet.",
@@ -2426,7 +2836,12 @@ fn load_sessions(root: &Path) -> Vec<SessionSummary> {
                 ("Recorded", "idle")
             };
             Some(SessionSummary {
-                title: session_title(&entry.path()),
+                title: meeting::read_details(&session.meeting_path())
+                    .ok()
+                    .flatten()
+                    .map(|details| details.title)
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or_else(|| session_title(&entry.path())),
                 started: manifest.started_wallclock.clone(),
                 duration_ms: session_duration_ms(&session, &manifest),
                 path: entry.path(),
@@ -2476,6 +2891,9 @@ fn transcript_row(
 ) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     row.add_css_class("transcript-row");
+    if utterance.echo.is_some() {
+        row.add_css_class("echo-row");
+    }
     let avatar = gtk::Image::from_icon_name("avatar-default-symbolic");
     avatar.set_pixel_size(28);
     avatar.add_css_class("speaker-avatar");
@@ -2518,6 +2936,15 @@ fn transcript_row(
     source_icon.add_css_class("dim-label");
     source_icon.set_valign(gtk::Align::Center);
     head.append(&source_icon);
+    if let Some(evidence) = utterance.echo {
+        let echo = status_pill("Echo", "idle");
+        echo.add_css_class("caption");
+        echo.set_tooltip_text(Some(match evidence {
+            EchoEvidence::RemoteAttendee => "Remote attendee heard through the microphone",
+            EchoEvidence::LocalRoster => "Everyone in the room is already identified",
+        }));
+        head.append(&echo);
+    }
     let play = gtk::Button::new();
     play.add_css_class("flat");
     play.set_valign(gtk::Align::Center);
@@ -2995,6 +3422,7 @@ mod tests {
             speaker_id: speaker_id.into(),
             speaker: speaker.into(),
             text: "text".into(),
+            echo: None,
         }
     }
 

@@ -1729,6 +1729,7 @@ struct MeetingPrefill {
     details: MeetingDetails,
     /// Calendar attendees still to be placed in the room or on the remote end.
     attendees: Vec<(String, u32)>,
+    attendee_note: Option<String>,
     caption: Option<String>,
 }
 
@@ -1810,6 +1811,15 @@ fn meeting_details_dialog(prefill: &MeetingPrefill, primary_label: &str) -> Meet
             attendee_rows.push((name.clone(), row));
         }
         body.append(&attendee_group);
+        if let Some(note) = &prefill.attendee_note {
+            let label = gtk::Label::new(Some(note));
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            label.set_max_width_chars(60);
+            label.add_css_class("dim-label");
+            label.add_css_class("caption");
+            body.append(&label);
+        }
     }
     let names_title = if attendee_rows.is_empty() {
         "Names, comma separated"
@@ -1903,6 +1913,7 @@ fn meeting_prefill(
         return Ok(MeetingPrefill {
             details,
             attendees: Vec::new(),
+            attendee_note: None,
             caption: Some("Previous details".into()),
         });
     }
@@ -1929,21 +1940,15 @@ fn meeting_prefill(
                 (name, place)
             })
             .collect();
-        let local = if invited_me || me.is_empty() {
-            Vec::new()
-        } else {
-            vec![me.to_owned()]
-        };
+        let attendee_note = (!invited_me && !me.is_empty()).then(|| {
+            format!(
+                "Your name in Settings, {me}, is not on the invite list; pick your own row as \"In the room\"."
+            )
+        });
         return Ok(MeetingPrefill {
-            details: MeetingDetails::new(
-                context.title,
-                Attendees {
-                    known: local,
-                    unknown: 0,
-                },
-                Attendees::default(),
-            ),
+            details: MeetingDetails::new(context.title, Attendees::default(), Attendees::default()),
             attendees,
+            attendee_note,
             caption: Some(format!("From meeting-context file {filename}")),
         });
     }
@@ -1957,6 +1962,7 @@ fn meeting_prefill(
             Attendees::default(),
         ),
         attendees: Vec::new(),
+        attendee_note: None,
         caption: None,
     })
 }

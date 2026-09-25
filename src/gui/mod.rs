@@ -1722,9 +1722,20 @@ fn recorder_status(job: Option<&RecordingJob>) -> remote::RecorderStatus {
     }
 }
 
+const PLACE_LOCAL: u32 = 0;
+const PLACE_REMOTE: u32 = 1;
+
+struct MeetingPrefill {
+    details: MeetingDetails,
+    /// Calendar attendees still to be placed in the room or on the remote end.
+    attendees: Vec<(String, u32)>,
+    caption: Option<String>,
+}
+
 struct MeetingDetailsDialog {
     dialog: adw::Dialog,
     title: adw::EntryRow,
+    attendee_rows: Vec<(String, adw::ComboRow)>,
     local_names: adw::EntryRow,
     local_unknown: adw::SpinRow,
     remote_names: adw::EntryRow,
@@ -1734,25 +1745,33 @@ struct MeetingDetailsDialog {
 
 impl MeetingDetailsDialog {
     fn details(&self) -> MeetingDetails {
+        let placed = |place: u32| {
+            self.attendee_rows
+                .iter()
+                .filter(move |(_, row)| row.selected() == place)
+                .map(|(name, _)| name.clone())
+        };
         MeetingDetails::new(
             self.title.text().to_string(),
             Attendees {
-                known: comma_separated_names(&self.local_names.text()),
+                known: placed(PLACE_LOCAL)
+                    .chain(comma_separated_names(&self.local_names.text()))
+                    .collect(),
                 unknown: self.local_unknown.value() as u32,
             },
             Attendees {
-                known: comma_separated_names(&self.remote_names.text()),
+                known: placed(PLACE_REMOTE)
+                    .chain(comma_separated_names(&self.remote_names.text()))
+                    .collect(),
                 unknown: self.remote_unknown.value() as u32,
             },
         )
     }
 }
 
-fn meeting_details_dialog(
-    details: &MeetingDetails,
-    prefill_caption: Option<&str>,
-    primary_label: &str,
-) -> MeetingDetailsDialog {
+fn meeting_details_dialog(prefill: &MeetingPrefill, primary_label: &str) -> MeetingDetailsDialog {
+    let details = &prefill.details;
+    let prefill_caption = prefill.caption.as_deref();
     let dialog = adw::Dialog::builder()
         .title("Meeting details")
         .content_width(520)
@@ -1773,11 +1792,36 @@ fn meeting_details_dialog(
     title_group.add(&title);
     body.append(&title_group);
 
+    let mut attendee_rows = Vec::new();
+    if !prefill.attendees.is_empty() {
+        let attendee_group = adw::PreferencesGroup::builder()
+            .title("Attendees")
+            .description("Where was each invited person? Add anyone missing below.")
+            .build();
+        for (name, place) in &prefill.attendees {
+            let row = adw::ComboRow::builder().title(name).build();
+            row.set_model(Some(&gtk::StringList::new(&[
+                "In the room",
+                "Remote",
+                "Did not attend",
+            ])));
+            row.set_selected(*place);
+            attendee_group.add(&row);
+            attendee_rows.push((name.clone(), row));
+        }
+        body.append(&attendee_group);
+    }
+    let names_title = if attendee_rows.is_empty() {
+        "Names, comma separated"
+    } else {
+        "Other names, comma separated"
+    };
+
     let local_group = adw::PreferencesGroup::builder()
         .title("In the room (microphone)")
         .build();
     let local_names = adw::EntryRow::builder()
-        .title("Names, comma separated")
+        .title(names_title)
         .text(details.local.known.join(", "))
         .build();
     local_group.add(&local_names);
@@ -1791,7 +1835,7 @@ fn meeting_details_dialog(
         .title("Remote (system audio)")
         .build();
     let remote_names = adw::EntryRow::builder()
-        .title("Names, comma separated")
+        .title(names_title)
         .text(details.remote.known.join(", "))
         .build();
     remote_group.add(&remote_names);
@@ -1819,11 +1863,25 @@ fn meeting_details_dialog(
     let primary = gtk::Button::with_label(primary_label);
     primary.add_css_class("suggested-action");
     actions.append(&primary);
-    body.append(&actions);
-    dialog.set_child(Some(&body));
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .max_content_height(520)
+        .child(&body)
+        .build();
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&scroll);
+    actions.set_margin_top(8);
+    actions.set_margin_bottom(24);
+    actions.set_margin_start(24);
+    actions.set_margin_end(24);
+    root.append(&actions);
+    dialog.set_child(Some(&root));
     MeetingDetailsDialog {
         dialog,
         title,
+        attendee_rows,
         local_names,
         local_unknown,
         remote_names,
@@ -1839,27 +1897,58 @@ fn comma_separated_names(value: &str) -> Vec<String> {
 fn meeting_prefill(
     session_path: &Path,
     config: &GuiConfig,
-) -> Result<(MeetingDetails, Option<String>), Box<dyn std::error::Error>> {
+) -> Result<MeetingPrefill, Box<dyn std::error::Error>> {
     let session = Session::open(session_path)?;
     if let Some(details) = meeting::read_details(&session.meeting_path())? {
-        return Ok((details, Some("Previous details".into())));
+        return Ok(MeetingPrefill {
+            details,
+            attendees: Vec::new(),
+            caption: Some("Previous details".into()),
+        });
     }
+    let me = config.local_speaker.trim();
     let manifest = session.read_manifest()?;
     if let Some(context_file) = config.context_file.as_deref()
-        && let Some((details, source)) =
+        && let Some((context, source)) =
             meeting::match_context_with_source(context_file, &manifest.started_wallclock)
     {
         let filename = source.file_name().map_or_else(
             || source.display().to_string(),
             |name| name.to_string_lossy().into(),
         );
-        return Ok((
-            details,
-            Some(format!("From meeting-context file {filename}")),
-        ));
+        let invited_me = context.attendees.iter().any(|name| name == me);
+        let attendees = context
+            .attendees
+            .into_iter()
+            .map(|name| {
+                let place = if name == me {
+                    PLACE_LOCAL
+                } else {
+                    PLACE_REMOTE
+                };
+                (name, place)
+            })
+            .collect();
+        let local = if invited_me || me.is_empty() {
+            Vec::new()
+        } else {
+            vec![me.to_owned()]
+        };
+        return Ok(MeetingPrefill {
+            details: MeetingDetails::new(
+                context.title,
+                Attendees {
+                    known: local,
+                    unknown: 0,
+                },
+                Attendees::default(),
+            ),
+            attendees,
+            caption: Some(format!("From meeting-context file {filename}")),
+        });
     }
-    Ok((
-        MeetingDetails::new(
+    Ok(MeetingPrefill {
+        details: MeetingDetails::new(
             String::new(),
             Attendees {
                 known: vec![config.local_speaker.clone()],
@@ -1867,8 +1956,9 @@ fn meeting_prefill(
             },
             Attendees::default(),
         ),
-        None,
-    ))
+        attendees: Vec::new(),
+        caption: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1923,7 +2013,7 @@ fn wire_processing(
             return;
         }
         if !confirmed_details.get() {
-            let (prefill, caption) = match meeting_prefill(
+            let prefill = match meeting_prefill(
                 &session_path,
                 &config_for_done.borrow(),
             ) {
@@ -1933,11 +2023,7 @@ fn wire_processing(
                     return;
                 }
             };
-            let meeting_dialog = Rc::new(meeting_details_dialog(
-                &prefill,
-                caption.as_deref(),
-                "Process",
-            ));
+            let meeting_dialog = Rc::new(meeting_details_dialog(&prefill, "Process"));
             let confirmed_reprocess_for_close = confirmed_reprocess.clone();
             let confirmed_details_for_close = confirmed_details.clone();
             meeting_dialog.dialog.connect_closed(move |_| {
@@ -2145,7 +2231,7 @@ fn wire_processing(
         let Some(session_path) = selected.borrow().clone() else {
             return;
         };
-        let (prefill, caption) = match meeting_prefill(&session_path, &config_for_save.borrow()) {
+        let prefill = match meeting_prefill(&session_path, &config_for_save.borrow()) {
             Ok(prefill) => prefill,
             Err(error) => {
                 show_error(
@@ -2156,11 +2242,7 @@ fn wire_processing(
                 return;
             }
         };
-        let meeting_dialog = Rc::new(meeting_details_dialog(
-            &prefill,
-            caption.as_deref(),
-            "Save and re-render",
-        ));
+        let meeting_dialog = Rc::new(meeting_details_dialog(&prefill, "Save and re-render"));
         let dialog_for_save = meeting_dialog.clone();
         let parent_for_save = parent.clone();
         let detail_for_done = detail_for_save.clone();

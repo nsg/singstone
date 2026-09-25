@@ -178,9 +178,12 @@ details…** on a processed session to revise it and re-render the transcript.
 An empty title keeps the session's date-based default title.
 
 Set **Meeting context file** in Settings to prefill the dialog from a JSON
-file created by calendar-export scripts or other local tools. Singstone reads
-its own interchange format only; it does not parse calendar-provider formats or
-execute scripts. The file has this schema:
+file created by calendar-export scripts or other local tools. A calendar knows
+who was invited but not where anyone sat, so the file lists attendees only.
+The dialog then asks, per attendee, whether that person was in the room,
+remote, or did not attend, and lets you add people who were not invited.
+Singstone reads its own interchange format only; it does not parse
+calendar-provider formats or execute scripts. The file has this schema:
 
 ```json
 {
@@ -190,24 +193,25 @@ execute scripts. The file has this schema:
       "title": "Weekly planning",
       "start": "2026-09-25T10:00:00+02:00",
       "end": "2026-09-25T11:00:00+02:00",
-      "local": { "known": ["Me", "Anna"], "unknown": 0 },
-      "remote": { "known": ["Bob", "Carol"], "unknown": 2 }
+      "attendees": ["Me", "Anna", "Bob", "Carol"]
     }
   ]
 }
 ```
 
 `format_version`, a non-empty `title`, and an RFC 3339 `start` with seconds
-and either `Z` or a numeric offset are required. `end` is optional. `local`
-and `remote` are optional; within each, `known` defaults to `[]` and `unknown`
-defaults to `0`. Names are trimmed and duplicate or empty names are ignored.
-Unknown members are reserved for forward compatibility. Bad files and bad
-entries are warned about and skipped without blocking processing.
+and either `Z` or a numeric offset are required. `end` and `attendees` are
+optional. Names are trimmed and duplicate or empty names are ignored. Bad
+files and bad entries are warned about and skipped without blocking
+processing.
 
 The session start must fall between 15 minutes before the meeting start and
 the meeting end. Without `end`, the window ends 60 minutes after the start.
-If several entries match, the closest start wins; ties use entry order.
-Existing session details take precedence over the context file.
+If several entries match, the closest start wins; ties use entry order. The
+attendee matching the configured local speaker name starts as "In the room";
+everyone else starts as "Remote". Existing session details take precedence
+over the context file. The setting also accepts a folder of `*.json` files;
+ties between files then use the file name.
 
 The per-session file used by processing is:
 
@@ -230,10 +234,8 @@ are also marked as echo. Echo lines stay in both transcript formats, carry
 metadata in `transcript.jsonl`, and can be hidden temporarily in the app.
 
 For command-line processing, `--meeting FILE` validates and copies a
-`meeting.json`-shaped file into the session. `--context-file FILE` (or
-`SINGSTONE_CONTEXT_FILE`) searches a context file only when the session has no
-details yet. Both may be supplied; `--meeting` wins. A folder of `*.json`
-files is also accepted; ties between files then use the file name.
+`meeting.json`-shaped file into the session. The context file is not used on
+the command line, since placing attendees needs a person to answer.
 
 ## Snap behavior
 
@@ -275,7 +277,7 @@ snap logs -n=100 singstone.model-download
 | `gui` | Launch the GTK4 interface (also the default with no command) |
 | `devices` | List selectable PipeWire sources and sinks |
 | `record` | Capture audio and optional screenshots into a session |
-| `process` | Run the pipeline, optionally with `--meeting` or `--context-file` details |
+| `process` | Run the pipeline, optionally with `--meeting` details |
 | `transcribe` | Produce word-level text and timestamps |
 | `diarize` | Produce anonymous speaker intervals |
 | `recognize` | Match speaker clusters to enrolled voices |

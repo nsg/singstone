@@ -63,9 +63,14 @@ pub struct MeetingContextEntry {
     #[serde(default)]
     pub end: Option<String>,
     #[serde(default)]
-    pub local: Attendees,
-    #[serde(default)]
-    pub remote: Attendees,
+    pub attendees: Vec<String>,
+}
+
+/// A calendar entry matched to a session: who was invited, not where they sat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingContext {
+    pub title: String,
+    pub attendees: Vec<String>,
 }
 
 pub fn read_details(path: &Path) -> io::Result<Option<MeetingDetails>> {
@@ -125,7 +130,7 @@ pub fn write_details_atomic(path: &Path, details: &MeetingDetails) -> io::Result
 pub fn match_context_with_source(
     source: &Path,
     started_wallclock: &str,
-) -> Option<(MeetingDetails, PathBuf)> {
+) -> Option<(MeetingContext, PathBuf)> {
     let session_start = match parse_rfc3339(started_wallclock) {
         Ok(value) => value,
         Err(error) => {
@@ -158,7 +163,7 @@ pub fn match_context_with_source(
     };
     files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
 
-    let mut best: Option<(u64, MeetingDetails, PathBuf)> = None;
+    let mut best: Option<(u64, MeetingContext, PathBuf)> = None;
     for path in files {
         let entries = match read_context_file(&path) {
             Some(entries) => entries,
@@ -184,7 +189,10 @@ pub fn match_context_with_source(
             {
                 best = Some((
                     distance,
-                    MeetingDetails::new(entry.title, entry.local, entry.remote),
+                    MeetingContext {
+                        title: entry.title.trim().to_owned(),
+                        attendees: normalize_names(entry.attendees),
+                    },
                     path.clone(),
                 ));
             }
@@ -289,15 +297,19 @@ fn attendee_count(attendees: &Attendees) -> u32 {
         .saturating_add(attendees.unknown)
 }
 
-fn normalize_attendees(mut attendees: Attendees) -> Attendees {
+pub fn normalize_names(names: Vec<String>) -> Vec<String> {
     let mut normalized = Vec::new();
-    for name in attendees.known {
+    for name in names {
         let name = name.trim();
         if !name.is_empty() && !normalized.iter().any(|existing| existing == name) {
             normalized.push(name.to_owned());
         }
     }
-    attendees.known = normalized;
+    normalized
+}
+
+fn normalize_attendees(mut attendees: Attendees) -> Attendees {
+    attendees.known = normalize_names(attendees.known);
     attendees
 }
 
@@ -441,7 +453,7 @@ mod tests {
         }
     }
 
-    fn match_context(source: &Path, started_wallclock: &str) -> Option<MeetingDetails> {
+    fn match_context(source: &Path, started_wallclock: &str) -> Option<MeetingContext> {
         match_context_with_source(source, started_wallclock).map(|(details, _)| details)
     }
 
@@ -498,12 +510,12 @@ mod tests {
             serde_json::json!([
                 {"title":7,"start":"bad"},
                 {"title":"Default end","start":"2026-09-25T10:00:00Z",
-                 "local":{"known":[" Me ","Me",""],"unknown":0}}
+                 "attendees":[" Me ","Me","","Anna"]}
             ]),
         );
         let matched = match_context(&dir, "2026-09-25T11:00:00Z").expect("boundary match");
         assert_eq!(matched.title, "Default end");
-        assert_eq!(matched.local.known, ["Me"]);
+        assert_eq!(matched.attendees, ["Me", "Anna"]);
         assert!(match_context(&dir, "2026-09-25T11:00:01Z").is_none());
         fs::remove_dir_all(dir).expect("remove fixture");
     }

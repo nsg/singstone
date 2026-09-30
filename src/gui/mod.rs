@@ -2,7 +2,7 @@ mod config;
 mod remote;
 mod wrap_layout;
 
-use crate::audio::{devices, record};
+use crate::audio::{archive, devices, record};
 use crate::cli::{Command, EnrollArgs, ProcessArgs, RecordArgs, RenderArgs};
 use crate::format::jsonl;
 use crate::meeting::{self, Attendees, MeetingDetails};
@@ -46,6 +46,7 @@ const CSS: &str = r#"
 .pill-ok { color: @success_fg_color; background: @success_bg_color; }
 .pill-idle { color: @accent_fg_color; background: @accent_bg_color; }
 .pill-busy { color: @warning_fg_color; background: @warning_bg_color; }
+.pill-archived { color: white; background: @purple_3; }
 .recording-dot { color: #e01b24; }
 .record-button { border-radius: 999px; padding-left: 12px; padding-right: 12px; font-weight: 600; }
 .live-bar { background: alpha(#e01b24, 0.10); padding: 7px 12px; }
@@ -108,6 +109,7 @@ struct SessionDetail {
     meeting_button: gtk::Button,
     rename_button: gtk::Button,
     delete_button: gtk::Button,
+    archive_button: gtk::Button,
     hide_echo: gtk::ToggleButton,
     transcript: gtk::Box,
     screenshots: gtk::FlowBox,
@@ -806,6 +808,11 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     files.set_margin_start(16);
     files.set_margin_end(16);
     root.append(&files);
+    let archive_button = gtk::Button::with_label("Archive audio…");
+    archive_button.set_halign(gtk::Align::Start);
+    archive_button.set_tooltip_text(Some(
+        "Convert the recorded audio to 16-bit FLAC to save disk space",
+    ));
 
     SessionDetail {
         root,
@@ -816,6 +823,7 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         meeting_button,
         rename_button,
         delete_button,
+        archive_button,
         hide_echo,
         transcript,
         screenshots,
@@ -2159,6 +2167,7 @@ fn wire_processing(
     search: &gtk::SearchEntry,
 ) {
     let busy = Rc::new(Cell::new(false));
+    wire_archiving(window, detail, banner, config, list, paths, search, &busy);
     let confirmed_reprocess = Rc::new(Cell::new(false));
     let confirmed_details = Rc::new(Cell::new(false));
     let selected = detail.selected.clone();
@@ -2530,6 +2539,124 @@ fn wire_processing(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn wire_archiving(
+    window: &adw::ApplicationWindow,
+    detail: &SessionDetail,
+    banner: &adw::Banner,
+    config: &Rc<RefCell<GuiConfig>>,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    search: &gtk::SearchEntry,
+    busy: &Rc<Cell<bool>>,
+) {
+    let parent = window.clone();
+    let detail_for_archive = detail.clone();
+    let banner = banner.clone();
+    let config = config.clone();
+    let list = list.clone();
+    let paths = paths.clone();
+    let search = search.clone();
+    let busy = busy.clone();
+    detail.archive_button.connect_clicked(move |_| {
+        if busy.get() {
+            return;
+        }
+        let Some(session_path) = detail_for_archive.selected.borrow().clone() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::new(
+            Some("Archive this session's audio?"),
+            Some(
+                "The recorded audio is converted to 16-bit FLAC, which typically takes a fifth of the space. Playback and reprocessing keep working. The original float recording is deleted once the copy is verified; this cannot be undone.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("archive", "Archive")]);
+        dialog.set_default_response(Some("archive"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("archive", adw::ResponseAppearance::Suggested);
+        let parent_for_response = parent.clone();
+        let detail = detail_for_archive.clone();
+        let banner = banner.clone();
+        let config = config.clone();
+        let list = list.clone();
+        let paths = paths.clone();
+        let search = search.clone();
+        let busy = busy.clone();
+        dialog.connect_response(Some("archive"), move |_, _| {
+            detail.playback.stop();
+            busy.set(true);
+            let progress = gtk::Window::builder()
+                .title("Archiving audio")
+                .transient_for(&parent_for_response)
+                .modal(true)
+                .deletable(false)
+                .default_width(360)
+                .build();
+            let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            body.set_margin_top(24);
+            body.set_margin_bottom(24);
+            body.set_margin_start(24);
+            body.set_margin_end(24);
+            let spinner = gtk::Spinner::new();
+            spinner.set_spinning(true);
+            body.append(&spinner);
+            body.append(&gtk::Label::new(Some(
+                "Converting the recorded audio to FLAC and verifying the copy…",
+            )));
+            progress.set_child(Some(&body));
+            progress.present();
+
+            let result = Arc::new(Mutex::new(None));
+            let thread_result = result.clone();
+            let archive_session = session_path.clone();
+            std::thread::spawn(move || {
+                let value = Session::open(&archive_session)
+                    .and_then(|session| archive::archive_session(&session))
+                    .map_err(|error| error.to_string());
+                *thread_result.lock().expect("archive result mutex") = Some(value);
+            });
+            let parent = parent_for_response.clone();
+            let detail = detail.clone();
+            let banner = banner.clone();
+            let config = config.clone();
+            let list = list.clone();
+            let paths = paths.clone();
+            let search = search.clone();
+            let busy = busy.clone();
+            let session_path = session_path.clone();
+            glib::timeout_add_local(Duration::from_millis(150), move || {
+                let Some(result) = result.lock().expect("archive result mutex").take() else {
+                    return glib::ControlFlow::Continue;
+                };
+                busy.set(false);
+                progress.close();
+                populate_sessions(&list, &paths, &config.borrow().meetings_dir, &search.text());
+                let index = paths.borrow().iter().position(|path| *path == session_path);
+                match index {
+                    Some(index) => select_session_row(&list, index),
+                    None => {
+                        let _ = detail.load(&session_path);
+                    }
+                }
+                match result {
+                    Ok(summary) => {
+                        banner.set_title(&format!(
+                            "Audio archived — {} is now {}",
+                            archive::format_size(summary.bytes_before),
+                            archive::format_size(summary.bytes_after)
+                        ));
+                        banner.set_revealed(true);
+                    }
+                    Err(error) => show_error(&parent, "Could not archive audio", &error),
+                }
+                glib::ControlFlow::Break
+            });
+        });
+        dialog.present(Some(&parent));
+    });
+}
+
 struct ProcessingDialog {
     dialog: adw::Dialog,
     label: gtk::Label,
@@ -2809,9 +2936,22 @@ fn start_audio_playback(
     start_ms: u64,
     end_ms: u64,
 ) -> io::Result<SpawnedPlayback> {
-    let mut audio = fs::File::open(audio_path)?;
-    let (offset, byte_count) = audio_byte_range(start_ms, end_ms, audio.metadata()?.len())?;
-    audio.seek(SeekFrom::Start(offset))?;
+    let mut segment: Box<dyn Read + Send> = if archive::is_archived(audio_path) {
+        let stored_bytes = archive::sample_count(audio_path)?.saturating_mul(4);
+        let (offset, byte_count) = audio_byte_range(start_ms, end_ms, stored_bytes)?;
+        let samples = archive::read_range(audio_path, offset / 4, (offset + byte_count) / 4)?;
+        Box::new(io::Cursor::new(
+            samples
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<u8>>(),
+        ))
+    } else {
+        let mut audio = fs::File::open(audio_path)?;
+        let (offset, byte_count) = audio_byte_range(start_ms, end_ms, audio.metadata()?.len())?;
+        audio.seek(SeekFrom::Start(offset))?;
+        Box::new(audio.take(byte_count))
+    };
 
     let executable = pw_play_executable();
     let mut child = pw_play_command(&executable)
@@ -2860,7 +3000,6 @@ fn start_audio_playback(
     let writer_error = Arc::new(Mutex::new(None));
     let writer_error_for_thread = writer_error.clone();
     std::thread::spawn(move || {
-        let mut segment = audio.take(byte_count);
         let result = io::copy(&mut segment, &mut stdin)
             .and_then(|_| stdin.flush())
             .map_err(|error| error.to_string());
@@ -2970,13 +3109,7 @@ impl SessionDetail {
             format_duration(duration)
         ));
         let processed = session.transcript_path().is_file();
-        let (status, class) = if manifest.state == SessionState::Recording {
-            ("Recording", "busy")
-        } else if processed {
-            ("Processed", "ok")
-        } else {
-            ("Recorded", "idle")
-        };
+        let (status, class) = session_status(&session, &manifest);
         set_status(&self.status, status, class);
         self.status.set_visible(true);
         self.process_button
@@ -3004,7 +3137,7 @@ impl SessionDetail {
             } else {
                 let frequent = Rc::new(frequent_speakers(&utterances, 3));
                 for utterance in &utterances {
-                    let audio_path = session.audio_path(utterance.source);
+                    let audio_path = session.stored_audio_path(utterance.source);
                     self.transcript
                         .append(&transcript_row(utterance, self, audio_path, &frequent));
                 }
@@ -3045,6 +3178,26 @@ impl SessionDetail {
             (false, false) => "None",
         };
         self.metadata.append(&property_row("Audio", audio));
+        let stored = [AudioSource::Mic, AudioSource::System]
+            .map(|source| session.stored_audio_path(source))
+            .into_iter()
+            .filter_map(|path| Some((fs::metadata(&path).ok()?.len(), path)))
+            .collect::<Vec<_>>();
+        if !stored.is_empty() {
+            let raw = stored.iter().any(|(_, path)| !archive::is_archived(path));
+            self.metadata.append(&property_row(
+                "Audio storage",
+                &format!(
+                    "{} · {}",
+                    archive::format_size(stored.iter().map(|(size, _)| size).sum()),
+                    if raw { "raw float" } else { "FLAC" }
+                ),
+            ));
+        }
+        self.archive_button.set_visible(
+            processed && manifest.state != SessionState::Recording && !session.is_archived(),
+        );
+        self.metadata.append(&self.archive_button);
 
         clear_box(&self.files);
         let outputs = gtk::Label::new(Some("Outputs:"));
@@ -3131,14 +3284,7 @@ fn load_sessions(root: &Path) -> Vec<SessionSummary> {
         .filter_map(|entry| {
             let session = Session::open(entry.path()).ok()?;
             let manifest = session.read_manifest().ok()?;
-            let processed = session.transcript_path().is_file();
-            let (status, status_class) = if manifest.state == SessionState::Recording {
-                ("Recording", "busy")
-            } else if processed {
-                ("Processed", "ok")
-            } else {
-                ("Recorded", "idle")
-            };
+            let (status, status_class) = session_status(&session, &manifest);
             Some(SessionSummary {
                 title: meeting::read_details(&session.meeting_path())
                     .ok()
@@ -3156,6 +3302,18 @@ fn load_sessions(root: &Path) -> Vec<SessionSummary> {
         .collect::<Vec<_>>();
     sessions.sort_by(|a, b| b.started.cmp(&a.started));
     sessions
+}
+
+fn session_status(session: &Session, manifest: &Manifest) -> (&'static str, &'static str) {
+    if manifest.state == SessionState::Recording {
+        ("Recording", "busy")
+    } else if !session.transcript_path().is_file() {
+        ("Recorded", "idle")
+    } else if session.is_archived() {
+        ("Archived", "archived")
+    } else {
+        ("Processed", "ok")
+    }
 }
 
 fn session_row(summary: &SessionSummary) -> gtk::ListBoxRow {
@@ -3593,7 +3751,7 @@ fn header_action_button(icon_name: &str, label: &str) -> gtk::Button {
 
 fn set_status(label: &gtk::Label, text: &str, class: &str) {
     label.set_label(text);
-    for name in ["pill-ok", "pill-idle", "pill-busy"] {
+    for name in ["pill-ok", "pill-idle", "pill-busy", "pill-archived"] {
         label.remove_css_class(name);
     }
     label.add_css_class(&format!("pill-{class}"));
@@ -3614,6 +3772,14 @@ fn session_title(path: &Path) -> String {
         .replace("session-", "Session ")
 }
 
+fn stored_sample_count(path: &Path) -> io::Result<u64> {
+    if archive::is_archived(path) {
+        archive::sample_count(path)
+    } else {
+        Ok(fs::metadata(path)?.len() / 4)
+    }
+}
+
 fn session_duration_ms(session: &Session, manifest: &Manifest) -> u64 {
     [
         (AudioSource::Mic, manifest.mic.enabled),
@@ -3621,8 +3787,8 @@ fn session_duration_ms(session: &Session, manifest: &Manifest) -> u64 {
     ]
     .into_iter()
     .filter(|(_, enabled)| *enabled)
-    .filter_map(|(source, _)| fs::metadata(session.audio_path(source)).ok())
-    .map(|metadata| metadata.len() / 4 * 1000 / u64::from(SAMPLE_RATE))
+    .filter_map(|(source, _)| stored_sample_count(&session.stored_audio_path(source)).ok())
+    .map(|samples| samples * 1000 / u64::from(SAMPLE_RATE))
     .max()
     .unwrap_or(0)
 }

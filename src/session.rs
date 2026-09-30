@@ -1,5 +1,6 @@
 //! Session directory layout and manifest handling.
 
+use crate::audio::archive;
 use crate::format::jsonl;
 use crate::types::Manifest;
 use std::fs::{self, File, OpenOptions};
@@ -77,6 +78,30 @@ impl Session {
     pub fn audio_path(&self, source: crate::types::AudioSource) -> PathBuf {
         self.dir.join("audio").join(format!("{source}.f32le"))
     }
+    pub fn archived_audio_path(&self, source: crate::types::AudioSource) -> PathBuf {
+        self.dir.join("audio").join(format!("{source}.flac"))
+    }
+    /// The file holding a track's audio: the raw recording while it exists,
+    /// afterwards its archived copy.
+    pub fn stored_audio_path(&self, source: crate::types::AudioSource) -> PathBuf {
+        let raw = self.audio_path(source);
+        let archived = self.archived_audio_path(source);
+        if !raw.is_file() && archived.is_file() {
+            archived
+        } else {
+            raw
+        }
+    }
+    /// True once archiving has replaced every raw track.
+    pub fn is_archived(&self) -> bool {
+        use crate::types::AudioSource::{Mic, System};
+        [Mic, System]
+            .into_iter()
+            .any(|source| self.archived_audio_path(source).is_file())
+            && ![Mic, System]
+                .into_iter()
+                .any(|source| self.audio_path(source).is_file())
+    }
     pub fn timeline_path(&self, source: crate::types::AudioSource) -> PathBuf {
         self.dir
             .join("audio")
@@ -133,9 +158,13 @@ impl Session {
         fs::rename(tmp, path)
     }
 
-    /// Read a raw f32le audio file fully into memory.
+    /// Read a track's stored audio fully into memory.
     pub fn read_audio(&self, source: crate::types::AudioSource) -> io::Result<Vec<f32>> {
-        let bytes = fs::read(self.audio_path(source))?;
+        let path = self.stored_audio_path(source);
+        if archive::is_archived(&path) {
+            return archive::read(&path);
+        }
+        let bytes = fs::read(path)?;
         Ok(bytes
             .as_chunks::<4>()
             .0

@@ -220,6 +220,7 @@ parts:
     build-packages:
       - clang
       - cmake
+      - flac
       - git
       - intel-oneapi-compiler-dpcpp-cpp-2026.1
       - intel-oneapi-mkl-sycl-devel-2026.1
@@ -232,6 +233,7 @@ parts:
       - bzip2
       - ca-certificates
       - curl
+      - flac
       - intel-opencl-icd
       - libze-intel-gpu1
       - libze1

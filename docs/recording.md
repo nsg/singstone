@@ -31,6 +31,11 @@ The command creates a private `session-YYYYMMDD-HHMMSS/` directory containing:
 
 Disabled sources do not produce audio or timeline files.
 
+`singstone archive` later replaces each `audio/*.f32le` file of a processed
+session with a verified 16-bit `audio/*.flac` copy. The manifest keeps
+describing the capture format; readers use whichever file exists and prefer
+the raw one.
+
 ## Audio capture
 
 Both streams share one monotonic start time. Each PipeWire callback validates

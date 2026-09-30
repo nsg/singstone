@@ -28,6 +28,15 @@ All Rust-lang / gtk-rs / Alex Crichton lineage. They run arbitrary code at
 build time by design; they are the reason the build must run in a trusted
 environment, not why it must be online.
 
+## Runtime programs
+
+Two packaged programs run as child processes instead of being linked:
+
+| Program | Purpose | Source | Assessment |
+|---|---|---|---|
+| `pw-play` | Transcript-side audio playback | Ubuntu `pipewire-bin` | Receives samples on a pipe; opens no files. |
+| `flac` 1.4.3 | Encodes archived audio and decodes it for playback and reprocessing | Ubuntu `flac` (universe), on top of `libflac12t64`, which `pipewire-bin` already pulls in | Xiph reference implementation in C, fuzzed upstream but with a history of memory-safety fixes. It only reads files Singstone wrote into the user's own meetings folder, under strict confinement. Singstone checks the stream header for 16 kHz mono 16-bit before decoding, treats a failing exit as an error, and deletes a raw recording only after its encoded copy decodes back to the same samples. Pure-Rust alternatives were reviewed on 2026-09-30 and rejected: `flacenc` 0.5.1 writes stream headers that `claxon` refuses for some lengths, and `claxon` 0.4.3 has an open soundness report and no release since 2020. **Accepted; security fixes arrive with Snap rebuilds.** |
+
 ## Native GPU toolchain
 
 The AMD64 Snap builds a second Whisper executable with Intel oneAPI DPC++/C++

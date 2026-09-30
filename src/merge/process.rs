@@ -1,3 +1,4 @@
+use crate::audio::archive;
 use crate::cli::{DiarizeArgs, ProcessArgs, RecognizeArgs, RenderArgs, TranscribeArgs};
 use crate::diarization::Diarizer;
 use crate::diarization::sherpa::SherpaDiarizer;
@@ -570,6 +571,14 @@ fn open_session(path: &Path) -> Result<(Session, Manifest), Box<dyn std::error::
         )
         .into());
     }
+    // Stages that tolerate unreadable audio would otherwise quietly produce
+    // emptier results from an archived session.
+    if [AudioSource::Mic, AudioSource::System]
+        .into_iter()
+        .any(|source| archive::is_archived(&session.stored_audio_path(source)))
+    {
+        archive::ensure_decoder()?;
+    }
     Ok((session, manifest))
 }
 
@@ -682,7 +691,7 @@ fn read_enabled_audio(
             error.kind(),
             format!(
                 "cannot read enabled {source} audio {}: {error}",
-                session.audio_path(source).display()
+                session.stored_audio_path(source).display()
             ),
         )),
     }
@@ -694,7 +703,7 @@ fn validate_enabled_audio_files(
 ) -> io::Result<()> {
     for (source, enabled) in tracks {
         if enabled {
-            let path = session.audio_path(source);
+            let path = session.stored_audio_path(source);
             fs::metadata(&path).map_err(|error| {
                 io::Error::new(
                     error.kind(),
@@ -1106,7 +1115,7 @@ fn hash_audio(
     source: AudioSource,
     included: bool,
 ) -> io::Result<Option<String>> {
-    let path = session.audio_path(source);
+    let path = session.stored_audio_path(source);
     (included && path.is_file())
         .then(|| models::sha256_file(&path))
         .transpose()
@@ -1201,8 +1210,8 @@ fn render_artifacts_with_segments_and_hook(
     warn_diarization_provenance(session, diarize_mic);
     let recognized = read_speaker_assignments(session)?;
     let audio = match AudioEnvelopes::read(
-        &session.audio_path(AudioSource::Mic),
-        &session.audio_path(AudioSource::System),
+        &session.stored_audio_path(AudioSource::Mic),
+        &session.stored_audio_path(AudioSource::System),
     ) {
         Ok(audio) => Some(audio),
         Err(error) => {
@@ -1445,13 +1454,72 @@ fn warn_input_hash(
     let Some(expected) = expected else {
         return;
     };
-    let path = session.audio_path(source);
+    let path = session.stored_audio_path(source);
     match models::sha256_file(&path) {
         Ok(actual) if !actual.eq_ignore_ascii_case(expected) => eprintln!(
             "warning: {metadata_name} was produced from different {source} audio; its output may be stale"
         ),
         Err(error) => eprintln!("warning: cannot fingerprint {}: {error}", path.display()),
         _ => {}
+    }
+}
+
+/// Archiving replaces a track's file. Stage metadata that fingerprinted the
+/// old file follows it to the new one, so its outputs are not reported stale.
+pub fn rebase_audio_provenance(session: &Session, source: AudioSource, old: &str, new: &str) {
+    fn rebase<T: Serialize + DeserializeOwned>(
+        path: &Path,
+        old: &str,
+        new: &str,
+        hash: impl Fn(&mut T) -> &mut Option<String>,
+    ) -> io::Result<()> {
+        let mut metadata: T = match read_json(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let hash = hash(&mut metadata);
+        if !hash
+            .as_deref()
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(old))
+        {
+            return Ok(());
+        }
+        *hash = Some(new.to_owned());
+        write_json_atomic(path, &metadata)
+    }
+    let words = session.words_metadata_path();
+    let diarization = session.diarization_metadata_path();
+    let results = [
+        (
+            &words,
+            rebase(
+                &words,
+                old,
+                new,
+                |metadata: &mut TranscriptionMetadata| match source {
+                    AudioSource::Mic => &mut metadata.mic_audio_sha256,
+                    AudioSource::System => &mut metadata.system_audio_sha256,
+                },
+            ),
+        ),
+        (
+            &diarization,
+            rebase(
+                &diarization,
+                old,
+                new,
+                |metadata: &mut DiarizationMetadata| match source {
+                    AudioSource::Mic => &mut metadata.mic_audio_sha256,
+                    AudioSource::System => &mut metadata.system_audio_sha256,
+                },
+            ),
+        ),
+    ];
+    for (path, result) in results {
+        if let Err(error) = result {
+            eprintln!("warning: cannot update {}: {error}", path.display());
+        }
     }
 }
 

@@ -37,7 +37,8 @@ singstone transcribe SESSION \
 
 **Input:** `manifest.json`, every enabled `audio/*.f32le` track, and a
 whisper.cpp GGML model. The audio must be 16 kHz mono float PCM, as produced by
-`record`.
+`record`. Every stage also accepts the 16-bit `audio/*.flac` tracks of an
+archived session, decoded through the `flac` program.
 
 **Model:** Whisper, through `whisper-rs`. The packaged
 `kb-whisper-small-q5_0.bin` is KBLab's Swedish-tuned Whisper Small model in the

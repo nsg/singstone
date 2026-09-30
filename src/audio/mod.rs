@@ -1,5 +1,6 @@
 //! PipeWire capture: real-time callback -> bounded queue -> writer thread.
 
+pub mod archive;
 pub mod capture;
 pub mod devices;
 pub mod pipewire;

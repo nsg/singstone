@@ -47,6 +47,8 @@ the recorded audio is preserved.
 - Names speakers from the transcript: one-click shortcuts for people already
   in the meeting, and reassignment when a voice was matched to the wrong person.
 - Renames sessions and deletes them, after a confirmation, from the session view.
+- Archives a processed session's audio as 16-bit FLAC, about a fifth of the
+  size, while keeping playback and reprocessing.
 - Optional GNOME Shell extension with a top-bar Record/Stop button and live
   level meters.
 - Learns an anonymous diarized voice when it is named in the transcript, or
@@ -240,6 +242,24 @@ For command-line processing, `--meeting FILE` validates and copies a
 `meeting.json`-shaped file into the session. The context file is not used on
 the command line, since placing attendees needs a person to answer.
 
+## Archive audio
+
+Recordings are raw 32-bit float audio, about 230 MB per hour and track.
+**Archive audio…** on a processed session, or `singstone archive SESSION`,
+converts each track to 16-bit FLAC, typically a fifth of the size:
+
+```bash
+singstone archive ~/Meetings/session-20260914-103000
+```
+
+Archiving is a manual, one-way step. Rounding to 16 bits is the only loss; it
+stays far below microphone noise. The raw file is deleted only after its FLAC
+copy has been written to disk and decoded back to the same samples. Archived
+sessions show an **Archived** label and still play, render and reprocess.
+
+The Snap bundles the `flac` program for this. Outside the Snap, install it
+from your distribution, or point `SINGSTONE_FLAC` at the executable.
+
 ## Snap behavior
 
 | Component | Access | Purpose |
@@ -259,7 +279,8 @@ exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the
 downloaded artifacts and final files, then publishes them atomically under
 `$SNAP_USER_COMMON/models`—normally `~/snap/singstone/common/models`.
 
-`devices`, `record`, `render`, and `speakers` never start the download service.
+`devices`, `record`, `render`, `archive`, and `speakers` never start the
+download service.
 `process`, `transcribe`, `diarize`, `recognize`, and `enroll` wait for setup
 when they use a missing default Snap model. Interrupted downloads resume on the
 next attempt.
@@ -285,6 +306,7 @@ snap logs -n=100 singstone.model-download
 | `diarize` | Produce anonymous speaker intervals |
 | `recognize` | Match speaker clusters to enrolled voices |
 | `render` | Build transcripts from persistent intermediate artifacts |
+| `archive` | Convert a processed session's raw audio to 16-bit FLAC |
 | `enroll` | Add voice samples to the speaker database |
 | `speakers` | List enrolled speakers |
 

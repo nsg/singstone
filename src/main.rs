@@ -42,6 +42,7 @@ fn main() -> ExitCode {
         cli::Command::Diarize(args) => merge::process::run_diarize(args),
         cli::Command::Recognize(args) => merge::process::run_recognize(args),
         cli::Command::Render(args) => merge::process::run_render(args),
+        cli::Command::Archive(args) => audio::archive::run(args),
         cli::Command::Enroll(args) => speaker::enroll::run(args),
         cli::Command::Speakers(args) => speaker::enroll::list(args),
     };

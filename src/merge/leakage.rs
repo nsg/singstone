@@ -1,3 +1,4 @@
+use crate::audio::archive;
 use crate::types::{AudioSource, SAMPLE_RATE, TimedWord};
 use serde::Serialize;
 use std::fs::File;
@@ -600,6 +601,17 @@ fn rms_envelope(samples: &[f32]) -> Vec<f32> {
 }
 
 fn read_rms_envelope(path: &Path) -> io::Result<Vec<f32>> {
+    if archive::is_archived(path) {
+        let mut envelope = Vec::new();
+        archive::decode_each(path, AUDIO_FRAME_SAMPLES, |frame| {
+            if frame.len() == AUDIO_FRAME_SAMPLES {
+                let mean_square = frame.iter().map(|sample| sample * sample).sum::<f32>()
+                    / AUDIO_FRAME_SAMPLES as f32;
+                envelope.push(mean_square.sqrt());
+            }
+        })?;
+        return Ok(envelope);
+    }
     let mut reader = BufReader::new(File::open(path)?);
     let frame_bytes = AUDIO_FRAME_SAMPLES * 4;
     let mut bytes = vec![0u8; frame_bytes];

@@ -21,6 +21,14 @@ files. The Snap itself contains their trusted manifest and notices:
 Exact revisions, source URLs, sizes, and SHA-256 digests are recorded in the
 installed `models.lock` file.
 
+## Bundled programs
+
+- `flac` 1.4.3 from Ubuntu Noble converts archived recordings. The
+  command-line program is GPL-2.0-or-later and runs as a separate process; the
+  library it uses, libFLAC, is BSD-3-Clause. Their package copyright files are
+  included under `/usr/share/doc`, and the source is available from the Ubuntu
+  archive.
+
 ## Bundled GPU runtimes
 
 - Intel oneAPI DPC++/C++ and Unified Runtime 2026.1 provide the SYCL runtime.

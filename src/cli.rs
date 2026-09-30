@@ -36,6 +36,8 @@ pub enum Command {
     Recognize(RecognizeArgs),
     /// Render persistent processing artifacts into transcript files.
     Render(RenderArgs),
+    /// Convert a processed session's raw audio to 16-bit FLAC to save disk space.
+    Archive(ArchiveArgs),
     /// Enroll a known speaker from audio samples (raw f32le or WAV).
     Enroll(EnrollArgs),
     /// List enrolled speakers.
@@ -233,6 +235,12 @@ pub struct RenderArgs {
         require_equals = true
     )]
     pub diarize_mic: Option<bool>,
+}
+
+#[derive(Args, Debug)]
+pub struct ArchiveArgs {
+    /// Session directory.
+    pub session: PathBuf,
 }
 
 #[derive(Args, Debug)]

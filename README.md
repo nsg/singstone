@@ -46,6 +46,7 @@ the recorded audio is preserved.
   storage folders, and a one-click header Record button.
 - Names speakers from the transcript: one-click shortcuts for people already
   in the meeting, and reassignment when a voice was matched to the wrong person.
+- Renames sessions and deletes them, after a confirmation, from the session view.
 - Optional GNOME Shell extension with a top-bar Record/Stop button and live
   level meters.
 - Learns an anonymous diarized voice when it is named in the transcript, or
@@ -175,7 +176,9 @@ When processing starts in the app, the **Meeting details** dialog asks for a
 title and the known and unnamed people in the room and on the remote end. The
 app stores the result as `meeting.json` inside that session. Use **Meeting
 details…** on a processed session to revise it and re-render the transcript.
-An empty title keeps the session's date-based default title.
+An empty title keeps the session's date-based default title. The pencil
+button in the session header changes only the title, at any stage, without
+re-rendering.
 
 Set **Meeting context file** in Settings to prefill the dialog from a JSON
 file created by calendar-export scripts or other local tools. A calendar knows

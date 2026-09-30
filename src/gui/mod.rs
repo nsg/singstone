@@ -106,6 +106,8 @@ struct SessionDetail {
     status: gtk::Label,
     process_button: gtk::Button,
     meeting_button: gtk::Button,
+    rename_button: gtk::Button,
+    delete_button: gtk::Button,
     hide_echo: gtk::ToggleButton,
     transcript: gtk::Box,
     screenshots: gtk::FlowBox,
@@ -305,6 +307,15 @@ fn build_window(app: &adw::Application) {
         &session_list,
         &session_paths,
         &search,
+    );
+    wire_session_actions(
+        &window,
+        &detail,
+        &config,
+        &session_list,
+        &session_paths,
+        &search,
+        &recording_page.job,
     );
     wire_settings(
         &window,
@@ -701,6 +712,16 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     let meeting_button = gtk::Button::with_label("Meeting details…");
     meeting_button.set_visible(false);
     top.append(&meeting_button);
+    let rename_button = gtk::Button::from_icon_name("document-edit-symbolic");
+    rename_button.set_tooltip_text(Some("Rename session"));
+    rename_button.add_css_class("flat");
+    rename_button.set_visible(false);
+    top.append(&rename_button);
+    let delete_button = gtk::Button::from_icon_name("user-trash-symbolic");
+    delete_button.set_tooltip_text(Some("Delete session"));
+    delete_button.add_css_class("flat");
+    delete_button.set_visible(false);
+    top.append(&delete_button);
     heading.append(&top);
     let subtitle = gtk::Label::new(Some("Recorded meetings appear in the sidebar."));
     subtitle.set_xalign(0.0);
@@ -793,6 +814,8 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         status,
         process_button,
         meeting_button,
+        rename_button,
+        delete_button,
         hide_echo,
         transcript,
         screenshots,
@@ -1429,6 +1452,151 @@ fn wire_session_browser(
     }
 }
 
+fn select_session_row(list: &gtk::ListBox, index: usize) {
+    if let Some(row) = i32::try_from(index)
+        .ok()
+        .and_then(|index| list.row_at_index(index))
+    {
+        list.select_row(Some(&row));
+    }
+}
+
+fn wire_session_actions(
+    window: &adw::ApplicationWindow,
+    detail: &SessionDetail,
+    config: &Rc<RefCell<GuiConfig>>,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    search: &gtk::SearchEntry,
+    job: &Rc<RefCell<Option<RecordingJob>>>,
+) {
+    let parent = window.clone();
+    let detail_for_rename = detail.clone();
+    let config_for_rename = config.clone();
+    let list_for_rename = list.clone();
+    let paths_for_rename = paths.clone();
+    let search_for_rename = search.clone();
+    detail.rename_button.connect_clicked(move |_| {
+        let Some(session_path) = detail_for_rename.selected.borrow().clone() else {
+            return;
+        };
+        let stored = match Session::open(&session_path)
+            .and_then(|session| meeting::read_details(&session.meeting_path()))
+        {
+            Ok(details) => details.map(|details| details.title).unwrap_or_default(),
+            Err(error) => {
+                show_error(&parent, "Could not read session", &error.to_string());
+                return;
+            }
+        };
+        let dialog = adw::AlertDialog::new(
+            Some("Rename session"),
+            Some("Leave the name empty to use the default name."),
+        );
+        let entry = gtk::Entry::builder()
+            .text(stored)
+            .placeholder_text(session_title(&session_path))
+            .activates_default(true)
+            .build();
+        dialog.set_extra_child(Some(&entry));
+        dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
+        dialog.set_default_response(Some("rename"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+        dialog.set_focus(Some(&entry));
+        let parent_for_response = parent.clone();
+        let detail = detail_for_rename.clone();
+        let config = config_for_rename.clone();
+        let list = list_for_rename.clone();
+        let paths = paths_for_rename.clone();
+        let search = search_for_rename.clone();
+        dialog.connect_response(Some("rename"), move |_, _| {
+            if let Err(error) = Session::open(&session_path)
+                .and_then(|session| meeting::set_title(&session.meeting_path(), &entry.text()))
+            {
+                show_error(
+                    &parent_for_response,
+                    "Could not rename session",
+                    &error.to_string(),
+                );
+                return;
+            }
+            populate_sessions(&list, &paths, &config.borrow().meetings_dir, &search.text());
+            let index = paths.borrow().iter().position(|path| *path == session_path);
+            match index {
+                Some(index) => select_session_row(&list, index),
+                // The new name no longer matches the search filter.
+                None => {
+                    let _ = detail.load(&session_path);
+                }
+            }
+        });
+        dialog.present(Some(&parent));
+    });
+
+    let parent = window.clone();
+    let detail_for_delete = detail.clone();
+    let config_for_delete = config.clone();
+    let list_for_delete = list.clone();
+    let paths_for_delete = paths.clone();
+    let search_for_delete = search.clone();
+    let job = job.clone();
+    detail.delete_button.connect_clicked(move |_| {
+        let Some(session_path) = detail_for_delete.selected.borrow().clone() else {
+            return;
+        };
+        let recording = job.borrow().is_some()
+            && Session::open(&session_path)
+                .and_then(|session| session.read_manifest())
+                .is_ok_and(|manifest| manifest.state == SessionState::Recording);
+        if recording {
+            show_error(
+                &parent,
+                "Recording in progress",
+                "Stop the recording before deleting its session.",
+            );
+            return;
+        }
+        let dialog = adw::AlertDialog::new(
+            Some("Delete this session?"),
+            Some(&format!(
+                "“{}” will be permanently deleted, including its recorded audio, transcript, and screenshots. This cannot be undone.",
+                detail_for_delete.title.label()
+            )),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        let parent_for_response = parent.clone();
+        let detail = detail_for_delete.clone();
+        let config = config_for_delete.clone();
+        let list = list_for_delete.clone();
+        let paths = paths_for_delete.clone();
+        let search = search_for_delete.clone();
+        dialog.connect_response(Some("delete"), move |_, _| {
+            detail.playback.stop();
+            let index = paths.borrow().iter().position(|path| *path == session_path);
+            if let Err(error) = Session::open(&session_path).and_then(Session::delete) {
+                show_error(
+                    &parent_for_response,
+                    "Could not delete session",
+                    &error.to_string(),
+                );
+                return;
+            }
+            populate_sessions(&list, &paths, &config.borrow().meetings_dir, &search.text());
+            let remaining = paths.borrow().len();
+            if remaining == 0 {
+                detail.clear();
+            } else {
+                select_session_row(&list, index.unwrap_or(0).min(remaining - 1));
+            }
+        });
+        dialog.present(Some(&parent));
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wire_recording(
     window: &adw::ApplicationWindow,
@@ -1909,14 +2077,23 @@ fn meeting_prefill(
     config: &GuiConfig,
 ) -> Result<MeetingPrefill, Box<dyn std::error::Error>> {
     let session = Session::open(session_path)?;
-    if let Some(details) = meeting::read_details(&session.meeting_path())? {
-        return Ok(MeetingPrefill {
-            details,
-            attendees: Vec::new(),
-            attendee_note: None,
-            caption: Some("Previous details".into()),
-        });
-    }
+    // Renaming an unprocessed session stores a title without attendees; keep
+    // that title but prefill the attendees as for a session without details.
+    // Once processed, an empty roster is what the user confirmed.
+    let confirmed = session.transcript_path().is_file();
+    let renamed = match meeting::read_details(&session.meeting_path())? {
+        Some(details) if confirmed || details.local_count() > 0 || details.remote_count() > 0 => {
+            return Ok(MeetingPrefill {
+                details,
+                attendees: Vec::new(),
+                attendee_note: None,
+                caption: Some("Previous details".into()),
+            });
+        }
+        stored => stored
+            .map(|details| details.title)
+            .filter(|title| !title.is_empty()),
+    };
     let me = config.local_speaker.trim();
     let manifest = session.read_manifest()?;
     if let Some(context_file) = config.context_file.as_deref()
@@ -1946,7 +2123,11 @@ fn meeting_prefill(
             )
         });
         return Ok(MeetingPrefill {
-            details: MeetingDetails::new(context.title, Attendees::default(), Attendees::default()),
+            details: MeetingDetails::new(
+                renamed.unwrap_or(context.title),
+                Attendees::default(),
+                Attendees::default(),
+            ),
             attendees,
             attendee_note,
             caption: Some(format!("From meeting-context file {filename}")),
@@ -1954,7 +2135,7 @@ fn meeting_prefill(
     }
     Ok(MeetingPrefill {
         details: MeetingDetails::new(
-            String::new(),
+            renamed.unwrap_or_default(),
             Attendees {
                 known: vec![config.local_speaker.clone()],
                 unknown: 0,
@@ -2809,6 +2990,8 @@ impl SessionDetail {
             .set_visible(manifest.state != SessionState::Recording);
         self.meeting_button
             .set_visible(processed && manifest.state != SessionState::Recording);
+        self.rename_button.set_visible(true);
+        self.delete_button.set_visible(true);
         self.hide_echo.set_active(false);
 
         clear_box(&self.transcript);
@@ -2888,6 +3071,29 @@ impl SessionDetail {
         open.connect_clicked(move |_| open_path(&folder));
         self.files.append(&open);
         Ok(())
+    }
+
+    /// Back to the empty state shown before any session is selected.
+    fn clear(&self) {
+        self.playback.stop();
+        *self.selected.borrow_mut() = None;
+        self.title.set_label("Select a session");
+        self.subtitle
+            .set_label("Recorded meetings appear in the sidebar.");
+        for widget in [
+            self.status.upcast_ref::<gtk::Widget>(),
+            self.process_button.upcast_ref(),
+            self.meeting_button.upcast_ref(),
+            self.rename_button.upcast_ref(),
+            self.delete_button.upcast_ref(),
+            self.hide_echo.upcast_ref(),
+        ] {
+            widget.set_visible(false);
+        }
+        clear_box(&self.transcript);
+        clear_flow(&self.screenshots);
+        clear_box(&self.metadata);
+        clear_box(&self.files);
     }
 }
 

@@ -66,6 +66,11 @@ impl Session {
         Ok(Self { dir })
     }
 
+    /// Permanently remove the session directory and everything in it.
+    pub fn delete(self) -> io::Result<()> {
+        fs::remove_dir_all(&self.dir)
+    }
+
     pub fn manifest_path(&self) -> PathBuf {
         self.dir.join(MANIFEST)
     }

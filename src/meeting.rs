@@ -126,6 +126,21 @@ pub fn write_details_atomic(path: &Path, details: &MeetingDetails) -> io::Result
     fs::rename(temporary, path)
 }
 
+/// Change only the title, keeping attendees. An empty title on a session
+/// without details writes nothing.
+pub fn set_title(path: &Path, title: &str) -> io::Result<()> {
+    let title = title.trim();
+    let details = match read_details(path)? {
+        Some(details) => MeetingDetails {
+            title: title.to_owned(),
+            ..details
+        },
+        None if title.is_empty() => return Ok(()),
+        None => MeetingDetails::new(title.to_owned(), Attendees::default(), Attendees::default()),
+    };
+    write_details_atomic(path, &details)
+}
+
 /// `source` is either one meeting-context JSON file or a folder of them.
 pub fn match_context_with_source(
     source: &Path,
@@ -517,6 +532,26 @@ mod tests {
         assert_eq!(matched.title, "Default end");
         assert_eq!(matched.attendees, ["Me", "Anna"]);
         assert!(match_context(&dir, "2026-09-25T11:00:01Z").is_none());
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
+    fn set_title_keeps_attendees_and_skips_empty_new_details() {
+        let dir = test_dir("set-title");
+        let path = dir.join("meeting.json");
+        set_title(&path, "  ").expect("empty title");
+        assert!(!path.exists());
+
+        let attendees = Attendees {
+            known: vec!["Anna".into()],
+            unknown: 2,
+        };
+        let details = MeetingDetails::new("Old".into(), Attendees::default(), attendees.clone());
+        write_details_atomic(&path, &details).expect("write details");
+        set_title(&path, " Weekly sync ").expect("rename");
+        let renamed = read_details(&path).expect("read").expect("details");
+        assert_eq!(renamed.title, "Weekly sync");
+        assert_eq!(renamed.remote, attendees);
         fs::remove_dir_all(dir).expect("remove fixture");
     }
 }

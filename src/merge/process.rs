@@ -486,7 +486,8 @@ pub fn correct_speaker(
         .clone()
         .unwrap_or_else(database::default_path);
     let threshold = args.speaker_threshold;
-    let mut outcome = apply_corrections(args, std::slice::from_ref(&request))?;
+    let (mut outcome, requests) = apply_corrections_inner(args, std::slice::from_ref(&request))?;
+    let request = &requests[0];
     if outcome.learning_available
         && let Some(cluster) = proposal_cluster
         && learning_configured
@@ -496,7 +497,7 @@ pub fn correct_speaker(
             read_jsonl_artifact(&session.embeddings_path(), "speaker embeddings")?;
         let database = SpeakerDatabase::load(&database_path)?;
         outcome.proposals =
-            build_proposals(&session, &request, cluster, &chunks, &database, threshold)?;
+            build_proposals(&session, request, cluster, &chunks, &database, threshold)?;
     }
     Ok(outcome)
 }
@@ -505,13 +506,13 @@ pub fn apply_corrections(
     args: ProcessArgs,
     requests: &[CorrectionRequest],
 ) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
-    apply_corrections_inner(args, requests)
+    apply_corrections_inner(args, requests).map(|(outcome, _)| outcome)
 }
 
 fn apply_corrections_inner(
     args: ProcessArgs,
     requests: &[CorrectionRequest],
-) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+) -> Result<(CorrectionOutcome, Vec<CorrectionRequest>), Box<dyn std::error::Error>> {
     let mut requests = requests
         .iter()
         .map(validate_correction_request)
@@ -539,6 +540,12 @@ fn apply_corrections_inner(
         Err(error) => return Err(error.into()),
     };
     let mut corrections = read_speaker_corrections(&session)?;
+    let mut learning = prepare_correction_learning(&args, &session, &segments)?;
+    if let Some(learning) = learning.as_ref() {
+        for request in &mut requests {
+            request.speaker = learning.database.resolve_name(&request.speaker);
+        }
+    }
     let mut replaced = Vec::with_capacity(requests.len());
     for request in &requests {
         replaced.push(upsert_correction(
@@ -551,7 +558,6 @@ fn apply_corrections_inner(
             },
         ));
     }
-    let mut learning = prepare_correction_learning(&args, &session, &segments)?;
     let learning_updates = learning
         .as_ref()
         .map(|learning| {
@@ -614,19 +620,26 @@ fn apply_corrections_inner(
         }
     }
     let echo = correction_is_system_echo(&requests, &recognized, &corrections.corrections);
-    Ok(CorrectionOutcome {
-        learned,
-        forgotten,
-        learning_available,
-        echo,
-        proposals: Vec::new(),
-    })
+    Ok((
+        CorrectionOutcome {
+            learned,
+            forgotten,
+            learning_available,
+            echo,
+            proposals: Vec::new(),
+        },
+        requests,
+    ))
 }
 
 fn validate_correction_request(
     request: &CorrectionRequest,
 ) -> Result<CorrectionRequest, Box<dyn std::error::Error>> {
-    let speaker = request.speaker.trim();
+    let speaker = request
+        .speaker
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if speaker.is_empty() {
         return Err(
             io::Error::new(io::ErrorKind::InvalidInput, "speaker name cannot be empty").into(),
@@ -643,7 +656,7 @@ fn validate_correction_request(
         source: request.source,
         start_ms: request.start_ms,
         end_ms: request.end_ms,
-        speaker: speaker.to_owned(),
+        speaker,
     })
 }
 
@@ -905,7 +918,7 @@ fn load_correction_database(
         )
     })?;
     if value.get("format_version").is_none() {
-        let (database, _) = SpeakerDatabase::import_legacy(value, path)?;
+        let (database, _, _) = SpeakerDatabase::import_legacy(value, path)?;
         database.validate_identity(identity)?;
         return Ok((database, true));
     }
@@ -3297,6 +3310,109 @@ mod tests {
         let assignments: SpeakerAssignments =
             read_json(&session.speaker_assignments_path()).expect("read assignments");
         assert_eq!(assignments.assignments[0].speaker, None);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn correction_resolves_existing_spelling_for_lock_and_learning() {
+        let Some(models) = std::env::var_os("SINGSTONE_TEST_MODELS") else {
+            return;
+        };
+        let (root, session) = assignment_fixture("correction-existing-spelling", None);
+        let model = PathBuf::from(models).join("nemo_en_titanet_small.onnx");
+        let extractor = EmbeddingExtractor::new(&model, 1).expect("open embedding model");
+        let identity = database::identity(&model, extractor.dimension()).expect("model identity");
+        let database_path = root.join("speakers.json");
+        let mut database = SpeakerDatabase::empty(identity.clone());
+        database.speakers.insert("Laura".into(), Default::default());
+        database.save(&database_path).expect("write database");
+
+        jsonl::write_all_atomic(
+            &session.words_path(),
+            &[TimedWord {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 2_000,
+                text: "hello".into(),
+            }],
+        )
+        .expect("replace words");
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 2_000,
+                cluster: 7,
+            }],
+        )
+        .expect("replace diarization");
+        let mut assignments: SpeakerAssignments =
+            read_json(&session.speaker_assignments_path()).expect("read assignments");
+        assignments.provenance.diarization_sha256 =
+            models::sha256_file(&session.diarization_path()).expect("hash diarization");
+        write_json_atomic(&session.speaker_assignments_path(), &assignments)
+            .expect("update assignments");
+
+        let mut vector = vec![0.0; identity.dimension];
+        vector[0] = 1.0;
+        jsonl::write_all_atomic(
+            &session.embeddings_path(),
+            &[EmbeddingChunk {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 2_000,
+                cluster: 7,
+                embedding: vector,
+            }],
+        )
+        .expect("write cached embeddings");
+        write_json_atomic(
+            &session.embeddings_metadata_path(),
+            &EmbeddingsMetadata {
+                format_version: EMBEDDINGS_FORMAT_VERSION,
+                output_file: "embeddings.jsonl".into(),
+                output_sha256: models::sha256_file(&session.embeddings_path())
+                    .expect("hash embeddings"),
+                diarization_sha256: models::sha256_file(&session.diarization_path())
+                    .expect("hash diarization"),
+                mic_audio_sha256: None,
+                system_audio_sha256: None,
+                embedding_model_sha256: identity.sha256,
+                threads: 1,
+                window_ms: EMBEDDING_WINDOW_MS,
+                min_learn_ms: MIN_LEARN_MS,
+            },
+        )
+        .expect("write embeddings metadata");
+        let mut args = stage_process_args(session.dir.clone());
+        args.embedding_model = Some(model);
+        args.allow_unverified_models = true;
+        args.threads = Some(1);
+        args.speakers_db = Some(database_path.clone());
+
+        let outcome = correct_speaker(
+            args,
+            &CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 2_000,
+                speaker: "laura".into(),
+            },
+        )
+        .expect("correct speaker");
+
+        assert_eq!(outcome.learned, 1);
+        let corrections: SpeakerCorrections =
+            read_json(&session.speaker_corrections_path()).expect("read corrections");
+        assert_eq!(corrections.corrections[0].speaker, "Laura");
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read transcript");
+        assert_eq!(transcript[0].speaker, "Laura");
+        assert!(transcript[0].locked);
+        let database = SpeakerDatabase::load(&database_path).expect("read learned database");
+        assert_eq!(database.speakers["Laura"].embeddings.len(), 1);
+        assert!(!database.speakers.contains_key("laura"));
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

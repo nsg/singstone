@@ -8,6 +8,17 @@ use std::path::{Path, PathBuf};
 
 pub const FORMAT_VERSION: u32 = 2;
 
+pub fn canonical_name_key(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn normalized_name(name: &str) -> String {
+    name.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingModelIdentity {
     pub name: String,
@@ -53,7 +64,7 @@ impl SpeakerDatabase {
             )
         })?;
         if value.get("format_version").is_none() {
-            let (database, dropped) = Self::import_legacy(value, path)?;
+            let (database, dropped, merged) = Self::import_legacy(value, path)?;
             let backup = next_v1_backup_path(path)?;
             fs::rename(path, &backup)?;
             database.save(path)?;
@@ -63,7 +74,7 @@ impl SpeakerDatabase {
                 .map(|speaker| speaker.embeddings.len())
                 .sum();
             eprintln!(
-                "speaker database {} used the old format; backed it up to {} and imported {imported} voice sample(s) for {} speaker(s){}",
+                "speaker database {} used the old format; backed it up to {} and imported {imported} voice sample(s) for {} speaker(s){}{}",
                 path.display(),
                 backup.display(),
                 database.speakers.len(),
@@ -71,6 +82,11 @@ impl SpeakerDatabase {
                     String::new()
                 } else {
                     format!(", dropping {dropped} invalid vector(s)")
+                },
+                if merged == 0 {
+                    String::new()
+                } else {
+                    format!(", merged {merged} duplicate name(s)")
                 }
             );
             return Ok(database);
@@ -93,7 +109,11 @@ impl SpeakerDatabase {
             ));
         }
         database.validate_vectors(path)?;
+        let merged = database.merge_duplicate_names();
         database.refresh_centroids();
+        if merged > 0 {
+            database.save(path)?;
+        }
         Ok(database)
     }
 
@@ -102,7 +122,7 @@ impl SpeakerDatabase {
     pub(crate) fn import_legacy(
         value: serde_json::Value,
         path: &Path,
-    ) -> io::Result<(Self, usize)> {
+    ) -> io::Result<(Self, usize, usize)> {
         let legacy: LegacySpeakerDatabase = serde_json::from_value(value).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -115,8 +135,9 @@ impl SpeakerDatabase {
             speakers: legacy.speakers,
         };
         let dropped = database.drop_invalid_vectors();
+        let merged = database.merge_duplicate_names();
         database.refresh_centroids();
-        Ok((database, dropped))
+        Ok((database, dropped, merged))
     }
 
     pub fn load_checked(path: &Path, expected: &EmbeddingModelIdentity) -> io::Result<Self> {
@@ -156,6 +177,16 @@ impl SpeakerDatabase {
         ))
     }
 
+    pub fn resolve_name(&self, typed: &str) -> String {
+        let normalized = normalized_name(typed);
+        let key = canonical_name_key(&normalized);
+        self.speakers
+            .keys()
+            .find(|name| canonical_name_key(name) == key)
+            .cloned()
+            .unwrap_or(normalized)
+    }
+
     pub fn forget_matching(&mut self, name: &str, embedding: &[f32], min_similarity: f32) -> usize {
         let Some(record) = self.speakers.get_mut(name) else {
             return 0;
@@ -173,6 +204,46 @@ impl SpeakerDatabase {
         for speaker in self.speakers.values_mut() {
             speaker.centroid = crate::speaker::embedding::mean_normalized(&speaker.embeddings);
         }
+    }
+
+    fn merge_duplicate_names(&mut self) -> usize {
+        let mut groups = BTreeMap::<String, Vec<(String, SpeakerRecord)>>::new();
+        for (name, record) in std::mem::take(&mut self.speakers) {
+            groups
+                .entry(canonical_name_key(&name))
+                .or_default()
+                .push((name, record));
+        }
+
+        let mut merged = 0;
+        for records in groups.into_values() {
+            let winner = records
+                .iter()
+                .enumerate()
+                .fold(0, |winner, (index, (_, record))| {
+                    if record.embeddings.len() > records[winner].1.embeddings.len() {
+                        index
+                    } else {
+                        winner
+                    }
+                });
+            let mut records = records;
+            let (display_name, mut record) = records.remove(winner);
+            merged += records.len();
+            for (_, duplicate) in records {
+                for vector in duplicate.embeddings {
+                    if record.embeddings.iter().any(|existing| {
+                        crate::speaker::embedding::cosine(existing, &vector)
+                            .is_some_and(|similarity| similarity >= 0.999)
+                    }) {
+                        continue;
+                    }
+                    record.embeddings.push(vector);
+                }
+            }
+            self.speakers.insert(display_name, record);
+        }
+        merged
     }
 
     fn drop_invalid_vectors(&mut self) -> usize {
@@ -382,6 +453,64 @@ mod tests {
             b"existing backup"
         );
         fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn load_merges_duplicate_names_with_larger_spelling_and_deduplicates_vectors() {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-speaker-db-duplicate-names-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).expect("create fixture directory");
+        let path = root.join("speakers.json");
+        fs::write(
+            &path,
+            r#"{
+  "format_version":2,
+  "embedding_model":{"name":"model","sha256":"abc","dimension":3},
+  "speakers":{
+    " Laura ":{"embeddings":[[0.0,0.0,1.0]]},
+    "Laura":{"embeddings":[[1.0,0.0,0.0],[0.0,1.0,0.0]]},
+    "laura":{"embeddings":[[1.0,0.0,0.0]]}
+  }
+}"#,
+        )
+        .expect("write duplicate database");
+
+        let database = SpeakerDatabase::load(&path).expect("load duplicate database");
+
+        assert_eq!(database.speakers.len(), 1);
+        assert_eq!(
+            database.speakers["Laura"].embeddings,
+            vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0]
+            ]
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read merged database"))
+                .expect("parse merged database");
+        assert_eq!(
+            saved["speakers"]
+                .as_object()
+                .expect("speaker object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["Laura"]
+        );
+        fs::remove_dir_all(root).expect("remove fixture directory");
+    }
+
+    #[test]
+    fn resolve_name_reuses_existing_spelling() {
+        let mut database = SpeakerDatabase::empty(identity_with("abc", 2));
+        database
+            .speakers
+            .insert("Laura Mc Kay".into(), SpeakerRecord::default());
+
+        assert_eq!(database.resolve_name("  laura\tMc  KAY "), "Laura Mc Kay");
     }
 
     #[test]

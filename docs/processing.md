@@ -265,6 +265,9 @@ The version 2 speaker database stores only a model identity and unit-length
 vectors ("dots") for each name. Dot count is the weight; dots have no dates,
 provenance, or serialized weights. A normalized mean centroid is computed at
 load time for candidate prefiltering but is not written to disk.
+Names that differ only by Unicode case or whitespace are merged when the
+database is loaded, keeping the spelling from the record with the most dots.
+Manual corrections reuse that stored spelling for matching names.
 
 ```json
 {

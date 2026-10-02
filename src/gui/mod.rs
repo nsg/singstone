@@ -2065,7 +2065,7 @@ fn wire_processing(
             let dialog = adw::AlertDialog::new(
                 Some("Reprocess this recording?"),
                 Some(
-                    "This replaces the transcript, intermediate processing files, and automatic speaker matches. Recorded audio and your confirmed speaker corrections are preserved.",
+                    "This replaces the transcript, intermediate processing files, and automatic speaker matches. Recorded audio is unchanged, and speaker names you confirmed are kept.",
                 ),
             );
             dialog.add_responses(&[("cancel", "Cancel"), ("reprocess", "Reprocess")]);
@@ -2988,7 +2988,7 @@ impl SessionDetail {
         self.process_button
             .set_label(if processed { "Reprocess" } else { "Process" });
         self.process_button.set_tooltip_text(Some(if processed {
-            "Replace the transcript, intermediate files, and speaker assignments. Recorded audio is preserved."
+            "Replace the transcript, intermediate files, and automatic speaker matches. Confirmed names are kept."
         } else {
             "Process this recording"
         }));
@@ -3256,6 +3256,15 @@ fn transcript_row(
         speaker.add_css_class("warning-text");
     }
     head.append(&speaker);
+    if utterance.locked {
+        let lock = gtk::Image::from_icon_name("changes-prevent-symbolic");
+        lock.set_pixel_size(14);
+        lock.set_tooltip_text(Some("Confirmed by you"));
+        lock.update_property(&[gtk::accessible::Property::Label("Confirmed by you")]);
+        lock.add_css_class("dim-label");
+        lock.set_valign(gtk::Align::Center);
+        head.append(&lock);
+    }
     let timestamp = gtk::Label::new(Some(&format_timestamp(utterance.start_ms)));
     timestamp.add_css_class("dim-label");
     timestamp.add_css_class("caption");
@@ -3373,16 +3382,20 @@ fn is_anonymous_speaker(utterance: &Utterance) -> bool {
 }
 
 fn has_assignable_id(utterance: &Utterance) -> bool {
-    utterance
-        .speaker_id
-        .rsplit_once('_')
-        .is_some_and(|(prefix, cluster)| {
-            matches!(prefix, "mic" | "spk") && cluster.parse::<u32>().is_ok()
-        })
-        || utterance
-            .speaker_id
-            .strip_prefix("speaker-")
-            .is_some_and(|cluster| cluster.parse::<u32>().is_ok())
+    parse_assignable_id(&utterance.speaker_id).is_some()
+}
+
+fn parse_assignable_id(value: &str) -> Option<(AudioSource, u32)> {
+    if let Some(cluster) = value.strip_prefix("speaker-") {
+        return Some((AudioSource::System, cluster.parse().ok()?));
+    }
+    let (prefix, cluster) = value.rsplit_once('_')?;
+    let source = match prefix {
+        "mic" => AudioSource::Mic,
+        "spk" => AudioSource::System,
+        _ => return None,
+    };
+    Some((source, cluster.parse().ok()?))
 }
 
 fn frequent_speakers(utterances: &[Utterance], limit: usize) -> Vec<String> {
@@ -3416,13 +3429,13 @@ fn show_assignment_dialog(
         (
             "Change this speaker",
             format!(
-                "Currently {current}. The new name updates every line of this voice in the transcript. When the local voice model is available, Singstone learns the voice under the new name and forgets it under the old one."
+                "Currently {current}. The new name applies to this line only. Singstone will suggest later lines of the same voice for you to confirm. When the local voice model is available, it also learns the voice under the new name."
             ),
         )
     } else {
         (
             "Who is this speaker?",
-            "The name updates this transcript. When the local voice model is available, Singstone also learns this voice for future meetings.".to_owned(),
+            "The name applies to this line only. Singstone will suggest later lines of the same voice for you to confirm. When the local voice model is available, it also learns this voice for future meetings.".to_owned(),
         )
     };
     let dialog = adw::AlertDialog::new(Some(heading), Some(&body));
@@ -3485,9 +3498,9 @@ fn show_assignment_dialog(
     content.append(&entry);
     dialog.set_extra_child(Some(&content));
     let response = if current.is_some() {
-        "Reassign and learn"
+        "Reassign"
     } else {
-        "Assign and learn"
+        "Assign"
     };
     dialog.add_responses(&[("cancel", "Cancel"), ("assign", response)]);
     dialog.set_default_response(Some("assign"));
@@ -3552,6 +3565,7 @@ fn start_assignment(
     progress.set_child(Some(&body));
     progress.present();
 
+    let assigned_name = name.clone();
     let result = Arc::new(Mutex::new(None));
     let thread_result = result.clone();
     std::thread::spawn(move || {
@@ -3581,37 +3595,219 @@ fn start_assignment(
         progress.close();
         match result {
             Ok(outcome) => {
-                let selected_path = detail.selected.borrow().clone();
-                if let Some(path) = selected_path {
-                    let _ = detail.load(&path);
-                }
-                if !outcome.learning_available || outcome.echo {
-                    let body = match (outcome.learning_available, outcome.echo) {
-                        (false, true) => {
-                            "The transcript was updated, but the voice model was unavailable, so this name applies to this session only. The line was marked as echo because the same speaker is on the system track."
-                        }
-                        (false, false) => {
-                            "The transcript was updated. The voice model was unavailable, so this name applies to this session only."
-                        }
-                        (true, true) => {
-                            "The line was marked as echo because the same speaker is on the system track."
-                        }
-                        (true, false) => unreachable!(),
-                    };
-                    let heading = if outcome.echo {
-                        "Speaker assigned as echo"
-                    } else {
-                        "Speaker assigned"
-                    };
-                    let notice = adw::AlertDialog::new(Some(heading), Some(body));
-                    notice.add_response("close", "Close");
-                    notice.present(Some(&detail.window));
+                if outcome.proposals.is_empty() {
+                    reload_session(&detail);
+                    show_assignment_notice(&detail, outcome.learning_available, outcome.echo);
+                } else {
+                    show_proposal_dialog(&detail, &assigned_name, outcome);
                 }
             }
             Err(error) => show_error(&detail.window, "Could not assign speaker", &error),
         }
         glib::ControlFlow::Break
     });
+}
+
+fn show_proposal_dialog(
+    detail: &SessionDetail,
+    speaker: &str,
+    outcome: process::CorrectionOutcome,
+) {
+    let dialog = adw::AlertDialog::new(
+        Some("Later lines of this voice"),
+        Some(&format!(
+            "Select the later lines that should also be confirmed as {speaker}."
+        )),
+    );
+    let scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(160)
+        .max_content_height(420)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    rows.set_margin_top(6);
+    rows.set_margin_bottom(6);
+    rows.set_margin_start(6);
+    rows.set_margin_end(6);
+    let choices = outcome
+        .proposals
+        .iter()
+        .map(|proposal| {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+            let selected = gtk::CheckButton::new();
+            selected.set_active(proposal.proposed);
+            selected.set_valign(gtk::Align::Start);
+            row.append(&selected);
+
+            let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            labels.set_hexpand(true);
+            let summary = gtk::Label::new(Some(&format!(
+                "{}–{}  {}",
+                format_timestamp(proposal.start_ms),
+                format_timestamp(proposal.end_ms),
+                proposal_preview(&proposal.text)
+            )));
+            summary.set_xalign(0.0);
+            summary.set_wrap(true);
+            labels.append(&summary);
+            let current = proposal.current_speaker.as_deref().unwrap_or("unnamed");
+            let old_score = proposal
+                .score_old
+                .map(|score| format!("{score:.2}"))
+                .unwrap_or_else(|| "n/a".to_owned());
+            let scores = gtk::Label::new(Some(&format!(
+                "Current: {current} · new {new:.2} · old {old_score}",
+                new = proposal.score_new,
+            )));
+            scores.set_xalign(0.0);
+            scores.add_css_class("dim-label");
+            scores.add_css_class("caption");
+            labels.append(&scores);
+            row.append(&labels);
+            rows.append(&row);
+            (proposal.clone(), selected)
+        })
+        .collect::<Vec<_>>();
+    scroll.set_child(Some(&rows));
+    dialog.set_extra_child(Some(&scroll));
+    dialog.add_responses(&[("skip", "Skip"), ("apply", "Apply selected")]);
+    dialog.set_default_response(Some("apply"));
+    dialog.set_close_response("skip");
+    dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+
+    let detail_for_skip = detail.clone();
+    let learning_available = outcome.learning_available;
+    let echo = outcome.echo;
+    dialog.connect_response(Some("skip"), move |_, _| {
+        reload_session(&detail_for_skip);
+        show_assignment_notice(&detail_for_skip, learning_available, echo);
+    });
+    let detail_for_apply = detail.clone();
+    let speaker = speaker.to_owned();
+    dialog.connect_response(Some("apply"), move |_, _| {
+        let mut requests = choices
+            .iter()
+            .filter(|(_, selected)| selected.is_active())
+            .map(|(proposal, _)| process::CorrectionRequest {
+                source: proposal.source,
+                start_ms: proposal.start_ms,
+                end_ms: proposal.end_ms,
+                speaker: speaker.clone(),
+            })
+            .collect::<Vec<_>>();
+        requests.sort_by_key(|request| (request.start_ms, request.end_ms));
+        if requests.is_empty() {
+            reload_session(&detail_for_apply);
+            show_assignment_notice(&detail_for_apply, learning_available, echo);
+        } else {
+            start_proposal_application(&detail_for_apply, requests, learning_available, echo);
+        }
+    });
+    dialog.present(Some(&detail.window));
+}
+
+fn start_proposal_application(
+    detail: &SessionDetail,
+    requests: Vec<process::CorrectionRequest>,
+    initial_learning_available: bool,
+    initial_echo: bool,
+) {
+    let Some(session) = detail.selected.borrow().clone() else {
+        return;
+    };
+    let progress = gtk::Window::builder()
+        .title("Applying speaker corrections")
+        .transient_for(&detail.window)
+        .modal(true)
+        .deletable(false)
+        .default_width(360)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_top(24);
+    body.set_margin_bottom(24);
+    body.set_margin_start(24);
+    body.set_margin_end(24);
+    let spinner = gtk::Spinner::new();
+    spinner.set_spinning(true);
+    body.append(&spinner);
+    let label = gtk::Label::new(Some("Applying selected speaker corrections…"));
+    label.set_wrap(true);
+    body.append(&label);
+    progress.set_child(Some(&body));
+    progress.present();
+
+    let result = Arc::new(Mutex::new(None));
+    let thread_result = result.clone();
+    std::thread::spawn(move || {
+        let value = process::apply_corrections(ProcessArgs::for_session(session), &requests)
+            .map_err(|error| error.to_string());
+        *thread_result.lock().expect("speaker proposal result mutex") = Some(value);
+    });
+    let detail = detail.clone();
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        let Some(result) = result.lock().expect("speaker proposal result mutex").take() else {
+            return glib::ControlFlow::Continue;
+        };
+        progress.close();
+        reload_session(&detail);
+        match result {
+            Ok(outcome) => show_assignment_notice(
+                &detail,
+                initial_learning_available && outcome.learning_available,
+                initial_echo || outcome.echo,
+            ),
+            Err(error) => show_error(
+                &detail.window,
+                "Could not apply speaker corrections",
+                &error,
+            ),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn reload_session(detail: &SessionDetail) {
+    let selected = detail.selected.borrow().clone();
+    if let Some(path) = selected {
+        let _ = detail.load(&path);
+    }
+}
+
+fn show_assignment_notice(detail: &SessionDetail, learning_available: bool, echo: bool) {
+    if learning_available && !echo {
+        return;
+    }
+    let body = match (learning_available, echo) {
+        (false, true) => {
+            "The line is locked with this name, but its voice could not be learned. It was recognized as an echo of a remote participant and is shown as echo."
+        }
+        (false, false) => "The line is locked with this name, but its voice could not be learned.",
+        (true, true) => {
+            "This line was recognized as an echo of a remote participant and is shown as echo."
+        }
+        (true, false) => unreachable!(),
+    };
+    let heading = if echo {
+        "Speaker assigned as echo"
+    } else {
+        "Speaker assigned"
+    };
+    let notice = adw::AlertDialog::new(Some(heading), Some(body));
+    notice.add_response("close", "Close");
+    notice.present(Some(&detail.window));
+}
+
+fn proposal_preview(text: &str) -> String {
+    const LIMIT: usize = 60;
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let preview = chars.by_ref().take(LIMIT).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 fn screenshot_card(path: &Path, time_ms: u64) -> gtk::Box {
@@ -3828,6 +4024,28 @@ mod tests {
             frequent_speakers(&utterances, 3),
             vec!["Alice", "Bob", "Carol"]
         );
+    }
+
+    #[test]
+    fn assignable_ids_match_correction_parser_formats() {
+        assert_eq!(parse_assignable_id("mic_3"), Some((AudioSource::Mic, 3)));
+        assert_eq!(
+            parse_assignable_id("spk_42"),
+            Some((AudioSource::System, 42))
+        );
+        assert_eq!(
+            parse_assignable_id("speaker-2"),
+            Some((AudioSource::System, 2))
+        );
+        assert_eq!(parse_assignable_id("spk_nope"), None);
+        assert_eq!(parse_assignable_id("other_1"), None);
+    }
+
+    #[test]
+    fn proposal_previews_are_unicode_safe() {
+        assert_eq!(proposal_preview("  short line  "), "short line");
+        let long = "é".repeat(61);
+        assert_eq!(proposal_preview(&long), format!("{}…", "é".repeat(60)));
     }
 
     #[test]

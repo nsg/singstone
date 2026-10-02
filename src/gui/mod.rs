@@ -2065,7 +2065,7 @@ fn wire_processing(
             let dialog = adw::AlertDialog::new(
                 Some("Reprocess this recording?"),
                 Some(
-                    "This replaces the transcript, intermediate processing files, and automatic speaker matches. Recorded audio is unchanged, and speaker names you confirmed are kept.",
+                    "This replaces the transcript, intermediate processing files, and automatic speaker matches. Recorded audio is unchanged, and speaker names you confirmed in this version are kept. Names assigned with an older version are replaced.",
                 ),
             );
             dialog.add_responses(&[("cancel", "Cancel"), ("reprocess", "Reprocess")]);

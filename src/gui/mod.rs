@@ -9,7 +9,7 @@ use crate::meeting::{self, Attendees, MeetingDetails};
 use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
 use crate::model_setup;
 use crate::session::Session;
-use crate::speaker::database::{self, SpeakerDatabase};
+use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
 use crate::transcription::{TranscriptionProgress, backend};
 use crate::types::{
     AudioSource, EchoEvidence, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance,
@@ -3465,37 +3465,16 @@ fn show_assignment_dialog(
         }
         content.append(&meeting);
     }
-    let database_path = std::env::var_os("SINGSTONE_SPEAKERS_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(database::default_path);
-    if let Ok(database) = SpeakerDatabase::load(&database_path)
-        && !database.speakers.is_empty()
-    {
-        let names = database
-            .speakers
-            .keys()
-            .filter(|name| current != Some(name.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
-        if !refs.is_empty() {
-            let choices = gtk::DropDown::from_strings(&refs);
-            choices.set_tooltip_text(Some("Choose a learned speaker"));
-            if current.is_some() {
-                choices.set_selected(gtk::INVALID_LIST_POSITION);
-            } else if let Some(first) = names.first() {
-                entry.set_text(first);
-            }
-            let entry_for_choice = entry.clone();
-            choices.connect_selected_notify(move |choices| {
-                if let Some(value) = choices.selected_item().and_downcast::<gtk::StringObject>() {
-                    entry_for_choice.set_text(&value.string());
-                }
-            });
-            content.append(&choices);
-        }
-    }
     content.append(&entry);
+
+    let suggestions = gtk::ListBox::new();
+    suggestions.add_css_class("boxed-list");
+    suggestions.set_activate_on_single_click(true);
+    suggestions.set_selection_mode(gtk::SelectionMode::Single);
+    let suggestion_names = assignment_suggestion_names(detail);
+    update_assignment_suggestions(&suggestions, &suggestion_names, "");
+    content.append(&suggestions);
+
     dialog.set_extra_child(Some(&content));
     let response = if current.is_some() {
         "Reassign"
@@ -3506,32 +3485,226 @@ fn show_assignment_dialog(
     dialog.set_default_response(Some("assign"));
     dialog.set_close_response("cancel");
     dialog.set_response_appearance("assign", adw::ResponseAppearance::Suggested);
+    dialog.set_response_enabled("assign", false);
+
+    let suggestions_for_change = suggestions.clone();
+    let suggestion_names_for_change = suggestion_names.clone();
+    let dialog_for_change = dialog.downgrade();
+    entry.connect_changed(move |entry| {
+        suggestions_for_change.unselect_all();
+        update_assignment_suggestions(
+            &suggestions_for_change,
+            &suggestion_names_for_change,
+            &entry.text(),
+        );
+        if let Some(dialog) = dialog_for_change.upgrade() {
+            dialog.set_response_enabled("assign", !entry.text().trim().is_empty());
+        }
+    });
+
+    let entry_keys = gtk::EventControllerKey::new();
+    let suggestions_for_entry_keys = suggestions.clone();
+    entry_keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gdk::Key::Down
+            && let Some(row) = suggestions_for_entry_keys.row_at_index(0)
+        {
+            suggestions_for_entry_keys.select_row(Some(&row));
+            row.grab_focus();
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    entry.add_controller(entry_keys);
+
+    let list_keys = gtk::EventControllerKey::new();
+    let suggestions_for_keys = suggestions.clone();
+    let entry_for_keys = entry.clone();
+    let dialog_for_keys = dialog.downgrade();
+    let detail_for_keys = detail.clone();
+    let current_for_keys = current.map(str::to_owned);
+    list_keys.connect_key_pressed(move |_, key, _, _| {
+        let selected = suggestions_for_keys.selected_row();
+        if key == gdk::Key::Up {
+            if selected.as_ref().is_some_and(|row| row.index() == 0) {
+                suggestions_for_keys.unselect_all();
+                entry_for_keys.grab_focus();
+            } else if let Some(row) = selected
+                && let Some(previous) = suggestions_for_keys.row_at_index(row.index() - 1)
+            {
+                suggestions_for_keys.select_row(Some(&previous));
+                previous.grab_focus();
+            }
+            return glib::Propagation::Stop;
+        }
+        if key == gdk::Key::Down {
+            if let Some(row) = selected
+                && let Some(next) = suggestions_for_keys.row_at_index(row.index() + 1)
+            {
+                suggestions_for_keys.select_row(Some(&next));
+                next.grab_focus();
+            }
+            return glib::Propagation::Stop;
+        }
+        if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter)
+            && let Some(row) = selected
+            && let Some(name) = assignment_suggestion_name(&row)
+        {
+            entry_for_keys.set_text(&name);
+            if let Some(dialog) = dialog_for_keys.upgrade() {
+                submit_assignment(
+                    &dialog,
+                    &detail_for_keys,
+                    source,
+                    start_ms,
+                    end_ms,
+                    current_for_keys.as_deref(),
+                    name,
+                );
+            }
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    suggestions.add_controller(list_keys);
+
+    let entry_for_row = entry.clone();
+    let dialog_for_row = dialog.downgrade();
+    let detail_for_row = detail.clone();
+    let current_for_row = current.map(str::to_owned);
+    suggestions.connect_row_activated(move |_, row| {
+        let Some(name) = assignment_suggestion_name(row) else {
+            return;
+        };
+        entry_for_row.set_text(&name);
+        if let Some(dialog) = dialog_for_row.upgrade() {
+            submit_assignment(
+                &dialog,
+                &detail_for_row,
+                source,
+                start_ms,
+                end_ms,
+                current_for_row.as_deref(),
+                name,
+            );
+        }
+    });
+
     let detail_for_response = detail.clone();
     let current = current.map(str::to_owned);
-    dialog.connect_response(Some("assign"), move |_, _| {
-        let name = entry.text().trim().to_owned();
-        if name.is_empty() {
-            show_error(
-                &detail_for_response.window,
-                "Speaker name required",
-                "Enter or choose a name for this voice.",
-            );
-            return;
-        }
-        if current
-            .as_deref()
-            .is_some_and(|current| current.trim() == name)
-        {
-            show_error(
-                &detail_for_response.window,
-                "Same name",
-                "Choose a different name to reassign this voice.",
-            );
-            return;
-        }
-        start_assignment(&detail_for_response, source, start_ms, end_ms, name);
+    let entry_for_response = entry.clone();
+    dialog.connect_response(Some("assign"), move |dialog, _| {
+        submit_assignment(
+            dialog,
+            &detail_for_response,
+            source,
+            start_ms,
+            end_ms,
+            current.as_deref(),
+            entry_for_response.text().to_string(),
+        );
     });
     dialog.present(Some(&detail.window));
+    entry.grab_focus();
+}
+
+fn assignment_suggestion_names(detail: &SessionDetail) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = BTreeMap::new();
+    let database_path = std::env::var_os("SINGSTONE_SPEAKERS_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(database::default_path);
+    if let Ok(database) = SpeakerDatabase::load(&database_path) {
+        for name in database.speakers.into_keys() {
+            if seen.insert(canonical_name_key(&name), ()).is_none() {
+                names.push(name);
+            }
+        }
+    }
+    if let Some(session_dir) = detail.selected.borrow().as_ref()
+        && let Ok(session) = Session::open(session_dir)
+        && let Ok(utterances) = jsonl::read_all::<Utterance>(&session.transcript_path())
+    {
+        for utterance in utterances {
+            if is_anonymous_speaker(&utterance) {
+                continue;
+            }
+            let name = utterance.speaker;
+            if seen.insert(canonical_name_key(&name), ()).is_none() {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+fn update_assignment_suggestions(list: &gtk::ListBox, names: &[String], typed: &str) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    let typed_key = canonical_name_key(typed);
+    let mut matches = names
+        .iter()
+        .filter_map(|name| {
+            let key = canonical_name_key(name);
+            let rank = if key == typed_key {
+                0
+            } else if key.starts_with(&typed_key) {
+                1
+            } else if key.contains(&typed_key) {
+                2
+            } else {
+                return None;
+            };
+            Some((rank, name))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(rank, _)| *rank);
+    for (_, name) in matches.into_iter().take(8) {
+        let label = gtk::Label::new(Some(name));
+        label.set_xalign(0.0);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        label.set_margin_start(8);
+        label.set_margin_end(8);
+        list.append(&label);
+    }
+    list.set_visible(list.first_child().is_some());
+}
+
+fn assignment_suggestion_name(row: &gtk::ListBoxRow) -> Option<String> {
+    row.child()?
+        .downcast::<gtk::Label>()
+        .ok()
+        .map(|label| label.text().to_string())
+}
+
+fn submit_assignment(
+    dialog: &adw::AlertDialog,
+    detail: &SessionDetail,
+    source: AudioSource,
+    start_ms: u64,
+    end_ms: u64,
+    current: Option<&str>,
+    name: String,
+) {
+    if name.trim().is_empty() {
+        show_error(
+            &detail.window,
+            "Speaker name required",
+            "Enter or choose a name for this voice.",
+        );
+        return;
+    }
+    if current.is_some_and(|current| canonical_name_key(current) == canonical_name_key(&name)) {
+        show_error(
+            &detail.window,
+            "Same name",
+            "Choose a different name to reassign this voice.",
+        );
+        return;
+    }
+    dialog.close();
+    start_assignment(detail, source, start_ms, end_ms, name);
 }
 
 fn start_assignment(
@@ -3599,7 +3772,13 @@ fn start_assignment(
                     reload_session(&detail);
                     show_assignment_notice(&detail, outcome.learning_available, outcome.echo);
                 } else {
-                    show_proposal_dialog(&detail, &assigned_name, outcome);
+                    let database_path = std::env::var_os("SINGSTONE_SPEAKERS_DB")
+                        .map(PathBuf::from)
+                        .unwrap_or_else(database::default_path);
+                    let display_name = SpeakerDatabase::load(&database_path)
+                        .map(|database| database.resolve_name(&assigned_name))
+                        .unwrap_or_else(|_| assigned_name.clone());
+                    show_proposal_dialog(&detail, &display_name, outcome);
                 }
             }
             Err(error) => show_error(&detail.window, "Could not assign speaker", &error),

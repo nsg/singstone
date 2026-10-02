@@ -41,10 +41,10 @@ fn main() -> ExitCode {
         cli::Command::Transcribe(args) => merge::process::run_transcribe(args),
         cli::Command::Diarize(args) => merge::process::run_diarize(args),
         cli::Command::Recognize(args) => merge::process::run_recognize(args),
+        cli::Command::Correct(args) => merge::process::run_correct(args),
         cli::Command::Render(args) => merge::process::run_render(args),
         cli::Command::Archive(args) => audio::archive::run(args),
-        cli::Command::Enroll(args) => speaker::enroll::run(args),
-        cli::Command::Speakers(args) => speaker::enroll::list(args),
+        cli::Command::Speakers(args) => speaker::speakers::list(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

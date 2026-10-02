@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const FORMAT_VERSION: u32 = 1;
+pub const DEFAULT_SPEAKER_THRESHOLD: f32 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,6 +51,17 @@ pub struct SpeakerSegment {
     pub cluster: u32,
 }
 
+/// One line of `embeddings.jsonl`: a fixed-duration voice sample derived from
+/// one diarization segment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddingChunk {
+    pub source: AudioSource,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub cluster: u32,
+    pub embedding: Vec<f32>,
+}
+
 /// One cluster's recognition diagnostics in `speaker-assignments.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerAssignment {
@@ -85,12 +97,27 @@ pub struct SpeakerAssignments {
     pub assignments: Vec<SpeakerAssignment>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerCorrection {
+    pub source: AudioSource,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub speaker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerCorrections {
+    pub format_version: u32,
+    pub corrections: Vec<SpeakerCorrection>,
+}
+
 /// One line of `transcript.jsonl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EchoEvidence {
     RemoteAttendee,
     LocalRoster,
+    SystemTrackSpeaker,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,8 +128,14 @@ pub struct Utterance {
     pub speaker_id: String,
     pub speaker: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub echo: Option<EchoEvidence>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// One line of `screenshots.jsonl`.

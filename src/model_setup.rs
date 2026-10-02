@@ -149,7 +149,7 @@ fn required_default_models<'a>(
             requested.push(("speaker-embedding", &args.embedding_model));
         }
         Command::Recognize(args) => requested.push(("speaker-embedding", &args.embedding_model)),
-        Command::Enroll(args) => requested.push(("speaker-embedding", &args.embedding_model)),
+        Command::Correct(args) => requested.push(("speaker-embedding", &args.embedding_model)),
         _ => {}
     }
     requested

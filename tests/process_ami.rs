@@ -1,13 +1,11 @@
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const RATE: usize = 16_000;
 
 #[derive(Debug, Deserialize)]
 struct Word {
@@ -30,8 +28,32 @@ struct Utterance {
     start_ms: u64,
     end_ms: u64,
     source: String,
+    speaker_id: String,
     speaker: String,
     text: String,
+    #[serde(default)]
+    locked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingChunk {
+    source: String,
+    start_ms: u64,
+    end_ms: u64,
+    cluster: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpeakerAssignments {
+    assignments: Vec<SpeakerAssignment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpeakerAssignment {
+    source: String,
+    cluster: u32,
+    best_candidate: Option<String>,
+    speaker: Option<String>,
 }
 
 fn configured() -> Option<(PathBuf, PathBuf)> {
@@ -84,7 +106,7 @@ fn processes_ami_with_timed_words_and_diarization() {
     );
     assert!(utterances.iter().any(|utterance| {
         utterance.source == "mic"
-            && utterance.speaker == "Me"
+            && utterance.speaker_id.starts_with("mic_")
             && (5_000..=7_000).contains(&utterance.start_ms)
     }));
 
@@ -133,64 +155,152 @@ fn processes_ami_with_timed_words_and_diarization() {
 }
 
 #[test]
-fn enrollment_names_david_from_disjoint_audio() {
+fn corrections_learn_and_recognize_ami_speaker() {
     let Some((models, samples)) = configured() else {
         eprintln!("skipped: SINGSTONE_TEST_MODELS and SINGSTONE_TEST_SAMPLES are required");
         return;
     };
-    let enrollment = unique_dir("singstone-enroll-ami").expect("create enrollment directory");
-    let sample_path = enrollment.join("david.f32le");
-    make_enrollment_sample(&samples, &sample_path).expect("make enrollment sample");
-    let database = enrollment.join("speakers.json");
-    let status = Command::new(env!("CARGO_BIN_EXE_singstone"))
-        .args(["enroll", "David"])
-        .arg(&sample_path)
-        .arg("--embedding-model")
-        .arg(models.join("nemo_en_titanet_small.onnx"))
-        .arg("--speakers-db")
-        .arg(&database)
-        .arg("--allow-unverified-models")
-        .status()
-        .expect("run enroll");
-    assert!(status.success());
+    let base = process_fixture().expect("process fixture");
+    let root = unique_dir("singstone-correct-ami").expect("create correction directory");
+    let session = root.join("session");
+    copy_dir(&base, &session).expect("copy processed session");
+    let database = root.join("speakers.json");
 
-    let session = enrollment.join("session");
-    copy_dir(&samples.join("session-ami-3min"), &session).expect("copy session");
-    run_process(&session, &models, Some(&database)).expect("process enrolled fixture");
+    assert!(session.join("embeddings.jsonl").is_file());
+    assert!(session.join("embeddings.meta.json").is_file());
+    assert!(session.join("speaker-assignments.json").is_file());
+    let chunks: Vec<EmbeddingChunk> =
+        read_jsonl(&session.join("embeddings.jsonl")).expect("read embeddings");
+    assert!(!chunks.is_empty());
     let utterances: Vec<Utterance> =
         read_jsonl(&session.join("transcript.jsonl")).expect("read transcript");
-    let david = utterances
-        .iter()
-        .filter(|utterance| utterance.speaker == "David")
-        .collect::<Vec<_>>();
-    assert!(!david.is_empty(), "no utterance was recognized as David");
-    let speaker_a = ground_truth_segments(&samples, "A", 70.0).expect("read speaker A segments");
-    let david_ms: u64 = david
-        .iter()
-        .map(|utterance| utterance.end_ms - utterance.start_ms)
-        .sum();
-    let overlap_ms: u64 = david
-        .iter()
-        .map(|utterance| {
-            speaker_a
-                .iter()
-                .map(|(start, end)| {
-                    utterance
-                        .end_ms
-                        .min(*end)
-                        .saturating_sub(utterance.start_ms.max(*start))
-                })
-                .sum::<u64>()
+    let truth = ['A', 'B', 'C', 'D']
+        .into_iter()
+        .map(|speaker| {
+            ground_truth_segments(&samples, &speaker.to_string(), 70.0)
+                .map(|segments| (speaker, segments))
         })
-        .sum();
-    eprintln!(
-        "David: {} utterances, {david_ms} ms, {overlap_ms} ms inside speaker A ground truth",
-        david.len()
+        .collect::<io::Result<BTreeMap<_, _>>>()
+        .expect("read ground truth");
+    let (target, truth_speaker, truth_overlap) =
+        correction_target(&utterances, &chunks, &truth).expect("eligible correction target");
+    let cluster = target
+        .speaker_id
+        .strip_prefix("spk_")
+        .expect("system cluster id")
+        .parse::<u32>()
+        .expect("numeric cluster");
+    let temporary_name = "Temporary speaker";
+    let learned_name = format!("AMI {truth_speaker}");
+
+    let first = run_correct(&session, &models, &database, target, temporary_name)
+        .expect("run first correction");
+    assert_eq!(first["learning_available"], true);
+    assert!(first["learned"].as_u64().is_some_and(|count| count > 0));
+    let corrected: Vec<Utterance> =
+        read_jsonl(&session.join("transcript.jsonl")).expect("read corrected transcript");
+    assert!(corrected.iter().any(|utterance| {
+        utterance.source == target.source
+            && utterance.start_ms == target.start_ms
+            && utterance.end_ms == target.end_ms
+            && utterance.speaker == temporary_name
+            && utterance.locked
+    }));
+
+    let second = run_correct(&session, &models, &database, target, &learned_name)
+        .expect("run replacement correction");
+    assert!(second["learned"].as_u64().is_some_and(|count| count > 0));
+    assert!(second["forgotten"].as_u64().is_some_and(|count| count > 0));
+    let database_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&database).expect("read speaker database"))
+            .expect("parse speaker database");
+    assert_eq!(database_json["format_version"], 2);
+    assert_eq!(
+        database_json["speakers"][temporary_name]["embeddings"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
     );
     assert!(
-        overlap_ms * 100 >= david_ms * 60,
-        "utterances named David mostly fall outside speaker A's ground truth"
+        database_json["speakers"][&learned_name]["embeddings"]
+            .as_array()
+            .is_some_and(|dots| !dots.is_empty())
     );
+
+    run_recognize(&session, &models, &database).expect("recognize learned speaker");
+    run_render(&session).expect("render recognized transcript");
+    let assignments: SpeakerAssignments = serde_json::from_slice(
+        &fs::read(session.join("speaker-assignments.json")).expect("read assignments"),
+    )
+    .expect("parse assignments");
+    let assignment = assignments
+        .assignments
+        .iter()
+        .find(|assignment| assignment.source == "system" && assignment.cluster == cluster)
+        .expect("corrected cluster assignment");
+    assert_eq!(
+        assignment.best_candidate.as_deref(),
+        Some(learned_name.as_str())
+    );
+    assert_eq!(assignment.speaker.as_deref(), Some(learned_name.as_str()));
+    let rendered: Vec<Utterance> =
+        read_jsonl(&session.join("transcript.jsonl")).expect("read rendered transcript");
+    assert!(rendered.iter().any(|utterance| {
+        utterance.source == target.source
+            && utterance.start_ms == target.start_ms
+            && utterance.end_ms == target.end_ms
+            && utterance.speaker == learned_name
+            && utterance.locked
+    }));
+    eprintln!(
+        "corrected {}..{} as {learned_name} ({truth_overlap} ms ground-truth overlap)",
+        target.start_ms, target.end_ms
+    );
+}
+
+fn correction_target<'a>(
+    utterances: &'a [Utterance],
+    chunks: &[EmbeddingChunk],
+    truth: &BTreeMap<char, Vec<(u64, u64)>>,
+) -> Option<(&'a Utterance, char, u64)> {
+    utterances
+        .iter()
+        .filter(|utterance| utterance.source == "system")
+        .filter_map(|utterance| {
+            let cluster = utterance
+                .speaker_id
+                .strip_prefix("spk_")?
+                .parse::<u32>()
+                .ok()?;
+            let has_dot = chunks.iter().any(|chunk| {
+                let duration = chunk.end_ms.saturating_sub(chunk.start_ms);
+                let overlap = chunk
+                    .end_ms
+                    .min(utterance.end_ms)
+                    .saturating_sub(chunk.start_ms.max(utterance.start_ms));
+                chunk.source == "system"
+                    && chunk.cluster == cluster
+                    && duration >= 1_500
+                    && overlap.saturating_mul(2) >= duration
+            });
+            has_dot.then_some((utterance, cluster))
+        })
+        .flat_map(|(utterance, _)| {
+            truth.iter().map(move |(speaker, segments)| {
+                let overlap = segments
+                    .iter()
+                    .map(|(start, end)| {
+                        utterance
+                            .end_ms
+                            .min(*end)
+                            .saturating_sub(utterance.start_ms.max(*start))
+                    })
+                    .sum::<u64>();
+                (utterance, *speaker, overlap)
+            })
+        })
+        .filter(|(_, _, overlap)| *overlap > 0)
+        .max_by_key(|(_, _, overlap)| *overlap)
 }
 
 /// Ground-truth (start_ms, end_ms) of one AMI speaker, shifted by `offset_s`.
@@ -241,6 +351,73 @@ fn run_process(session: &Path, models: &Path, database: Option<&Path>) -> io::Re
     }
 }
 
+fn run_correct(
+    session: &Path,
+    models: &Path,
+    database: &Path,
+    target: &Utterance,
+    name: &str,
+) -> io::Result<serde_json::Value> {
+    let output = Command::new(env!("CARGO_BIN_EXE_singstone"))
+        .arg("correct")
+        .arg(session)
+        .args(["--source", &target.source])
+        .args(["--start-ms", &target.start_ms.to_string()])
+        .args(["--end-ms", &target.end_ms.to_string()])
+        .args(["--name", name])
+        .arg("--embedding-model")
+        .arg(models.join("nemo_en_titanet_small.onnx"))
+        .arg("--speakers-db")
+        .arg(database)
+        .arg("--allow-unverified-models")
+        .args(["--threads", "4"])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "correct exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let line = String::from_utf8(output.stdout)
+        .map_err(io::Error::other)?
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::other("correct produced no outcome"))?
+        .to_owned();
+    serde_json::from_str(&line).map_err(io::Error::other)
+}
+
+fn run_recognize(session: &Path, models: &Path, database: &Path) -> io::Result<()> {
+    let status = Command::new(env!("CARGO_BIN_EXE_singstone"))
+        .arg("recognize")
+        .arg(session)
+        .arg("--embedding-model")
+        .arg(models.join("nemo_en_titanet_small.onnx"))
+        .arg("--speakers-db")
+        .arg(database)
+        .arg("--speaker-threshold")
+        .arg("0")
+        .arg("--allow-unverified-models")
+        .args(["--threads", "4"])
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| io::Error::other(format!("recognize exited with {status}")))
+}
+
+fn run_render(session: &Path) -> io::Result<()> {
+    let status = Command::new(env!("CARGO_BIN_EXE_singstone"))
+        .arg("render")
+        .arg(session)
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| io::Error::other(format!("render exited with {status}")))
+}
+
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<Vec<T>> {
     fs::read_to_string(path)?
         .lines()
@@ -268,69 +445,6 @@ fn ground_truth_tokens(words_dir: &Path) -> io::Result<HashSet<String>> {
         }
     }
     Ok(result)
-}
-
-fn make_enrollment_sample(samples: &Path, output: &Path) -> io::Result<()> {
-    let wav = fs::read(samples.join("ES2002a.Mix-Headset.wav"))?;
-    let pcm = wav_data(&wav)?;
-    let xml = fs::read_to_string(samples.join("ami/segments/ES2002a.A.segments.xml"))?;
-    let mut segments = xml
-        .lines()
-        .filter(|line| line.trim_start().starts_with("<segment "))
-        .filter_map(|line| {
-            let start = attribute(line, "transcriber_start")?.parse::<f64>().ok()?;
-            let end = attribute(line, "transcriber_end")?.parse::<f64>().ok()?;
-            (start >= 250.0 && end - start >= 2.0).then_some((start, end))
-        })
-        .collect::<Vec<_>>();
-    segments.sort_by(|a, b| (b.1 - b.0).total_cmp(&(a.1 - a.0)));
-    let mut selected = Vec::new();
-    let mut duration = 0.0;
-    for (start, end) in segments {
-        if duration >= 25.0 {
-            break;
-        }
-        let take = (end - start).min(25.0 - duration);
-        let first = (start * RATE as f64) as usize;
-        let last = ((start + take) * RATE as f64) as usize;
-        selected.extend_from_slice(&pcm[first.min(pcm.len())..last.min(pcm.len())]);
-        duration += take;
-    }
-    assert!(
-        duration >= 20.0,
-        "only {duration:.1} s available for enrollment"
-    );
-    let bytes = selected
-        .into_iter()
-        .flat_map(|sample| (sample as f32 / 32768.0).to_le_bytes())
-        .collect::<Vec<_>>();
-    fs::write(output, bytes)
-}
-
-fn wav_data(bytes: &[u8]) -> io::Result<Vec<i16>> {
-    let mut offset = 12usize;
-    while offset + 8 <= bytes.len() {
-        let size = u32::from_le_bytes(
-            bytes[offset + 4..offset + 8]
-                .try_into()
-                .map_err(io::Error::other)?,
-        ) as usize;
-        let start = offset + 8;
-        let end = start + size;
-        if &bytes[offset..offset + 4] == b"data" {
-            return Ok(bytes[start..end]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect());
-        }
-        offset = end + (size & 1);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidData,
-        "WAV has no data chunk",
-    ))
 }
 
 fn attribute<'a>(line: &'a str, name: &str) -> Option<&'a str> {

@@ -85,6 +85,35 @@ pub fn mean_normalized(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
     }
 }
 
+/// Score one query dot against the three nearest stored dots for a speaker.
+pub fn topk_mean(query: &[f32], enrolled: &[Vec<f32>]) -> Option<f32> {
+    let mut scores = enrolled
+        .iter()
+        .filter_map(|candidate| cosine(query, candidate))
+        .collect::<Vec<_>>();
+    scores.sort_by(|left, right| right.total_cmp(left));
+    let count = scores.len().min(3);
+    (count > 0).then(|| scores[..count].iter().sum::<f32>() / count as f32)
+}
+
+/// Score a speaker as the median query-dot score across a cluster or line.
+pub fn speaker_score(query: &[Vec<f32>], enrolled: &[Vec<f32>]) -> Option<f32> {
+    let mut scores = query
+        .iter()
+        .filter_map(|dot| topk_mean(dot, enrolled))
+        .collect::<Vec<_>>();
+    if scores.is_empty() {
+        return None;
+    }
+    scores.sort_by(f32::total_cmp);
+    let middle = scores.len() / 2;
+    if scores.len().is_multiple_of(2) {
+        Some((scores[middle - 1] + scores[middle]) / 2.0)
+    } else {
+        Some(scores[middle])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClusterCandidate {
     pub cluster: u32,
@@ -132,6 +161,23 @@ mod tests {
         let expected = 1.0 / 2.0f32.sqrt();
         assert!((mean[0] - expected).abs() < 1e-6);
         assert!((mean[1] - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn speaker_score_uses_top_three_and_median() {
+        let enrolled = vec![
+            vec![1.0, 0.0],
+            vec![0.8, 0.6],
+            vec![0.6, 0.8],
+            vec![-1.0, 0.0],
+        ];
+        let query = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let first = (1.0 + 0.8 + 0.6) / 3.0;
+        let second = (0.8 + 0.6 + 0.0) / 3.0;
+        let expected = (first + second) / 2.0;
+        assert!((speaker_score(&query, &enrolled).expect("score") - expected).abs() < 1e-6);
+        assert_eq!(speaker_score(&[], &enrolled), None);
+        assert_eq!(speaker_score(&query, &[]), None);
     }
 
     #[test]

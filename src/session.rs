@@ -125,8 +125,17 @@ impl Session {
     pub fn diarization_metadata_path(&self) -> PathBuf {
         self.dir.join("diarization.meta.json")
     }
+    pub fn embeddings_path(&self) -> PathBuf {
+        self.dir.join("embeddings.jsonl")
+    }
+    pub fn embeddings_metadata_path(&self) -> PathBuf {
+        self.dir.join("embeddings.meta.json")
+    }
     pub fn speaker_assignments_path(&self) -> PathBuf {
         self.dir.join("speaker-assignments.json")
+    }
+    pub fn speaker_corrections_path(&self) -> PathBuf {
+        self.dir.join("speaker-corrections.json")
     }
     pub fn meeting_path(&self) -> PathBuf {
         self.dir.join("meeting.json")

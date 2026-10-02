@@ -50,18 +50,19 @@ fn isolated_sherpa_diarization_and_embedding_calibration() {
         .expect("create extractor");
     let meeting =
         read_wav_pcm16(&samples.join("ES2002a.Mix-Headset.wav")).expect("read AMI meeting");
-    let enrolled = enroll_ground_truth_speakers(&samples, &meeting, &extractor)
-        .expect("enroll ground-truth speakers");
-    let cluster_embeddings = embed_clusters(&segments, &audio, &extractor);
+    let learned = learn_ground_truth_speakers(&samples, &meeting, &extractor)
+        .expect("learn ground-truth speakers");
+    assert!(learned.values().all(|dots| !dots.is_empty()));
+    let cluster_embeddings = embed_cluster_chunks(&segments, &audio, &extractor);
     let truth = ground_truth_segments(&samples).expect("parse ground truth segments");
     let mut same_scores = Vec::new();
     let mut different_scores = Vec::new();
     for (cluster, cluster_embedding) in cluster_embeddings {
         let speaker = dominant_speaker(cluster, &segments, &truth).expect("dominant speaker");
-        let scores = enrolled
+        let scores = learned
             .iter()
-            .filter_map(|(name, enrolled_embedding)| {
-                embedding::cosine(&cluster_embedding, enrolled_embedding)
+            .filter_map(|(name, learned_dots)| {
+                embedding::speaker_score(&cluster_embedding, learned_dots)
                     .map(|score| (*name, score))
             })
             .collect::<Vec<_>>();
@@ -79,7 +80,7 @@ fn isolated_sherpa_diarization_and_embedding_calibration() {
         same_scores.push(same);
         different_scores.push(different);
         eprintln!(
-            "cluster {cluster}: ground truth {speaker}, same {same:.3}, best different {different:.3}"
+            "cluster {cluster}: ground truth {speaker}, correct {same:.6}, best wrong {different:.6}"
         );
     }
     eprintln!(
@@ -135,55 +136,38 @@ fn diarize(
     diarizer.diarize(audio)
 }
 
-fn embed_clusters(
+fn embed_cluster_chunks(
     segments: &[SpeakerSegment],
     audio: &[f32],
     extractor: &EmbeddingExtractor,
-) -> BTreeMap<u32, Vec<f32>> {
-    let mut grouped: BTreeMap<u32, Vec<&SpeakerSegment>> = BTreeMap::new();
-    for segment in segments
-        .iter()
-        .filter(|segment| segment.end_ms.saturating_sub(segment.start_ms) >= 1_500)
-    {
-        grouped.entry(segment.cluster).or_default().push(segment);
-    }
-    grouped
-        .into_iter()
-        .filter_map(|(cluster, mut segments)| {
-            segments.sort_by_key(|segment| {
-                std::cmp::Reverse(segment.end_ms.saturating_sub(segment.start_ms))
-            });
-            let mut used = 0u64;
-            let mut embeddings = Vec::new();
-            for segment in segments {
-                let duration = (segment.end_ms - segment.start_ms).min(30_000 - used);
-                if duration < 1_500 {
-                    break;
-                }
-                let start = to_sample(segment.start_ms).min(audio.len());
-                let end = to_sample(segment.start_ms + duration).min(audio.len());
-                if let Some(value) = extractor.embed(&audio[start..end]) {
-                    embeddings.push(value);
-                    used += duration;
-                }
+) -> BTreeMap<u32, Vec<Vec<f32>>> {
+    let mut output = BTreeMap::<u32, Vec<Vec<f32>>>::new();
+    for segment in segments {
+        for (start_ms, end_ms) in fixed_windows(segment.start_ms, segment.end_ms) {
+            if end_ms.saturating_sub(start_ms) < 1_500 {
+                continue;
             }
-            embedding::mean_normalized(&embeddings).map(|value| (cluster, value))
-        })
-        .collect()
+            let start = to_sample(start_ms).min(audio.len());
+            let end = to_sample(end_ms).min(audio.len());
+            if let Some(value) = extractor.embed(&audio[start..end]) {
+                output.entry(segment.cluster).or_default().push(value);
+            }
+        }
+    }
+    output
 }
 
-fn enroll_ground_truth_speakers(
+fn learn_ground_truth_speakers(
     samples: &Path,
     meeting: &[f32],
     extractor: &EmbeddingExtractor,
-) -> io::Result<BTreeMap<char, Vec<f32>>> {
+) -> io::Result<BTreeMap<char, Vec<Vec<f32>>>> {
     let mut output = BTreeMap::new();
     for speaker in ['A', 'B', 'C', 'D'] {
         let xml = fs::read_to_string(
             samples.join(format!("ami/segments/ES2002a.{speaker}.segments.xml")),
         )?;
-        let mut selected = Vec::new();
-        let mut duration = 0.0f64;
+        let mut dots = Vec::new();
         for line in xml
             .lines()
             .filter(|line| line.trim_start().starts_with("<segment "))
@@ -194,21 +178,46 @@ fn enroll_ground_truth_speakers(
             let Some(end) = attribute(line, "transcriber_end").and_then(parse_number) else {
                 continue;
             };
-            if start < 250.0 || duration >= 25.0 {
-                continue;
+            let start_ms = (start * 1_000.0).round() as u64;
+            let end_ms = (end * 1_000.0).round() as u64;
+            for (window_start, window_end) in fixed_windows(start_ms, end_ms) {
+                if window_end.saturating_sub(window_start) < 1_500 {
+                    continue;
+                }
+                let first = to_sample(window_start).min(meeting.len());
+                let last = to_sample(window_end).min(meeting.len());
+                if let Some(value) = extractor.embed(&meeting[first..last]) {
+                    dots.push(value);
+                }
             }
-            let take = (end - start).min(25.0 - duration);
-            let first = (start * SAMPLE_RATE as f64) as usize;
-            let last = ((start + take) * SAMPLE_RATE as f64) as usize;
-            selected.extend_from_slice(&meeting[first.min(meeting.len())..last.min(meeting.len())]);
-            duration += take;
         }
-        let value = extractor
-            .embed(&selected)
-            .ok_or_else(|| io::Error::other(format!("could not embed AMI speaker {speaker}")))?;
-        output.insert(speaker, value);
+        if dots.is_empty() {
+            return Err(io::Error::other(format!(
+                "could not embed AMI speaker {speaker}"
+            )));
+        }
+        eprintln!("learned AMI speaker {speaker} from {} dots", dots.len());
+        output.insert(speaker, dots);
     }
     Ok(output)
+}
+
+fn fixed_windows(start_ms: u64, end_ms: u64) -> Vec<(u64, u64)> {
+    let duration = end_ms.saturating_sub(start_ms);
+    if duration == 0 {
+        return Vec::new();
+    }
+    let count = duration.div_ceil(10_000);
+    (0..count)
+        .map(|index| {
+            let offset =
+                |part: u64| (u128::from(duration) * u128::from(part) / u128::from(count)) as u64;
+            (
+                start_ms.saturating_add(offset(index)),
+                start_ms.saturating_add(offset(index + 1)),
+            )
+        })
+        .collect()
 }
 
 fn ground_truth_segments(samples: &Path) -> io::Result<BTreeMap<char, Vec<(f64, f64)>>> {

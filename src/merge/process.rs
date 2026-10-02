@@ -1,5 +1,7 @@
 use crate::audio::archive;
-use crate::cli::{DiarizeArgs, ProcessArgs, RecognizeArgs, RenderArgs, TranscribeArgs};
+use crate::cli::{
+    CorrectArgs, DiarizeArgs, ProcessArgs, RecognizeArgs, RenderArgs, TranscribeArgs,
+};
 use crate::diarization::Diarizer;
 use crate::diarization::sherpa::SherpaDiarizer;
 use crate::format::jsonl;
@@ -8,13 +10,14 @@ use crate::merge::leakage::{self, AudioEnvelopes};
 use crate::merge::utterances::{self, DEFAULT_NEAREST_TOLERANCE_MS};
 use crate::models;
 use crate::session::Session;
-use crate::speaker::database::{self, SpeakerDatabase};
+use crate::speaker::database::{self, EmbeddingModelIdentity, SpeakerDatabase};
 use crate::speaker::embedding::{self, ClusterCandidate, EmbeddingExtractor};
 use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
-    AudioSource, Manifest, SAMPLE_RATE, SessionState, SpeakerAssignment,
-    SpeakerAssignmentProvenance, SpeakerAssignments, SpeakerSegment, TimedWord, Utterance,
+    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, Manifest, SAMPLE_RATE, SessionState,
+    SpeakerAssignment, SpeakerAssignmentProvenance, SpeakerAssignments, SpeakerCorrection,
+    SpeakerCorrections, SpeakerSegment, TimedWord, Utterance,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,6 +30,13 @@ use std::time::Instant;
 
 const SPEAKER_ASSIGNMENTS_FORMAT_VERSION: u32 = 1;
 const STAGE_METADATA_FORMAT_VERSION: u32 = 1;
+const EMBEDDINGS_FORMAT_VERSION: u32 = 1;
+const SPEAKER_CORRECTIONS_FORMAT_VERSION: u32 = 1;
+const EMBEDDING_WINDOW_MS: u64 = 10_000;
+const MIN_LEARN_MS: u64 = 1_500;
+const PROPOSAL_MARGIN: f32 = 0.05;
+
+type CorrectionLearning = (Vec<EmbeddingChunk>, SpeakerDatabase, PathBuf);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessingStage {
@@ -47,7 +57,7 @@ impl ProcessingStage {
             Self::TranscribingMic => "Transcribing microphone audio",
             Self::TranscribingSystem => "Transcribing system audio",
             Self::Diarizing => "Separating speakers",
-            Self::Recognizing => "Recognizing enrolled voices",
+            Self::Recognizing => "Recognizing learned voices",
             Self::Merging => "Merging the meeting timeline",
             Self::Writing => "Writing transcript files",
             Self::Finished => "Processing complete",
@@ -128,6 +138,20 @@ struct DiarizationMetadata {
     threads: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct EmbeddingsMetadata {
+    format_version: u32,
+    output_file: String,
+    output_sha256: String,
+    diarization_sha256: String,
+    mic_audio_sha256: Option<String>,
+    system_audio_sha256: Option<String>,
+    embedding_model_sha256: String,
+    threads: usize,
+    window_ms: u64,
+    min_learn_ms: u64,
+}
+
 pub fn run(args: ProcessArgs) -> Result<(), Box<dyn std::error::Error>> {
     run_with_progress(args, |_| {})
 }
@@ -192,7 +216,8 @@ pub fn run_with_control_and_metrics(
     let mut segments = diarize_sources(&args, &session, &manifest, threads, false)?;
     sort_segments(&mut segments);
     jsonl::write_all_atomic(&session.diarization_path(), &segments)?;
-    write_diarization_metadata(&args, &session, &manifest, threads)?;
+    let diarize_mic = effective_diarize_mic(args.diarize_mic, &segments);
+    write_diarization_metadata(&args, &session, &manifest, diarize_mic, threads)?;
     eprintln!(
         "diarize: {} segment(s) in {:.1} s",
         segments.len(),
@@ -226,7 +251,7 @@ pub fn run_with_control_and_metrics(
 
     ensure_not_cancelled(&cancelled)?;
     progress(ProcessingProgress::indeterminate(ProcessingStage::Merging));
-    render_artifacts_with_hook(&session, &manifest, args.diarize_mic, || {
+    render_artifacts_with_hook(&session, &manifest, diarize_mic, || {
         progress(ProcessingProgress::indeterminate(ProcessingStage::Writing));
     })?;
     progress(ProcessingProgress::determinate(
@@ -307,7 +332,14 @@ pub fn run_diarize(args: DiarizeArgs) -> Result<(), Box<dyn std::error::Error>> 
     )?;
     sort_segments(&mut segments);
     jsonl::write_all_atomic(&session.diarization_path(), &segments)?;
-    write_diarization_metadata(&process, &session, &manifest, thread_count(process.threads))?;
+    let diarize_mic = effective_diarize_mic(process.diarize_mic, &segments);
+    write_diarization_metadata(
+        &process,
+        &session,
+        &manifest,
+        diarize_mic,
+        thread_count(process.threads),
+    )?;
     eprintln!(
         "diarize: {} segment(s) in {:.1} s",
         segments.len(),
@@ -339,6 +371,29 @@ pub fn run_recognize(args: RecognizeArgs) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+pub fn run_correct(args: CorrectArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut process = stage_process_args(args.session);
+    process.embedding_model = Some(args.embedding_model);
+    process.models_lock = args.models_lock;
+    process.allow_unverified_models = args.allow_unverified_models;
+    process.threads = args.threads;
+    process.speakers_db = args.speakers_db;
+    process.speaker_threshold = args.speaker_threshold;
+    let request = CorrectionRequest {
+        source: args.source,
+        start_ms: args.start_ms,
+        end_ms: args.end_ms,
+        speaker: args.name,
+    };
+    let mut outcome = correct_speaker(process, &request)?;
+    let proposals = std::mem::take(&mut outcome.proposals);
+    println!("{}", serde_json::to_string(&outcome)?);
+    for proposal in proposals {
+        println!("{}", serde_json::to_string(&proposal)?);
+    }
+    Ok(())
+}
+
 pub fn run_render(args: RenderArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (session, manifest) = open_session(&args.session)?;
     let segments: Vec<SpeakerSegment> =
@@ -347,101 +402,195 @@ pub fn run_render(args: RenderArgs) -> Result<(), Box<dyn std::error::Error>> {
     render_artifacts_with_segments(&session, &manifest, diarize_mic, segments)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AssignmentOutcome {
-    /// Whether the cluster embedding was also added to the persistent speaker
-    /// database, allowing later sessions to recognize the voice.
-    pub learned: bool,
-    pub previous: Option<String>,
-    pub forgotten: usize,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorrectionRequest {
+    pub source: AudioSource,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub speaker: String,
 }
 
-/// Assign a diarized cluster from the transcript and, when the embedding model
-/// is available, use that cluster as a new local enrollment sample.
-pub fn assign_speaker(
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Proposal {
+    pub source: AudioSource,
+    pub cluster: u32,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
+    pub current_speaker: Option<String>,
+    pub score_new: f32,
+    pub score_old: Option<f32>,
+    pub proposed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CorrectionOutcome {
+    pub learned: usize,
+    pub forgotten: usize,
+    pub learning_available: bool,
+    pub echo: bool,
+    pub proposals: Vec<Proposal>,
+}
+
+pub fn correct_speaker(
     args: ProcessArgs,
-    speaker_id: &str,
-    name: &str,
-) -> Result<AssignmentOutcome, Box<dyn std::error::Error>> {
-    let name = name.trim();
-    if name.is_empty() {
+    request: &CorrectionRequest,
+) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+    apply_corrections_inner(args, std::slice::from_ref(request), true)
+}
+
+#[allow(dead_code)]
+pub fn apply_corrections(
+    args: ProcessArgs,
+    requests: &[CorrectionRequest],
+) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+    apply_corrections_inner(args, requests, false)
+}
+
+fn apply_corrections_inner(
+    args: ProcessArgs,
+    requests: &[CorrectionRequest],
+    include_proposals: bool,
+) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+    let mut requests = requests
+        .iter()
+        .map(validate_correction_request)
+        .collect::<Result<Vec<_>, _>>()?;
+    requests.sort_by_key(|request| {
+        (
+            request.start_ms,
+            source_order(request.source),
+            request.end_ms,
+        )
+    });
+    let (session, _) = open_session(&args.session)?;
+    let segments: Vec<SpeakerSegment> =
+        read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
+    let recognized = read_speaker_assignments(&session)?;
+    let prior_utterances = match read_jsonl_artifact(&session.transcript_path(), "transcript") {
+        Ok(utterances) => utterances,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let proposal_cluster = include_proposals
+        .then(|| requests.first())
+        .flatten()
+        .and_then(|request| cluster_for_request(request, &prior_utterances, &segments));
+
+    let mut corrections = read_speaker_corrections(&session)?;
+    let mut replaced = Vec::with_capacity(requests.len());
+    for request in &requests {
+        replaced.push(upsert_correction(
+            &mut corrections,
+            SpeakerCorrection {
+                source: request.source,
+                start_ms: request.start_ms,
+                end_ms: request.end_ms,
+                speaker: request.speaker.clone(),
+            },
+        ));
+    }
+    write_json_atomic(&session.speaker_corrections_path(), &corrections)?;
+
+    let mut learned = 0usize;
+    let mut forgotten = 0usize;
+    let mut learning_available = false;
+    let mut learning = match prepare_correction_learning(&args, &session, &segments) {
+        Ok(learning) => learning,
+        Err(error) => {
+            eprintln!(
+                "warning: speaker correction was saved but its voice could not be learned: {error}"
+            );
+            None
+        }
+    };
+    if let Some((chunks, database, database_path)) = learning.as_mut() {
+        learning_available = true;
+        for (request, replaced) in requests.iter().zip(&replaced) {
+            let vectors =
+                embeddings_in_range(chunks, request.source, request.start_ms, request.end_ms);
+            if vectors.is_empty() {
+                continue;
+            }
+            let mut old_names = replaced
+                .iter()
+                .map(|correction| correction.speaker.as_str())
+                .collect::<HashSet<_>>();
+            if let Some(cluster) = cluster_for_request(request, &prior_utterances, &segments)
+                && let Some(name) = recognized.get(&(request.source, cluster))
+            {
+                old_names.insert(name);
+            }
+            old_names.remove(request.speaker.as_str());
+            for old_name in old_names {
+                for vector in &vectors {
+                    forgotten += database.forget_matching(old_name, vector, 0.999);
+                }
+            }
+            learned += vectors.len();
+            database
+                .speakers
+                .entry(request.speaker.clone())
+                .or_default()
+                .embeddings
+                .extend(vectors);
+        }
+        database.refresh_centroids();
+        if learned > 0 || forgotten > 0 {
+            database.save(database_path)?;
+        }
+    }
+
+    run_render(RenderArgs {
+        session: session.dir.clone(),
+        diarize_mic: None,
+    })?;
+    let echo = correction_is_system_echo(&requests, &recognized, &corrections.corrections);
+    let proposals = if include_proposals {
+        match (requests.first(), proposal_cluster, learning.as_ref()) {
+            (Some(request), Some(cluster), Some((chunks, database, _))) => build_proposals(
+                &session,
+                request,
+                cluster,
+                chunks,
+                database,
+                args.speaker_threshold,
+            )?,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    Ok(CorrectionOutcome {
+        learned,
+        forgotten,
+        learning_available,
+        echo,
+        proposals,
+    })
+}
+
+fn validate_correction_request(
+    request: &CorrectionRequest,
+) -> Result<CorrectionRequest, Box<dyn std::error::Error>> {
+    let speaker = request.speaker.trim();
+    if speaker.is_empty() {
         return Err(
             io::Error::new(io::ErrorKind::InvalidInput, "speaker name cannot be empty").into(),
         );
     }
-    let (source, cluster) = parse_speaker_id(speaker_id).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{speaker_id:?} is not an assignable diarized speaker"),
-        )
-    })?;
-    let (session, _) = open_session(&args.session)?;
-    let mut artifact: SpeakerAssignments = read_json(&session.speaker_assignments_path())?;
-    if artifact.format_version != SPEAKER_ASSIGNMENTS_FORMAT_VERSION
-        || artifact.provenance.diarization_file != "diarization.jsonl"
-        || !artifact
-            .provenance
-            .diarization_sha256
-            .eq_ignore_ascii_case(&models::sha256_file(&session.diarization_path())?)
-    {
+    if request.end_ms <= request.start_ms {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "speaker assignments are stale; process the session again before assigning a name",
+            io::ErrorKind::InvalidInput,
+            "speaker correction end must be after its start",
         )
         .into());
     }
-    let assignment = artifact
-        .assignments
-        .iter_mut()
-        .find(|value| value.source == source && value.cluster == cluster)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("speaker cluster {speaker_id} is not in this session"),
-            )
-        })?;
-    let previous = assignment.speaker.clone();
-    let unchanged = previous
-        .as_deref()
-        .is_some_and(|previous| previous.trim() == name);
-    assignment.speaker = Some(name.to_owned());
-
-    let (learned, forgotten) = if unchanged {
-        (false, 0)
-    } else {
-        match learn_cluster(
-            &args,
-            &session,
-            source,
-            cluster,
-            name,
-            previous.as_deref().map(str::trim),
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                eprintln!("warning: assigned {speaker_id} but could not learn its voice: {error}");
-                (false, 0)
-            }
-        }
-    };
-    if learned {
-        assignment.best_candidate = Some(name.to_owned());
-        assignment.score = Some(1.0);
-        let database_path = args
-            .speakers_db
-            .clone()
-            .unwrap_or_else(database::default_path);
-        artifact.provenance.speakers_database_sha256 = Some(models::sha256_file(&database_path)?);
-    }
-    write_json_atomic(&session.speaker_assignments_path(), &artifact)?;
-    run_render(RenderArgs {
-        session: session.dir,
-        diarize_mic: None,
-    })?;
-    Ok(AssignmentOutcome {
-        learned,
-        previous,
-        forgotten,
+    Ok(CorrectionRequest {
+        source: request.source,
+        start_ms: request.start_ms,
+        end_ms: request.end_ms,
+        speaker: speaker.to_owned(),
     })
 }
 
@@ -458,16 +607,190 @@ fn parse_speaker_id(value: &str) -> Option<(AudioSource, u32)> {
     Some((source, cluster.parse().ok()?))
 }
 
-fn learn_cluster(
+fn read_speaker_corrections(session: &Session) -> io::Result<SpeakerCorrections> {
+    let path = session.speaker_corrections_path();
+    let artifact: SpeakerCorrections = match read_json(&path) {
+        Ok(artifact) => artifact,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SpeakerCorrections {
+                format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
+                corrections: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if artifact.format_version != SPEAKER_CORRECTIONS_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported speaker corrections format version {} in {}",
+                artifact.format_version,
+                path.display()
+            ),
+        ));
+    }
+    Ok(artifact)
+}
+
+fn upsert_correction(
+    artifact: &mut SpeakerCorrections,
+    correction: SpeakerCorrection,
+) -> Vec<SpeakerCorrection> {
+    let old = std::mem::take(&mut artifact.corrections);
+    let mut replaced = Vec::new();
+    for existing in old {
+        if existing.source == correction.source
+            && ranges_overlap(
+                existing.start_ms,
+                existing.end_ms,
+                correction.start_ms,
+                correction.end_ms,
+            )
+        {
+            replaced.push(existing);
+        } else {
+            artifact.corrections.push(existing);
+        }
+    }
+    artifact.corrections.push(correction);
+    replaced
+}
+
+fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
+    left_start < right_end && right_start < left_end
+}
+
+fn cluster_for_request(
+    request: &CorrectionRequest,
+    utterances: &[Utterance],
+    segments: &[SpeakerSegment],
+) -> Option<u32> {
+    utterances
+        .iter()
+        .find(|utterance| {
+            utterance.source == request.source
+                && utterance.start_ms == request.start_ms
+                && utterance.end_ms == request.end_ms
+        })
+        .and_then(|utterance| parse_speaker_id(&utterance.speaker_id))
+        .filter(|(source, _)| *source == request.source)
+        .map(|(_, cluster)| cluster)
+        .or_else(|| {
+            segments
+                .iter()
+                .filter(|segment| segment.source == request.source)
+                .filter_map(|segment| {
+                    let overlap = segment
+                        .end_ms
+                        .min(request.end_ms)
+                        .saturating_sub(segment.start_ms.max(request.start_ms));
+                    (overlap > 0).then_some((overlap, segment.start_ms, segment.cluster))
+                })
+                .max_by_key(|(overlap, start, cluster)| {
+                    (
+                        *overlap,
+                        std::cmp::Reverse(*start),
+                        std::cmp::Reverse(*cluster),
+                    )
+                })
+                .map(|(_, _, cluster)| cluster)
+        })
+}
+
+fn correction_is_system_echo(
+    requests: &[CorrectionRequest],
+    recognized: &HashMap<(AudioSource, u32), String>,
+    corrections: &[SpeakerCorrection],
+) -> bool {
+    let system_speakers = recognized
+        .iter()
+        .filter(|((source, _), _)| *source == AudioSource::System)
+        .map(|(_, speaker)| speaker.as_str())
+        .chain(
+            corrections
+                .iter()
+                .filter(|correction| correction.source == AudioSource::System)
+                .map(|correction| correction.speaker.as_str()),
+        )
+        .collect::<HashSet<_>>();
+    requests.iter().any(|request| {
+        request.source == AudioSource::Mic && system_speakers.contains(request.speaker.as_str())
+    })
+}
+
+fn build_proposals(
+    session: &Session,
+    request: &CorrectionRequest,
+    cluster: u32,
+    chunks: &[EmbeddingChunk],
+    database: &SpeakerDatabase,
+    threshold: f32,
+) -> Result<Vec<Proposal>, Box<dyn std::error::Error>> {
+    let utterances: Vec<Utterance> = read_jsonl_artifact(&session.transcript_path(), "transcript")?;
+    let mut proposals = utterances
+        .into_iter()
+        .filter_map(|utterance| {
+            proposal_for_utterance(request, cluster, utterance, chunks, database, threshold)
+        })
+        .collect::<Vec<_>>();
+    proposals.sort_by_key(|proposal| (proposal.start_ms, proposal.end_ms));
+    Ok(proposals)
+}
+
+fn proposal_for_utterance(
+    request: &CorrectionRequest,
+    cluster: u32,
+    utterance: Utterance,
+    chunks: &[EmbeddingChunk],
+    database: &SpeakerDatabase,
+    threshold: f32,
+) -> Option<Proposal> {
+    if utterance.source != request.source
+        || utterance.start_ms < request.end_ms
+        || utterance.locked
+        || parse_speaker_id(&utterance.speaker_id) != Some((request.source, cluster))
+    {
+        return None;
+    }
+    let query = embeddings_in_range(
+        chunks,
+        utterance.source,
+        utterance.start_ms,
+        utterance.end_ms,
+    );
+    let score_new = score_speaker_name(database, &request.speaker, &query)?;
+    let current_speaker =
+        (!is_anonymous_speaker(&utterance.speaker)).then(|| utterance.speaker.clone());
+    let score_old = current_speaker
+        .as_deref()
+        .and_then(|name| score_speaker_name(database, name, &query));
+    let proposed = score_old.map_or(score_new >= threshold, |score_old| {
+        score_new - score_old >= PROPOSAL_MARGIN
+    });
+    Some(Proposal {
+        source: utterance.source,
+        cluster,
+        start_ms: utterance.start_ms,
+        end_ms: utterance.end_ms,
+        text: utterance.text,
+        current_speaker,
+        score_new,
+        score_old,
+        proposed,
+    })
+}
+
+fn is_anonymous_speaker(speaker: &str) -> bool {
+    speaker.starts_with("SPEAKER_") || speaker == "unknown"
+}
+
+fn prepare_correction_learning(
     args: &ProcessArgs,
     session: &Session,
-    source: AudioSource,
-    cluster: u32,
-    name: &str,
-    previous: Option<&str>,
-) -> Result<(bool, usize), Box<dyn std::error::Error>> {
+    segments: &[SpeakerSegment],
+) -> Result<Option<CorrectionLearning>, Box<dyn std::error::Error>> {
     let Some(model) = args.embedding_model.as_deref() else {
-        return Ok((false, 0));
+        return Ok(None);
     };
     models::verify_model(
         model,
@@ -475,41 +798,20 @@ fn learn_cluster(
         args.models_lock.as_deref(),
         args.allow_unverified_models,
     )?;
-    let extractor = EmbeddingExtractor::new(model, thread_count(args.threads))?;
-    let segments: Vec<SpeakerSegment> =
-        read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
-    let source_segments = segments
-        .iter()
-        .filter(|segment| segment.source == source && segment.cluster == cluster)
-        .collect::<Vec<_>>();
-    let samples = session.read_audio(source)?;
-    let Some(embedding) = embed_clusters(&extractor, &samples, &source_segments).remove(&cluster)
-    else {
-        return Ok((false, 0));
-    };
+    let threads = thread_count(args.threads);
+    let extractor = EmbeddingExtractor::new(model, threads)?;
     let identity = database::identity(model, extractor.dimension())?;
+    let chunks = ensure_embeddings(session, segments, &extractor, &identity, threads)?;
     let path = args
         .speakers_db
         .clone()
         .unwrap_or_else(database::default_path);
-    let mut database = match SpeakerDatabase::load_checked(&path, &identity) {
+    let database = match SpeakerDatabase::load_checked(&path, &identity) {
         Ok(database) => database,
         Err(error) if error.kind() == io::ErrorKind::NotFound => SpeakerDatabase::empty(identity),
         Err(error) => return Err(error.into()),
     };
-    let forgotten = previous
-        .filter(|previous| *previous != name)
-        .map_or(0, |previous| {
-            database.forget_matching(previous, &embedding, 0.999)
-        });
-    database
-        .speakers
-        .entry(name.to_owned())
-        .or_default()
-        .embeddings
-        .push(embedding);
-    database.save(&path)?;
-    Ok((true, forgotten))
+    Ok(Some((chunks, database, path)))
 }
 
 fn stage_process_args(session: PathBuf) -> ProcessArgs {
@@ -521,13 +823,13 @@ fn stage_process_args(session: PathBuf) -> ProcessArgs {
         embedding_model: None,
         models_lock: None,
         allow_unverified_models: false,
-        diarize_mic: false,
+        diarize_mic: true,
         no_diarize: false,
         skip_transcription: false,
         language: "auto".into(),
         threads: None,
         speakers_db: None,
-        speaker_threshold: 0.6,
+        speaker_threshold: DEFAULT_SPEAKER_THRESHOLD,
         cluster_threshold: 1.0,
         num_speakers: None,
     }
@@ -843,50 +1145,6 @@ fn recognize_speakers(
     strict: bool,
     progress: Option<&dyn Fn(f64)>,
 ) -> Result<RecognitionResult, Box<dyn std::error::Error>> {
-    if segments.is_empty() {
-        eprintln!("speaker recognition: no diarized clusters; skipped");
-        return Ok(RecognitionResult::default());
-    }
-    let path = args
-        .speakers_db
-        .clone()
-        .unwrap_or_else(database::default_path);
-    if !path.is_file() {
-        if strict {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("speaker database {} does not exist", path.display()),
-            )
-            .into());
-        }
-        eprintln!("speaker recognition: no database; skipped");
-        return Ok(RecognitionResult::default());
-    }
-    let database = match SpeakerDatabase::load(&path) {
-        Ok(database) => database,
-        Err(error) => {
-            if strict {
-                return Err(error.into());
-            }
-            eprintln!("warning: speaker recognition skipped: {error}");
-            return Ok(RecognitionResult::default());
-        }
-    };
-    if database
-        .speakers
-        .values()
-        .all(|speaker| speaker.embeddings.is_empty())
-    {
-        if strict {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "speaker database has no embeddings",
-            )
-            .into());
-        }
-        eprintln!("speaker recognition: database has no embeddings; skipped");
-        return Ok(RecognitionResult::default());
-    }
     let Some(model) = args.embedding_model.as_deref() else {
         if strict {
             return Err(io::Error::new(
@@ -930,6 +1188,62 @@ fn recognize_speakers(
             return Ok(RecognitionResult::default());
         }
     };
+    let chunks = match write_embeddings(session, segments, &extractor, &identity, threads, progress)
+    {
+        Ok(chunks) => chunks,
+        Err(error) => {
+            if strict {
+                return Err(error);
+            }
+            eprintln!("warning: speaker embeddings unavailable: {error}");
+            return Ok(RecognitionResult::default());
+        }
+    };
+    if segments.is_empty() {
+        eprintln!("speaker recognition: no diarized clusters; skipped");
+        return Ok(RecognitionResult::default());
+    }
+
+    let path = args
+        .speakers_db
+        .clone()
+        .unwrap_or_else(database::default_path);
+    if !path.is_file() {
+        if strict {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("speaker database {} does not exist", path.display()),
+            )
+            .into());
+        }
+        eprintln!("speaker recognition: no database; skipped");
+        return Ok(RecognitionResult::default());
+    }
+    let database = match SpeakerDatabase::load(&path) {
+        Ok(database) => database,
+        Err(error) => {
+            if strict {
+                return Err(error.into());
+            }
+            eprintln!("warning: speaker recognition skipped: {error}");
+            return Ok(RecognitionResult::default());
+        }
+    };
+    if database
+        .speakers
+        .values()
+        .all(|speaker| speaker.embeddings.is_empty())
+    {
+        if strict {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "speaker database has no embeddings",
+            )
+            .into());
+        }
+        eprintln!("speaker recognition: database has no embeddings; skipped");
+        return Ok(RecognitionResult::default());
+    }
     if let Err(error) = database.validate_identity(&identity) {
         if strict {
             return Err(error.into());
@@ -939,44 +1253,20 @@ fn recognize_speakers(
     }
 
     let meeting = meeting::read_details(&session.meeting_path())?;
-    let total_clusters = segments
-        .iter()
-        .filter(|segment| segment.end_ms.saturating_sub(segment.start_ms) >= 1_500)
-        .map(|segment| (segment.source, segment.cluster))
-        .collect::<HashSet<_>>()
-        .len();
-    let mut completed_clusters = 0usize;
-    if let Some(progress) = progress
-        && total_clusters > 0
-    {
-        progress(0.0);
-    }
     let mut result = RecognitionResult::default();
     for source in [AudioSource::System, AudioSource::Mic] {
-        let source_segments = segments
-            .iter()
-            .filter(|segment| segment.source == source)
-            .collect::<Vec<_>>();
-        if source_segments.is_empty() {
+        let mut cluster_embeddings = BTreeMap::<u32, Vec<Vec<f32>>>::new();
+        for chunk in chunks.iter().filter(|chunk| {
+            chunk.source == source && chunk.end_ms.saturating_sub(chunk.start_ms) >= MIN_LEARN_MS
+        }) {
+            cluster_embeddings
+                .entry(chunk.cluster)
+                .or_default()
+                .push(chunk.embedding.clone());
+        }
+        if cluster_embeddings.is_empty() {
             continue;
         }
-        let samples = match session.read_audio(source) {
-            Ok(samples) => samples,
-            Err(error) => {
-                if strict {
-                    return Err(error.into());
-                }
-                eprintln!("warning: cannot read {source} audio for speaker recognition: {error}");
-                continue;
-            }
-        };
-        let cluster_embeddings =
-            embed_clusters_with_progress(&extractor, &samples, &source_segments, || {
-                completed_clusters += 1;
-                if let Some(progress) = progress {
-                    progress(completed_clusters as f64 / total_clusters as f64);
-                }
-            });
         let allowed = meeting
             .as_ref()
             .and_then(|meeting| allowed_candidate_names(meeting, source));
@@ -987,11 +1277,11 @@ fn recognize_speakers(
             names.sort();
             eprintln!("candidates\t{}", names.join(", "));
         } else {
-            eprintln!("candidates\tall enrolled speakers");
+            eprintln!("candidates\tall learned speakers");
         }
         eprintln!("cluster\tbest candidate\tscore\tassigned");
-        for (cluster, embedding) in cluster_embeddings {
-            let best = best_candidate_filtered(&database, &embedding, allowed.as_ref());
+        for (cluster, embeddings) in cluster_embeddings {
+            let best = best_candidate(&database, &embeddings, allowed.as_ref());
             match best {
                 Some((name, score)) => {
                     let assigned = if score >= args.speaker_threshold {
@@ -1073,6 +1363,7 @@ fn write_diarization_metadata(
     args: &ProcessArgs,
     session: &Session,
     manifest: &Manifest,
+    diarize_mic: bool,
     threads: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let meeting = meeting::read_details(&session.meeting_path())?;
@@ -1090,15 +1381,17 @@ fn write_diarization_metadata(
             mic_audio_sha256: hash_audio(
                 session,
                 AudioSource::Mic,
-                manifest.mic.enabled && args.diarize_mic,
+                manifest.mic.enabled && diarize_mic,
             )?,
             system_audio_sha256: hash_audio(session, AudioSource::System, manifest.system.enabled)?,
             segmentation_model_sha256: optional_hash(args.segmentation_model.as_deref())?,
             embedding_model_sha256: optional_hash(args.embedding_model.as_deref())?,
-            diarize_mic: args.diarize_mic,
+            diarize_mic,
             cluster_threshold: args.cluster_threshold,
             num_speakers: args.num_speakers,
-            mic_num_speakers: effective_num_speakers(args, meeting.as_ref(), AudioSource::Mic),
+            mic_num_speakers: diarize_mic
+                .then(|| effective_num_speakers(args, meeting.as_ref(), AudioSource::Mic))
+                .flatten(),
             system_num_speakers: effective_num_speakers(
                 args,
                 meeting.as_ref(),
@@ -1108,6 +1401,13 @@ fn write_diarization_metadata(
         },
     )?;
     Ok(())
+}
+
+fn effective_diarize_mic(requested: bool, segments: &[SpeakerSegment]) -> bool {
+    requested
+        && segments
+            .iter()
+            .any(|segment| segment.source == AudioSource::Mic)
 }
 
 fn hash_audio(
@@ -1209,6 +1509,7 @@ fn render_artifacts_with_segments_and_hook(
     warn_transcription_provenance(session);
     warn_diarization_provenance(session, diarize_mic);
     let recognized = read_speaker_assignments(session)?;
+    let corrections = read_speaker_corrections(session)?;
     let audio = match AudioEnvelopes::read(
         &session.stored_audio_path(AudioSource::Mic),
         &session.stored_audio_path(AudioSource::System),
@@ -1227,6 +1528,7 @@ fn render_artifacts_with_segments_and_hook(
         &leakage.words,
         &segments,
         &recognized,
+        &corrections.corrections,
         &manifest.local_speaker,
         diarize_mic,
         DEFAULT_NEAREST_TOLERANCE_MS,
@@ -1490,6 +1792,7 @@ pub fn rebase_audio_provenance(session: &Session, source: AudioSource, old: &str
     }
     let words = session.words_metadata_path();
     let diarization = session.diarization_metadata_path();
+    let embeddings = session.embeddings_metadata_path();
     let results = [
         (
             &words,
@@ -1510,6 +1813,18 @@ pub fn rebase_audio_provenance(session: &Session, source: AudioSource, old: &str
                 old,
                 new,
                 |metadata: &mut DiarizationMetadata| match source {
+                    AudioSource::Mic => &mut metadata.mic_audio_sha256,
+                    AudioSource::System => &mut metadata.system_audio_sha256,
+                },
+            ),
+        ),
+        (
+            &embeddings,
+            rebase(
+                &embeddings,
+                old,
+                new,
+                |metadata: &mut EmbeddingsMetadata| match source {
                     AudioSource::Mic => &mut metadata.mic_audio_sha256,
                     AudioSource::System => &mut metadata.system_audio_sha256,
                 },
@@ -1553,74 +1868,246 @@ fn read_jsonl_artifact<T: DeserializeOwned>(path: &Path, description: &str) -> i
     })
 }
 
-fn embed_clusters(
+fn ensure_embeddings(
+    session: &Session,
+    segments: &[SpeakerSegment],
     extractor: &EmbeddingExtractor,
-    samples: &[f32],
-    segments: &[&SpeakerSegment],
-) -> BTreeMap<u32, Vec<f32>> {
-    embed_clusters_with_progress(extractor, samples, segments, || {})
+    identity: &EmbeddingModelIdentity,
+    threads: usize,
+) -> Result<Vec<EmbeddingChunk>, Box<dyn std::error::Error>> {
+    let current = (|| -> Result<Option<Vec<EmbeddingChunk>>, Box<dyn std::error::Error>> {
+        let metadata: EmbeddingsMetadata = read_json(&session.embeddings_metadata_path())?;
+        if !embeddings_metadata_is_current(session, segments, identity, &metadata)? {
+            return Ok(None);
+        }
+        let chunks = read_jsonl_artifact(&session.embeddings_path(), "speaker embeddings")?;
+        Ok(Some(chunks))
+    })();
+    if let Ok(Some(chunks)) = current {
+        return Ok(chunks);
+    }
+    write_embeddings(session, segments, extractor, identity, threads, None)
 }
 
-fn embed_clusters_with_progress(
+fn write_embeddings(
+    session: &Session,
+    segments: &[SpeakerSegment],
     extractor: &EmbeddingExtractor,
-    samples: &[f32],
-    segments: &[&SpeakerSegment],
-    mut completed_cluster: impl FnMut(),
-) -> BTreeMap<u32, Vec<f32>> {
-    let mut grouped: BTreeMap<u32, Vec<&SpeakerSegment>> = BTreeMap::new();
-    for segment in segments
+    identity: &EmbeddingModelIdentity,
+    threads: usize,
+    progress: Option<&dyn Fn(f64)>,
+) -> Result<Vec<EmbeddingChunk>, Box<dyn std::error::Error>> {
+    let total_chunks = segments
         .iter()
-        .copied()
-        .filter(|segment| segment.end_ms.saturating_sub(segment.start_ms) >= 1_500)
-    {
-        grouped.entry(segment.cluster).or_default().push(segment);
+        .map(|segment| chunk_ranges(segment).len())
+        .sum::<usize>();
+    if let Some(progress) = progress {
+        progress(0.0);
     }
-    let mut output = BTreeMap::new();
-    for (cluster, mut cluster_segments) in grouped {
-        cluster_segments
-            .sort_by_key(|segment| std::cmp::Reverse(segment.end_ms - segment.start_ms));
-        let mut total_ms = 0u64;
-        let mut embeddings = Vec::new();
-        for segment in cluster_segments {
-            let remaining = 30_000u64.saturating_sub(total_ms);
-            if remaining < 1_500 {
-                break;
-            }
-            let duration = (segment.end_ms - segment.start_ms).min(remaining);
-            let start = ms_to_index(segment.start_ms, samples.len());
-            let end = ms_to_index(segment.start_ms + duration, samples.len());
-            if end > start
-                && let Some(embedding) = extractor.embed(&samples[start..end])
-            {
-                embeddings.push(embedding);
-                total_ms += duration;
+    let mut completed = 0usize;
+    let mut chunks = Vec::with_capacity(total_chunks);
+    for source in [AudioSource::System, AudioSource::Mic] {
+        let source_segments = segments
+            .iter()
+            .filter(|segment| segment.source == source)
+            .collect::<Vec<_>>();
+        if source_segments.is_empty() {
+            continue;
+        }
+        let samples = session.read_audio(source)?;
+        for segment in source_segments {
+            for (start_ms, end_ms) in chunk_ranges(segment) {
+                let start = ms_to_index(start_ms, samples.len());
+                let end = ms_to_index(end_ms, samples.len());
+                if end > start {
+                    if let Some(embedding) = extractor.embed(&samples[start..end]) {
+                        chunks.push(EmbeddingChunk {
+                            source,
+                            start_ms,
+                            end_ms,
+                            cluster: segment.cluster,
+                            embedding,
+                        });
+                    } else {
+                        eprintln!("warning: could not embed {source} chunk {start_ms}..{end_ms}");
+                    }
+                }
+                completed += 1;
+                if let Some(progress) = progress
+                    && total_chunks > 0
+                {
+                    progress(completed as f64 / total_chunks as f64);
+                }
             }
         }
-        if let Some(mean) = embedding::mean_normalized(&embeddings) {
-            output.insert(cluster, mean);
-        }
-        completed_cluster();
     }
-    output
+    chunks.sort_by_key(|chunk| {
+        (
+            chunk.start_ms,
+            source_order(chunk.source),
+            chunk.cluster,
+            chunk.end_ms,
+        )
+    });
+    jsonl::write_all_atomic(&session.embeddings_path(), &chunks)?;
+    let (mic_audio_sha256, system_audio_sha256) = embeddings_audio_hashes(session, segments)?;
+    write_json_atomic(
+        &session.embeddings_metadata_path(),
+        &EmbeddingsMetadata {
+            format_version: EMBEDDINGS_FORMAT_VERSION,
+            output_file: "embeddings.jsonl".into(),
+            output_sha256: models::sha256_file(&session.embeddings_path())?,
+            diarization_sha256: models::sha256_file(&session.diarization_path())?,
+            mic_audio_sha256,
+            system_audio_sha256,
+            embedding_model_sha256: identity.sha256.clone(),
+            threads,
+            window_ms: EMBEDDING_WINDOW_MS,
+            min_learn_ms: MIN_LEARN_MS,
+        },
+    )?;
+    Ok(chunks)
 }
 
-fn best_candidate_filtered(
-    database: &SpeakerDatabase,
-    cluster: &[f32],
+fn embeddings_metadata_is_current(
+    session: &Session,
+    segments: &[SpeakerSegment],
+    identity: &EmbeddingModelIdentity,
+    metadata: &EmbeddingsMetadata,
+) -> io::Result<bool> {
+    if metadata.format_version != EMBEDDINGS_FORMAT_VERSION
+        || metadata.output_file != "embeddings.jsonl"
+        || metadata.window_ms != EMBEDDING_WINDOW_MS
+        || metadata.min_learn_ms != MIN_LEARN_MS
+        || !metadata
+            .embedding_model_sha256
+            .eq_ignore_ascii_case(&identity.sha256)
+        || !models::sha256_file(&session.diarization_path())?
+            .eq_ignore_ascii_case(&metadata.diarization_sha256)
+        || !models::sha256_file(&session.embeddings_path())?
+            .eq_ignore_ascii_case(&metadata.output_sha256)
+    {
+        return Ok(false);
+    }
+    let (mic, system) = embeddings_audio_hashes(session, segments)?;
+    Ok(
+        option_hashes_equal(mic.as_deref(), metadata.mic_audio_sha256.as_deref())
+            && option_hashes_equal(system.as_deref(), metadata.system_audio_sha256.as_deref()),
+    )
+}
+
+fn embeddings_audio_hashes(
+    session: &Session,
+    segments: &[SpeakerSegment],
+) -> io::Result<(Option<String>, Option<String>)> {
+    Ok((
+        hash_audio(
+            session,
+            AudioSource::Mic,
+            segments
+                .iter()
+                .any(|segment| segment.source == AudioSource::Mic),
+        )?,
+        hash_audio(
+            session,
+            AudioSource::System,
+            segments
+                .iter()
+                .any(|segment| segment.source == AudioSource::System),
+        )?,
+    ))
+}
+
+fn option_hashes_equal(left: Option<&str>, right: Option<&str>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn chunk_ranges(segment: &SpeakerSegment) -> Vec<(u64, u64)> {
+    let duration = segment.end_ms.saturating_sub(segment.start_ms);
+    if duration == 0 {
+        return Vec::new();
+    }
+    let count = duration.div_ceil(EMBEDDING_WINDOW_MS);
+    (0..count)
+        .map(|index| {
+            let offset =
+                |part: u64| (u128::from(duration) * u128::from(part) / u128::from(count)) as u64;
+            (
+                segment.start_ms.saturating_add(offset(index)),
+                segment.start_ms.saturating_add(offset(index + 1)),
+            )
+        })
+        .collect()
+}
+
+fn embeddings_in_range(
+    chunks: &[EmbeddingChunk],
+    source: AudioSource,
+    start_ms: u64,
+    end_ms: u64,
+) -> Vec<Vec<f32>> {
+    chunks
+        .iter()
+        .filter(|chunk| {
+            if chunk.source != source {
+                return false;
+            }
+            let duration = chunk.end_ms.saturating_sub(chunk.start_ms);
+            if duration < MIN_LEARN_MS {
+                return false;
+            }
+            let overlap = chunk
+                .end_ms
+                .min(end_ms)
+                .saturating_sub(chunk.start_ms.max(start_ms));
+            overlap.saturating_mul(2) >= duration
+        })
+        .map(|chunk| chunk.embedding.clone())
+        .collect()
+}
+
+fn score_speaker_name(database: &SpeakerDatabase, name: &str, query: &[Vec<f32>]) -> Option<f32> {
+    embedding::speaker_score(query, &database.speakers.get(name)?.embeddings)
+}
+
+fn centroid_prefilter<'a>(
+    database: &'a SpeakerDatabase,
+    query: &[Vec<f32>],
     allowed: Option<&HashSet<String>>,
-) -> Option<(String, f32)> {
-    database
+) -> Vec<(&'a str, &'a database::SpeakerRecord)> {
+    let Some(query_centroid) = embedding::mean_normalized(query) else {
+        return Vec::new();
+    };
+    let mut candidates = database
         .speakers
         .iter()
         .filter(|(name, _)| allowed.is_none_or(|allowed| allowed.contains(*name)))
-        .flat_map(|(name, speaker)| {
-            speaker.embeddings.iter().filter_map(move |enrolled| {
-                let mut enrolled = enrolled.clone();
-                embedding::normalize(&mut enrolled)
-                    .then(|| embedding::cosine(cluster, &enrolled))
-                    .flatten()
-                    .map(|score| (name.clone(), score))
-            })
+        .filter_map(|(name, speaker)| {
+            embedding::cosine(&query_centroid, speaker.centroid.as_deref()?)
+                .map(|score| (name.as_str(), speaker, score))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.2.total_cmp(&left.2).then_with(|| left.0.cmp(right.0)));
+    candidates.truncate(5);
+    candidates
+        .into_iter()
+        .map(|(name, speaker, _)| (name, speaker))
+        .collect()
+}
+
+fn best_candidate(
+    database: &SpeakerDatabase,
+    query: &[Vec<f32>],
+    allowed: Option<&HashSet<String>>,
+) -> Option<(String, f32)> {
+    centroid_prefilter(database, query, allowed)
+        .into_iter()
+        .filter_map(|(name, _)| {
+            score_speaker_name(database, name, query).map(|score| (name.to_owned(), score))
         })
         .max_by(|left, right| {
             left.1
@@ -1714,32 +2201,112 @@ mod tests {
     }
 
     #[test]
-    fn best_score_uses_max_enrollment_embedding() {
-        let database = SpeakerDatabase {
-            embedding_model: EmbeddingModelIdentity {
-                name: "m".into(),
-                sha256: "x".into(),
-                dimension: 2,
-            },
-            speakers: BTreeMap::from([
-                (
-                    "Alice".into(),
-                    SpeakerRecord {
-                        embeddings: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
-                    },
-                ),
-                (
-                    "Bob".into(),
-                    SpeakerRecord {
-                        embeddings: vec![vec![-1.0, 0.0]],
-                    },
-                ),
-            ]),
+    fn chunk_windows_are_equal_and_keep_short_segments() {
+        let ranges = |duration: u64| {
+            chunk_ranges(&SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 100,
+                end_ms: 100 + duration,
+                cluster: 0,
+            })
+            .into_iter()
+            .map(|(start, end)| end - start)
+            .collect::<Vec<_>>()
         };
-        let (name, score) =
-            best_candidate_filtered(&database, &[0.0, 1.0], None).expect("candidate");
-        assert_eq!(name, "Alice");
-        assert!((score - 1.0).abs() < 1e-6);
+        assert!(ranges(0).is_empty());
+        assert_eq!(ranges(1_499), [1_499]);
+        assert_eq!(ranges(1_500), [1_500]);
+        assert_eq!(ranges(10_000), [10_000]);
+        assert_eq!(ranges(10_001), [5_000, 5_001]);
+        assert_eq!(ranges(20_000), [10_000, 10_000]);
+        assert_eq!(ranges(20_001), [6_667, 6_667, 6_667]);
+    }
+
+    #[test]
+    fn embedding_range_requires_half_overlap_and_minimum_duration() {
+        let chunks = [
+            EmbeddingChunk {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 2_000,
+                cluster: 1,
+                embedding: vec![1.0, 0.0],
+            },
+            EmbeddingChunk {
+                source: AudioSource::System,
+                start_ms: 2_000,
+                end_ms: 3_499,
+                cluster: 1,
+                embedding: vec![0.0, 1.0],
+            },
+            EmbeddingChunk {
+                source: AudioSource::Mic,
+                start_ms: 0,
+                end_ms: 2_000,
+                cluster: 1,
+                embedding: vec![-1.0, 0.0],
+            },
+        ];
+
+        assert_eq!(
+            embeddings_in_range(&chunks, AudioSource::System, 1_000, 2_000),
+            vec![vec![1.0, 0.0]]
+        );
+        assert!(embeddings_in_range(&chunks, AudioSource::System, 1_001, 2_000).is_empty());
+    }
+
+    #[test]
+    fn microphone_diarization_is_effective_only_with_mic_segments() {
+        assert!(!effective_diarize_mic(true, &[]));
+        assert!(!effective_diarize_mic(
+            false,
+            &[SpeakerSegment {
+                source: AudioSource::Mic,
+                start_ms: 0,
+                end_ms: 1_000,
+                cluster: 0,
+            }]
+        ));
+        assert!(effective_diarize_mic(
+            true,
+            &[SpeakerSegment {
+                source: AudioSource::Mic,
+                start_ms: 0,
+                end_ms: 1_000,
+                cluster: 0,
+            }]
+        ));
+    }
+
+    #[test]
+    fn centroid_prefilter_keeps_only_five_nearest_speakers() {
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "m".into(),
+            sha256: "x".into(),
+            dimension: 2,
+        });
+        for (name, x) in [
+            ("A", 1.0f32),
+            ("B", 0.9),
+            ("C", 0.8),
+            ("D", 0.7),
+            ("E", 0.6),
+            ("F", -1.0),
+        ] {
+            database.speakers.insert(
+                name.into(),
+                SpeakerRecord {
+                    embeddings: vec![vec![x, (1.0 - x * x).max(0.0).sqrt()]],
+                    centroid: None,
+                },
+            );
+        }
+        database.refresh_centroids();
+        let names = centroid_prefilter(&database, &[vec![1.0, 0.0]], None)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["A", "B", "C", "D", "E"]);
     }
 
     #[test]
@@ -1796,30 +2363,29 @@ mod tests {
             allowed_candidate_names(&meeting, AudioSource::Mic),
             Some(HashSet::from(["Bob".into(), "Laura".into()]))
         );
-        let database = SpeakerDatabase {
-            embedding_model: EmbeddingModelIdentity {
-                name: "m".into(),
-                sha256: "x".into(),
-                dimension: 2,
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "m".into(),
+            sha256: "x".into(),
+            dimension: 2,
+        });
+        database.speakers.insert(
+            "Alice".into(),
+            SpeakerRecord {
+                embeddings: vec![vec![1.0, 0.0]],
+                centroid: None,
             },
-            speakers: BTreeMap::from([
-                (
-                    "Alice".into(),
-                    SpeakerRecord {
-                        embeddings: vec![vec![1.0, 0.0]],
-                    },
-                ),
-                (
-                    "Bob".into(),
-                    SpeakerRecord {
-                        embeddings: vec![vec![0.0, 1.0]],
-                    },
-                ),
-            ]),
-        };
+        );
+        database.speakers.insert(
+            "Bob".into(),
+            SpeakerRecord {
+                embeddings: vec![vec![0.0, 1.0]],
+                centroid: None,
+            },
+        );
+        database.refresh_centroids();
         let allowed = HashSet::from(["Bob".into()]);
         assert_eq!(
-            best_candidate_filtered(&database, &[1.0, 0.0], Some(&allowed))
+            best_candidate(&database, &[vec![1.0, 0.0]], Some(&allowed))
                 .expect("filtered candidate")
                 .0,
             "Bob"
@@ -1868,6 +2434,7 @@ mod tests {
                 speaker_id: "spk_3".into(),
                 speaker: "SPEAKER_00".into(),
                 text: "hello".into(),
+                locked: false,
                 echo: None,
             }],
         );
@@ -2056,6 +2623,19 @@ mod tests {
         jsonl::write_all_atomic::<TimedWord>(&session.words_path(), &[]).expect("write words");
         fs::write(session.transcript_path(), b"stale transcript\n")
             .expect("write stale transcript");
+        let corrections = SpeakerCorrections {
+            format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
+            corrections: vec![SpeakerCorrection {
+                source: AudioSource::Mic,
+                start_ms: 10,
+                end_ms: 20,
+                speaker: "Alice".into(),
+            }],
+        };
+        write_json_atomic(&session.speaker_corrections_path(), &corrections)
+            .expect("write corrections");
+        let correction_bytes =
+            fs::read(session.speaker_corrections_path()).expect("read corrections");
 
         run(ProcessArgs {
             session: session.dir.clone(),
@@ -2096,6 +2676,10 @@ mod tests {
         assert_ne!(
             fs::read(session.transcript_path()).expect("read replaced transcript"),
             b"stale transcript\n"
+        );
+        assert_eq!(
+            fs::read(session.speaker_corrections_path()).expect("reread corrections"),
+            correction_bytes
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -2245,45 +2829,183 @@ mod tests {
     }
 
     #[test]
-    fn manual_assignment_rerenders_without_a_voice_model() {
-        let (root, session) = assignment_fixture("manual-assignment", None);
-        let outcome = assign_speaker(stage_process_args(session.dir.clone()), "spk_7", "Carol")
-            .expect("assign speaker");
-        assert!(!outcome.learned);
-        assert_eq!(outcome.previous, None);
+    fn correction_without_model_locks_and_rerenders_only_its_range() {
+        let (root, session) = assignment_fixture("speaker-correction", None);
+        let request = CorrectionRequest {
+            source: AudioSource::System,
+            start_ms: 10,
+            end_ms: 20,
+            speaker: " Carol ".into(),
+        };
+        let outcome = correct_speaker(stage_process_args(session.dir.clone()), &request)
+            .expect("correct speaker");
+        assert_eq!(outcome.learned, 0);
         assert_eq!(outcome.forgotten, 0);
+        assert!(!outcome.learning_available);
+        assert!(outcome.proposals.is_empty());
+        let corrections: SpeakerCorrections =
+            read_json(&session.speaker_corrections_path()).expect("read corrections");
+        assert_eq!(corrections.corrections[0].speaker, "Carol");
         let transcript: Vec<Utterance> =
             jsonl::read_all(&session.transcript_path()).expect("read transcript");
         assert_eq!(transcript[0].speaker, "Carol");
+        assert!(transcript[0].locked);
+        let assignments: SpeakerAssignments =
+            read_json(&session.speaker_assignments_path()).expect("read assignments");
+        assert_eq!(assignments.assignments[0].speaker, None);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
-    fn reassigns_named_cluster_without_a_voice_model() {
-        let (root, session) = assignment_fixture("speaker-reassignment", Some("Carol"));
-        let outcome = assign_speaker(stage_process_args(session.dir.clone()), "spk_7", "Dave")
-            .expect("reassign speaker");
-        assert!(!outcome.learned);
-        assert_eq!(outcome.previous.as_deref(), Some("Carol"));
-        assert_eq!(outcome.forgotten, 0);
-        let transcript: Vec<Utterance> =
-            jsonl::read_all(&session.transcript_path()).expect("read transcript");
-        assert_eq!(transcript[0].speaker, "Dave");
-        fs::remove_dir_all(root).expect("remove fixture");
+    fn correction_upsert_replaces_only_same_source_overlaps() {
+        let mut artifact = SpeakerCorrections {
+            format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
+            corrections: vec![
+                SpeakerCorrection {
+                    source: AudioSource::System,
+                    start_ms: 0,
+                    end_ms: 100,
+                    speaker: "Old".into(),
+                },
+                SpeakerCorrection {
+                    source: AudioSource::System,
+                    start_ms: 100,
+                    end_ms: 200,
+                    speaker: "Adjacent".into(),
+                },
+                SpeakerCorrection {
+                    source: AudioSource::Mic,
+                    start_ms: 0,
+                    end_ms: 100,
+                    speaker: "Other source".into(),
+                },
+            ],
+        };
+        let replacement = SpeakerCorrection {
+            source: AudioSource::System,
+            start_ms: 50,
+            end_ms: 100,
+            speaker: "New".into(),
+        };
+
+        let replaced = upsert_correction(&mut artifact, replacement.clone());
+
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].speaker, "Old");
+        assert_eq!(artifact.corrections.len(), 3);
+        assert!(artifact.corrections.contains(&replacement));
+        assert!(
+            artifact
+                .corrections
+                .iter()
+                .any(|correction| correction.speaker == "Adjacent")
+        );
+        assert!(
+            artifact
+                .corrections
+                .iter()
+                .any(|correction| correction.speaker == "Other source")
+        );
     }
 
     #[test]
-    fn assigning_same_name_again_still_renders() {
-        let (root, session) = assignment_fixture("same-speaker-assignment", Some("Carol"));
-        let outcome = assign_speaker(stage_process_args(session.dir.clone()), "spk_7", " Carol ")
-            .expect("assign same speaker");
-        assert!(!outcome.learned);
-        assert_eq!(outcome.previous.as_deref(), Some("Carol"));
-        assert_eq!(outcome.forgotten, 0);
-        let transcript: Vec<Utterance> =
-            jsonl::read_all(&session.transcript_path()).expect("read transcript");
-        assert_eq!(transcript[0].speaker, "Carol");
-        fs::remove_dir_all(root).expect("remove fixture");
+    fn proposals_are_forward_unlocked_cluster_matches_with_margin() {
+        let request = CorrectionRequest {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            speaker: "Alice".into(),
+        };
+        let chunks = [EmbeddingChunk {
+            source: AudioSource::System,
+            start_ms: 2_000,
+            end_ms: 4_000,
+            cluster: 7,
+            embedding: vec![1.0, 0.0],
+        }];
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "model".into(),
+            sha256: "hash".into(),
+            dimension: 2,
+        });
+        database.speakers.insert(
+            "Alice".into(),
+            SpeakerRecord {
+                embeddings: vec![vec![1.0, 0.0]],
+                centroid: None,
+            },
+        );
+        database.speakers.insert(
+            "Bob".into(),
+            SpeakerRecord {
+                embeddings: vec![vec![0.96, 0.28]],
+                centroid: None,
+            },
+        );
+        let candidate = Utterance {
+            start_ms: 2_000,
+            end_ms: 4_000,
+            source: AudioSource::System,
+            speaker_id: "spk_7".into(),
+            speaker: "Bob".into(),
+            text: "later".into(),
+            locked: false,
+            echo: None,
+        };
+
+        let proposal =
+            proposal_for_utterance(&request, 7, candidate.clone(), &chunks, &database, 0.6)
+                .expect("proposal");
+        assert_eq!(proposal.current_speaker.as_deref(), Some("Bob"));
+        assert_eq!(proposal.score_new, 1.0);
+        assert!(proposal.score_old.is_some_and(|score| score > 0.95));
+        assert!(!proposal.proposed);
+
+        database.speakers.get_mut("Bob").unwrap().embeddings = vec![vec![0.8, 0.6]];
+        assert!(
+            proposal_for_utterance(&request, 7, candidate.clone(), &chunks, &database, 0.6)
+                .expect("positive margin proposal")
+                .proposed
+        );
+        let anonymous = Utterance {
+            speaker: "SPEAKER_00".into(),
+            ..candidate.clone()
+        };
+        let anonymous_proposal =
+            proposal_for_utterance(&request, 7, anonymous, &chunks, &database, 0.99)
+                .expect("anonymous threshold proposal");
+        assert_eq!(anonymous_proposal.score_old, None);
+        assert!(anonymous_proposal.proposed);
+
+        assert!(
+            proposal_for_utterance(
+                &request,
+                7,
+                Utterance {
+                    locked: true,
+                    ..candidate.clone()
+                },
+                &chunks,
+                &database,
+                0.6,
+            )
+            .is_none()
+        );
+        assert!(
+            proposal_for_utterance(
+                &request,
+                7,
+                Utterance {
+                    start_ms: 1_999,
+                    ..candidate.clone()
+                },
+                &chunks,
+                &database,
+                0.6,
+            )
+            .is_none()
+        );
+        assert!(proposal_for_utterance(&request, 8, candidate, &chunks, &database, 0.6).is_none());
     }
 
     #[test]

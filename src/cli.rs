@@ -1,4 +1,5 @@
-use clap::{Args, Parser, Subcommand};
+use crate::types::{AudioSource, DEFAULT_SPEAKER_THRESHOLD};
+use clap::{ArgAction, Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -34,13 +35,13 @@ pub enum Command {
     Diarize(DiarizeArgs),
     /// Match diarized clusters and write speaker-assignments.json.
     Recognize(RecognizeArgs),
+    /// Correct one transcript line and learn its speaker.
+    Correct(CorrectArgs),
     /// Render persistent processing artifacts into transcript files.
     Render(RenderArgs),
     /// Convert a processed session's raw audio to 16-bit FLAC to save disk space.
     Archive(ArchiveArgs),
-    /// Enroll a known speaker from audio samples (raw f32le or WAV).
-    Enroll(EnrollArgs),
-    /// List enrolled speakers.
+    /// List learned speakers.
     Speakers(SpeakersArgs),
 }
 
@@ -91,8 +92,15 @@ pub struct ProcessArgs {
     /// Skip model hash verification (development only).
     #[arg(long)]
     pub allow_unverified_models: bool,
-    /// Also diarize the microphone track (several people in the room).
-    #[arg(long)]
+    /// Diarize the microphone track (`--diarize-mic=false` to disable).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        require_equals = true,
+        action = ArgAction::Set
+    )]
     pub diarize_mic: bool,
     /// Skip diarization entirely; every system utterance is `unknown`.
     #[arg(long)]
@@ -107,11 +115,11 @@ pub struct ProcessArgs {
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]
     pub threads: Option<usize>,
-    /// Enrolled-speaker database (default: $XDG_DATA_HOME/singstone/speakers.json).
+    /// Learned-speaker database (default: $XDG_DATA_HOME/singstone/speakers.json).
     #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
     pub speakers_db: Option<PathBuf>,
-    /// Minimum cosine similarity to name a diarized cluster after an enrolled speaker.
-    #[arg(long, default_value_t = 0.6)]
+    /// Minimum speaker-matching score required to name a diarized cluster.
+    #[arg(long, default_value_t = DEFAULT_SPEAKER_THRESHOLD)]
     pub speaker_threshold: f32,
     /// Sherpa agglomerative clustering distance threshold (lower = more
     /// speakers; 0.9-1.1 works with titanet-small on meeting audio).
@@ -132,7 +140,7 @@ impl ProcessArgs {
             embedding_model: std::env::var_os("SINGSTONE_EMBEDDING_MODEL").map(PathBuf::from),
             models_lock: std::env::var_os("SINGSTONE_MODELS_LOCK").map(PathBuf::from),
             allow_unverified_models: false,
-            diarize_mic: false,
+            diarize_mic: true,
             no_diarize: false,
             skip_transcription: false,
             language: std::env::var("SINGSTONE_WHISPER_LANGUAGE")
@@ -141,7 +149,7 @@ impl ProcessArgs {
                 .unwrap_or_else(|| "auto".into()),
             threads: None,
             speakers_db: std::env::var_os("SINGSTONE_SPEAKERS_DB").map(PathBuf::from),
-            speaker_threshold: 0.6,
+            speaker_threshold: DEFAULT_SPEAKER_THRESHOLD,
             cluster_threshold: 1.0,
             num_speakers: None,
         }
@@ -185,8 +193,15 @@ pub struct DiarizeArgs {
     /// Skip model hash verification (development only).
     #[arg(long)]
     pub allow_unverified_models: bool,
-    /// Also diarize the microphone track (several people in the room).
-    #[arg(long)]
+    /// Diarize the microphone track (`--diarize-mic=false` to disable).
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_value_t = true,
+        default_missing_value = "true",
+        require_equals = true,
+        action = ArgAction::Set
+    )]
     pub diarize_mic: bool,
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]
@@ -215,12 +230,56 @@ pub struct RecognizeArgs {
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]
     pub threads: Option<usize>,
-    /// Enrolled-speaker database (default: $XDG_DATA_HOME/singstone/speakers.json).
+    /// Learned-speaker database (default: $XDG_DATA_HOME/singstone/speakers.json).
     #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
     pub speakers_db: Option<PathBuf>,
-    /// Minimum cosine similarity to name a diarized cluster after an enrolled speaker.
-    #[arg(long, default_value_t = 0.6)]
+    /// Minimum speaker-matching score required to name a diarized cluster.
+    #[arg(long, default_value_t = DEFAULT_SPEAKER_THRESHOLD)]
     pub speaker_threshold: f32,
+}
+
+#[derive(Args, Debug)]
+pub struct CorrectArgs {
+    /// Session directory.
+    pub session: PathBuf,
+    /// Audio source of the rendered transcript line.
+    #[arg(long, value_parser = parse_audio_source)]
+    pub source: AudioSource,
+    /// Exact rendered start time of the transcript line.
+    #[arg(long)]
+    pub start_ms: u64,
+    /// Exact rendered end time of the transcript line.
+    #[arg(long)]
+    pub end_ms: u64,
+    /// Speaker name to lock onto the line.
+    #[arg(long)]
+    pub name: String,
+    /// Path to the sherpa-onnx speaker embedding model.
+    #[arg(long, env = "SINGSTONE_EMBEDDING_MODEL")]
+    pub embedding_model: PathBuf,
+    /// Trusted model manifest with SHA-256 hashes.
+    #[arg(long, env = "SINGSTONE_MODELS_LOCK")]
+    pub models_lock: Option<PathBuf>,
+    /// Skip model hash verification (development only).
+    #[arg(long)]
+    pub allow_unverified_models: bool,
+    /// Inference threads (defaults to available parallelism).
+    #[arg(long)]
+    pub threads: Option<usize>,
+    /// Learned-speaker database (default: $XDG_DATA_HOME/singstone/speakers.json).
+    #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
+    pub speakers_db: Option<PathBuf>,
+    /// Minimum score for an unnamed forward proposal.
+    #[arg(long, default_value_t = DEFAULT_SPEAKER_THRESHOLD)]
+    pub speaker_threshold: f32,
+}
+
+fn parse_audio_source(value: &str) -> Result<AudioSource, String> {
+    match value {
+        "mic" => Ok(AudioSource::Mic),
+        "system" => Ok(AudioSource::System),
+        _ => Err("source must be 'system' or 'mic'".into()),
+    }
 }
 
 #[derive(Args, Debug)]
@@ -244,26 +303,6 @@ pub struct ArchiveArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct EnrollArgs {
-    /// Speaker name.
-    pub name: String,
-    /// Audio samples: raw 16 kHz mono f32le, or 16 kHz mono WAV.
-    #[arg(required = true)]
-    pub samples: Vec<PathBuf>,
-    #[arg(long, env = "SINGSTONE_EMBEDDING_MODEL")]
-    pub embedding_model: PathBuf,
-    #[arg(long, env = "SINGSTONE_MODELS_LOCK")]
-    pub models_lock: Option<PathBuf>,
-    #[arg(long)]
-    pub allow_unverified_models: bool,
-    #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
-    pub speakers_db: Option<PathBuf>,
-    /// Replace existing embeddings for this name instead of adding to them.
-    #[arg(long)]
-    pub replace: bool,
-}
-
-#[derive(Args, Debug)]
 pub struct SpeakersArgs {
     #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
     pub speakers_db: Option<PathBuf>,
@@ -279,11 +318,26 @@ mod tests {
             ProcessArgs::for_session(PathBuf::from("session")).language,
             "auto"
         );
+        assert!(ProcessArgs::for_session(PathBuf::from("session")).diarize_mic);
         let process =
             Cli::try_parse_from(["singstone", "process", "session"]).expect("parse process");
         assert!(matches!(
             process.command,
-            Command::Process(ProcessArgs { language, .. }) if language == "auto"
+            Command::Process(ProcessArgs {
+                language,
+                diarize_mic: true,
+                ..
+            }) if language == "auto"
+        ));
+        let process_without_mic =
+            Cli::try_parse_from(["singstone", "process", "session", "--diarize-mic=false"])
+                .expect("parse process microphone opt-out");
+        assert!(matches!(
+            process_without_mic.command,
+            Command::Process(ProcessArgs {
+                diarize_mic: false,
+                ..
+            })
         ));
 
         let transcribe = Cli::try_parse_from([
@@ -309,7 +363,31 @@ mod tests {
             "embed.onnx",
         ])
         .expect("parse diarize");
-        assert!(matches!(diarize.command, Command::Diarize(_)));
+        assert!(matches!(
+            diarize.command,
+            Command::Diarize(DiarizeArgs {
+                diarize_mic: true,
+                ..
+            })
+        ));
+        let diarize_without_mic = Cli::try_parse_from([
+            "singstone",
+            "diarize",
+            "session",
+            "--segmentation-model",
+            "seg.onnx",
+            "--embedding-model",
+            "embed.onnx",
+            "--diarize-mic=false",
+        ])
+        .expect("parse diarize microphone opt-out");
+        assert!(matches!(
+            diarize_without_mic.command,
+            Command::Diarize(DiarizeArgs {
+                diarize_mic: false,
+                ..
+            })
+        ));
 
         let recognize = Cli::try_parse_from([
             "singstone",
@@ -320,6 +398,33 @@ mod tests {
         ])
         .expect("parse recognize");
         assert!(matches!(recognize.command, Command::Recognize(_)));
+
+        let correct = Cli::try_parse_from([
+            "singstone",
+            "correct",
+            "session",
+            "--source",
+            "mic",
+            "--start-ms",
+            "100",
+            "--end-ms",
+            "200",
+            "--name",
+            "Alice",
+            "--embedding-model",
+            "embed.onnx",
+        ])
+        .expect("parse correction");
+        assert!(matches!(
+            correct.command,
+            Command::Correct(CorrectArgs {
+                source: AudioSource::Mic,
+                start_ms: 100,
+                end_ms: 200,
+                ref name,
+                ..
+            }) if name == "Alice"
+        ));
 
         let render = Cli::try_parse_from(["singstone", "render", "session", "--diarize-mic"])
             .expect("parse render");

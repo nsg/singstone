@@ -3,14 +3,13 @@ mod remote;
 mod wrap_layout;
 
 use crate::audio::{archive, devices, record};
-use crate::cli::{Command, EnrollArgs, ProcessArgs, RecordArgs, RenderArgs};
+use crate::cli::{Command, ProcessArgs, RecordArgs, RenderArgs};
 use crate::format::jsonl;
 use crate::meeting::{self, Attendees, MeetingDetails};
 use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
 use crate::model_setup;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase};
-use crate::speaker::enroll;
 use crate::transcription::{TranscriptionProgress, backend};
 use crate::types::{
     AudioSource, EchoEvidence, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance,
@@ -163,7 +162,7 @@ fn build_window(app: &adw::Application) {
     new_recording.set_tooltip_text(Some("Set up a new recording"));
     header.pack_start(&new_recording);
     let speakers = header_action_button("system-users-symbolic", "Speakers");
-    speakers.set_tooltip_text(Some("Manage enrolled speakers"));
+    speakers.set_tooltip_text(Some("Manage learned speakers"));
     header.pack_start(&speakers);
     let settings = header_action_button("preferences-system-symbolic", "Settings");
     settings.set_tooltip_text(Some("Open application settings"));
@@ -840,8 +839,6 @@ struct SpeakersPage {
     root: gtk::Box,
     group: adw::PreferencesGroup,
     rows: Rc<RefCell<Vec<adw::ActionRow>>>,
-    add_row: adw::ActionRow,
-    add: gtk::Button,
     database_path: PathBuf,
 }
 
@@ -857,21 +854,13 @@ fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
         .build();
     let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
     let group = adw::PreferencesGroup::builder()
-        .title("Enrolled voices")
+        .title("Learned voices")
         .description("Voices are matched locally; uncertain matches stay anonymous")
         .build();
     let db_path = std::env::var_os("SINGSTONE_SPEAKERS_DB")
         .map(PathBuf::from)
         .unwrap_or_else(database::default_path);
     body.append(&group);
-    let add_row = adw::ActionRow::builder()
-        .title("Enroll a new voice")
-        .subtitle("Pick 10–30 seconds of clean speech")
-        .build();
-    add_row.add_prefix(&gtk::Image::from_icon_name("contact-new-symbolic"));
-    let add = gtk::Button::with_label("Add…");
-    add.set_valign(gtk::Align::Center);
-    add_row.add_suffix(&add);
     let path = gtk::Label::new(Some(&format!("Database: {}", db_path.display())));
     path.set_xalign(0.0);
     path.set_wrap(true);
@@ -885,24 +874,14 @@ fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
         root,
         group,
         rows: Rc::new(RefCell::new(Vec::new())),
-        add_row,
-        add,
         database_path: db_path,
     };
     page.refresh(window);
-    let page_for_add = page.clone();
-    let window_for_add = window.clone();
-    page.add.connect_clicked(move |_| {
-        show_enroll_dialog(&window_for_add, &page_for_add);
-    });
     page
 }
 
 impl SpeakersPage {
     fn refresh(&self, window: &adw::ApplicationWindow) {
-        if self.add_row.parent().is_some() {
-            self.group.remove(&self.add_row);
-        }
         for row in self.rows.borrow_mut().drain(..) {
             self.group.remove(&row);
         }
@@ -924,7 +903,7 @@ impl SpeakersPage {
                         .build();
                     row.add_prefix(&gtk::Image::from_icon_name("avatar-default-symbolic"));
                     let remove = gtk::Button::from_icon_name("user-trash-symbolic");
-                    remove.set_tooltip_text(Some("Remove enrolled voice"));
+                    remove.set_tooltip_text(Some("Remove learned voice"));
                     remove.add_css_class("flat");
                     remove.set_valign(gtk::Align::Center);
                     row.add_suffix(&remove);
@@ -939,22 +918,21 @@ impl SpeakersPage {
             }
             Ok(_) | Err(_) => {
                 let row = adw::ActionRow::builder()
-                    .title("No enrolled voices yet")
-                    .subtitle("Add 10–30 seconds of clean speech to recognize someone")
+                    .title("No learned voices yet")
+                    .subtitle("Name someone in a transcript to teach Singstone their voice")
                     .build();
-                row.add_prefix(&gtk::Image::from_icon_name("contact-new-symbolic"));
+                row.add_prefix(&gtk::Image::from_icon_name("avatar-default-symbolic"));
                 self.group.add(&row);
                 rows.push(row);
             }
         }
-        self.group.add(&self.add_row);
         *self.rows.borrow_mut() = rows;
     }
 }
 
 fn confirm_delete_speaker(parent: &adw::ApplicationWindow, page: &SpeakersPage, name: &str) {
     let dialog = adw::AlertDialog::new(
-        Some("Remove enrolled voice?"),
+        Some("Remove learned voice?"),
         Some(&format!(
             "Future sessions will no longer recognize {name}. Existing transcripts are unchanged."
         )),
@@ -981,111 +959,6 @@ fn confirm_delete_speaker(parent: &adw::ApplicationWindow, page: &SpeakersPage, 
         }
     });
     dialog.present(Some(parent));
-}
-
-fn show_enroll_dialog(parent: &adw::ApplicationWindow, page: &SpeakersPage) {
-    let dialog = adw::AlertDialog::new(
-        Some("Enroll a new voice"),
-        Some(
-            "Name the speaker, then choose one or more clean 16 kHz WAV or raw f32le recordings (10–30 seconds works well).",
-        ),
-    );
-    let entry = gtk::Entry::builder()
-        .placeholder_text("Speaker name")
-        .activates_default(true)
-        .build();
-    dialog.set_extra_child(Some(&entry));
-    dialog.add_responses(&[("cancel", "Cancel"), ("choose", "Choose audio…")]);
-    dialog.set_default_response(Some("choose"));
-    dialog.set_close_response("cancel");
-    dialog.set_response_appearance("choose", adw::ResponseAppearance::Suggested);
-    let parent_for_response = parent.clone();
-    let page_for_response = page.clone();
-    dialog.connect_response(Some("choose"), move |_, _| {
-        let name = entry.text().trim().to_owned();
-        if name.is_empty() {
-            show_error(
-                &parent_for_response,
-                "Speaker name required",
-                "Enter the name that should appear in transcripts.",
-            );
-            return;
-        }
-        choose_enrollment_audio(&parent_for_response, &page_for_response, name);
-    });
-    dialog.present(Some(parent));
-}
-
-fn choose_enrollment_audio(parent: &adw::ApplicationWindow, page: &SpeakersPage, name: String) {
-    let Some(embedding_model) = std::env::var_os("SINGSTONE_EMBEDDING_MODEL").map(PathBuf::from)
-    else {
-        show_error(
-            parent,
-            "Speaker model is not configured",
-            "Process a session after installing the local models, then try again.",
-        );
-        return;
-    };
-    let chooser = gtk::FileDialog::builder()
-        .title("Choose clean voice recordings")
-        .accept_label("Enroll")
-        .modal(true)
-        .build();
-    let parent_for_choose = parent.clone();
-    let page_for_choose = page.clone();
-    chooser.open_multiple(Some(parent), None::<&gio::Cancellable>, move |result| {
-        let Ok(files) = result else { return };
-        let samples = (0..files.n_items())
-            .filter_map(|index| files.item(index))
-            .filter_map(|item| item.downcast::<gio::File>().ok())
-            .filter_map(|file| file.path())
-            .collect::<Vec<_>>();
-        if samples.is_empty() {
-            return;
-        }
-        let args = EnrollArgs {
-            name,
-            samples,
-            embedding_model,
-            models_lock: std::env::var_os("SINGSTONE_MODELS_LOCK").map(PathBuf::from),
-            allow_unverified_models: false,
-            speakers_db: Some(page_for_choose.database_path.clone()),
-            replace: false,
-        };
-        start_enrollment(&parent_for_choose, &page_for_choose, args);
-    });
-}
-
-fn start_enrollment(parent: &adw::ApplicationWindow, page: &SpeakersPage, args: EnrollArgs) {
-    page.add.set_sensitive(false);
-    page.add.set_label("Enrolling…");
-    let result = Arc::new(Mutex::new(None));
-    let thread_result = result.clone();
-    std::thread::spawn(move || {
-        let value = (|| -> Result<(), String> {
-            let command = Command::Enroll(args);
-            model_setup::ensure_available(&command).map_err(|error| error.to_string())?;
-            let Command::Enroll(args) = command else {
-                unreachable!()
-            };
-            enroll::run(args).map_err(|error| error.to_string())
-        })();
-        *thread_result.lock().expect("enrollment result mutex") = Some(value);
-    });
-    let parent = parent.clone();
-    let page = page.clone();
-    glib::timeout_add_local(Duration::from_millis(150), move || {
-        let Some(result) = result.lock().expect("enrollment result mutex").take() else {
-            return glib::ControlFlow::Continue;
-        };
-        page.add.set_sensitive(true);
-        page.add.set_label("Add a voice…");
-        match result {
-            Ok(()) => page.refresh(&parent),
-            Err(error) => show_error(&parent, "Could not enroll voice", &error),
-        }
-        glib::ControlFlow::Break
-    });
 }
 
 struct SettingsPage {
@@ -2192,7 +2065,7 @@ fn wire_processing(
             let dialog = adw::AlertDialog::new(
                 Some("Reprocess this recording?"),
                 Some(
-                    "This replaces the transcript, intermediate processing files, and assigned speaker names. Recorded audio is preserved.",
+                    "This replaces the transcript, intermediate processing files, and automatic speaker matches. Recorded audio and your confirmed speaker corrections are preserved.",
                 ),
             );
             dialog.add_responses(&[("cancel", "Cancel"), ("reprocess", "Reprocess")]);
@@ -3404,6 +3277,7 @@ fn transcript_row(
         echo.set_tooltip_text(Some(match evidence {
             EchoEvidence::RemoteAttendee => "Remote attendee heard through the microphone",
             EchoEvidence::LocalRoster => "Everyone in the room is already identified",
+            EchoEvidence::SystemTrackSpeaker => "This speaker is also resolved on the system track",
         }));
         head.append(&echo);
     }
@@ -3426,30 +3300,43 @@ fn transcript_row(
                 let shortcut = shortcut_button(name);
                 shortcut.set_tooltip_text(Some(&format!("Assign this voice to {name}")));
                 let detail = detail.clone();
-                let speaker_id = utterance.speaker_id.clone();
+                let source = utterance.source;
+                let start_ms = utterance.start_ms;
+                let end_ms = utterance.end_ms;
                 let name = name.clone();
                 shortcut.connect_clicked(move |_| {
-                    start_assignment(&detail, speaker_id.clone(), name.clone());
+                    start_assignment(&detail, source, start_ms, end_ms, name.clone());
                 });
                 head.append(&shortcut);
             }
             let assign = caption_button("Assign…");
             let detail = detail.clone();
-            let speaker_id = utterance.speaker_id.clone();
+            let source = utterance.source;
+            let start_ms = utterance.start_ms;
+            let end_ms = utterance.end_ms;
             let frequent = frequent.clone();
             assign.connect_clicked(move |_| {
-                show_assignment_dialog(&detail, &speaker_id, None, &frequent);
+                show_assignment_dialog(&detail, source, start_ms, end_ms, None, &frequent);
             });
             head.append(&assign);
         } else {
             let change = caption_button("Change…");
             change.set_tooltip_text(Some("Reassign this voice to someone else"));
             let detail = detail.clone();
-            let speaker_id = utterance.speaker_id.clone();
+            let source = utterance.source;
+            let start_ms = utterance.start_ms;
+            let end_ms = utterance.end_ms;
             let current = utterance.speaker.clone();
             let frequent = frequent.clone();
             change.connect_clicked(move |_| {
-                show_assignment_dialog(&detail, &speaker_id, Some(&current), &frequent);
+                show_assignment_dialog(
+                    &detail,
+                    source,
+                    start_ms,
+                    end_ms,
+                    Some(&current),
+                    &frequent,
+                );
             });
             head.append(&change);
         }
@@ -3519,7 +3406,9 @@ fn frequent_speakers(utterances: &[Utterance], limit: usize) -> Vec<String> {
 
 fn show_assignment_dialog(
     detail: &SessionDetail,
-    speaker_id: &str,
+    source: AudioSource,
+    start_ms: u64,
+    end_ms: u64,
     current: Option<&str>,
     frequent: &[String],
 ) {
@@ -3578,7 +3467,7 @@ fn show_assignment_dialog(
         let refs = names.iter().map(String::as_str).collect::<Vec<_>>();
         if !refs.is_empty() {
             let choices = gtk::DropDown::from_strings(&refs);
-            choices.set_tooltip_text(Some("Choose an enrolled speaker"));
+            choices.set_tooltip_text(Some("Choose a learned speaker"));
             if current.is_some() {
                 choices.set_selected(gtk::INVALID_LIST_POSITION);
             } else if let Some(first) = names.first() {
@@ -3605,7 +3494,6 @@ fn show_assignment_dialog(
     dialog.set_close_response("cancel");
     dialog.set_response_appearance("assign", adw::ResponseAppearance::Suggested);
     let detail_for_response = detail.clone();
-    let speaker_id = speaker_id.to_owned();
     let current = current.map(str::to_owned);
     dialog.connect_response(Some("assign"), move |_, _| {
         let name = entry.text().trim().to_owned();
@@ -3628,12 +3516,18 @@ fn show_assignment_dialog(
             );
             return;
         }
-        start_assignment(&detail_for_response, speaker_id.clone(), name);
+        start_assignment(&detail_for_response, source, start_ms, end_ms, name);
     });
     dialog.present(Some(&detail.window));
 }
 
-fn start_assignment(detail: &SessionDetail, speaker_id: String, name: String) {
+fn start_assignment(
+    detail: &SessionDetail,
+    source: AudioSource,
+    start_ms: u64,
+    end_ms: u64,
+    name: String,
+) {
     let Some(session) = detail.selected.borrow().clone() else {
         return;
     };
@@ -3661,8 +3555,16 @@ fn start_assignment(detail: &SessionDetail, speaker_id: String, name: String) {
     let result = Arc::new(Mutex::new(None));
     let thread_result = result.clone();
     std::thread::spawn(move || {
-        let value = process::assign_speaker(ProcessArgs::for_session(session), &speaker_id, &name)
-            .map_err(|error| error.to_string());
+        let value = process::correct_speaker(
+            ProcessArgs::for_session(session),
+            &process::CorrectionRequest {
+                source,
+                start_ms,
+                end_ms,
+                speaker: name,
+            },
+        )
+        .map_err(|error| error.to_string());
         *thread_result
             .lock()
             .expect("speaker assignment result mutex") = Some(value);
@@ -3683,13 +3585,25 @@ fn start_assignment(detail: &SessionDetail, speaker_id: String, name: String) {
                 if let Some(path) = selected_path {
                     let _ = detail.load(&path);
                 }
-                if !outcome.learned {
-                    let body = if outcome.previous.is_some() {
-                        "The transcript was updated. The voice model was unavailable, so the voice was not relearned; the change applies to this session only."
-                    } else {
-                        "The transcript was updated. The voice model was unavailable, so this name applies to this session only."
+                if !outcome.learning_available || outcome.echo {
+                    let body = match (outcome.learning_available, outcome.echo) {
+                        (false, true) => {
+                            "The transcript was updated, but the voice model was unavailable, so this name applies to this session only. The line was marked as echo because the same speaker is on the system track."
+                        }
+                        (false, false) => {
+                            "The transcript was updated. The voice model was unavailable, so this name applies to this session only."
+                        }
+                        (true, true) => {
+                            "The line was marked as echo because the same speaker is on the system track."
+                        }
+                        (true, false) => unreachable!(),
                     };
-                    let notice = adw::AlertDialog::new(Some("Speaker assigned"), Some(body));
+                    let heading = if outcome.echo {
+                        "Speaker assigned as echo"
+                    } else {
+                        "Speaker assigned"
+                    };
+                    let notice = adw::AlertDialog::new(Some(heading), Some(body));
                     notice.add_response("close", "Close");
                     notice.present(Some(&detail.window));
                 }
@@ -3892,6 +3806,7 @@ mod tests {
             speaker_id: speaker_id.into(),
             speaker: speaker.into(),
             text: "text".into(),
+            locked: false,
             echo: None,
         }
     }

@@ -276,10 +276,12 @@ load time for candidate prefiltering but is not written to disk.
 
 The stored vector is likewise abbreviated in this example.
 
-On first use, a legacy database without `format_version` is moved to
-`speakers.json.v1.bak` (then `.v1.bak.2`, `.3`, and so on if needed), a warning
-is printed, and Singstone starts with an empty version 2 database. Legacy
-cluster-mean vectors are not converted.
+On first use, a legacy database without `format_version` is copied to
+`speakers.json.v1.bak` (then `.v1.bak.2`, `.3`, and so on if needed), its
+vectors are imported under the same names into a version 2 database, and a
+line on stderr reports the counts. Each legacy vector was the mean of a whole
+diarization cluster, so it counts as one voice sample; a vector from a merged
+cluster stays in the database until later corrections outweigh it.
 
 The versioned `speaker-assignments.json` contains every diarized cluster, even
 when it has no usable embedding or confident match:

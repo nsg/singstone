@@ -53,25 +53,27 @@ impl SpeakerDatabase {
             )
         })?;
         if value.get("format_version").is_none() {
-            let legacy: LegacySpeakerDatabase = serde_json::from_value(value).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid speaker database {}: {error}", path.display()),
-                )
-            })?;
-            let LegacySpeakerDatabase {
-                embedding_model,
-                speakers,
-            } = legacy;
-            drop(speakers);
+            let (database, dropped) = Self::import_legacy(value, path)?;
             let backup = next_v1_backup_path(path)?;
             fs::rename(path, &backup)?;
+            database.save(path)?;
+            let imported: usize = database
+                .speakers
+                .values()
+                .map(|speaker| speaker.embeddings.len())
+                .sum();
             eprintln!(
-                "speaker database {} used the old format; moved it to {} and started empty",
+                "speaker database {} used the old format; backed it up to {} and imported {imported} voice sample(s) for {} speaker(s){}",
                 path.display(),
-                backup.display()
+                backup.display(),
+                database.speakers.len(),
+                if dropped == 0 {
+                    String::new()
+                } else {
+                    format!(", dropping {dropped} invalid vector(s)")
+                }
             );
-            return Ok(Self::empty(embedding_model));
+            return Ok(database);
         }
         let mut database: Self = serde_json::from_value(value).map_err(|error| {
             io::Error::new(
@@ -93,6 +95,28 @@ impl SpeakerDatabase {
         database.validate_vectors(path)?;
         database.refresh_centroids();
         Ok(database)
+    }
+
+    /// Converts an unversioned database in memory; the caller decides when to
+    /// back up and rewrite the file.
+    pub(crate) fn import_legacy(
+        value: serde_json::Value,
+        path: &Path,
+    ) -> io::Result<(Self, usize)> {
+        let legacy: LegacySpeakerDatabase = serde_json::from_value(value).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid speaker database {}: {error}", path.display()),
+            )
+        })?;
+        let mut database = Self {
+            format_version: FORMAT_VERSION,
+            embedding_model: legacy.embedding_model,
+            speakers: legacy.speakers,
+        };
+        let dropped = database.drop_invalid_vectors();
+        database.refresh_centroids();
+        Ok((database, dropped))
     }
 
     pub fn load_checked(path: &Path, expected: &EmbeddingModelIdentity) -> io::Result<Self> {
@@ -151,17 +175,23 @@ impl SpeakerDatabase {
         }
     }
 
+    fn drop_invalid_vectors(&mut self) -> usize {
+        let dimension = self.embedding_model.dimension;
+        let mut dropped = 0;
+        for speaker in self.speakers.values_mut() {
+            let before = speaker.embeddings.len();
+            speaker
+                .embeddings
+                .retain(|vector| is_unit_vector(vector, dimension));
+            dropped += before - speaker.embeddings.len();
+        }
+        dropped
+    }
+
     fn validate_vectors(&self, path: &Path) -> io::Result<()> {
         for (name, speaker) in &self.speakers {
             for (index, vector) in speaker.embeddings.iter().enumerate() {
-                let norm_squared = vector
-                    .iter()
-                    .map(|value| f64::from(*value) * f64::from(*value))
-                    .sum::<f64>();
-                if vector.len() != self.embedding_model.dimension
-                    || !norm_squared.is_finite()
-                    || (norm_squared - 1.0).abs() > 1e-3
-                {
+                if !is_unit_vector(vector, self.embedding_model.dimension) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -194,6 +224,14 @@ impl SpeakerDatabase {
         }
         fs::rename(tmp, path)
     }
+}
+
+fn is_unit_vector(vector: &[f32], dimension: usize) -> bool {
+    let norm_squared = vector
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>();
+    vector.len() == dimension && norm_squared.is_finite() && (norm_squared - 1.0).abs() <= 1e-3
 }
 
 fn next_v1_backup_path(path: &Path) -> io::Result<PathBuf> {
@@ -310,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn backs_up_unversioned_database_and_starts_empty() {
+    fn backs_up_unversioned_database_and_imports_its_vectors() {
         let root =
             std::env::temp_dir().join(format!("singstone-speaker-db-v1-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -320,15 +358,21 @@ mod tests {
         fs::write(&first_backup, b"existing backup").expect("write existing backup");
         let legacy = r#"{
   "embedding_model":{"name":"old","sha256":"abc","dimension":2},
-  "speakers":{"Alice":{"embeddings":[[1.0,0.0]]}}
+  "speakers":{"Alice":{"embeddings":[[1.0,0.0],[3.0,4.0]]},"Bob":{"embeddings":[[0.0,1.0]]}}
 }"#;
         fs::write(&path, legacy).expect("write v1 database");
 
         let database = SpeakerDatabase::load(&path).expect("migrate v1 database");
 
         assert_eq!(database.format_version, FORMAT_VERSION);
-        assert!(database.speakers.is_empty());
-        assert!(!path.exists());
+        assert_eq!(database.speakers["Alice"].embeddings, vec![vec![1.0, 0.0]]);
+        assert_eq!(database.speakers["Bob"].embeddings, vec![vec![0.0, 1.0]]);
+        assert!(database.speakers["Alice"].centroid.is_some());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read migrated database"))
+                .expect("parse migrated database");
+        assert_eq!(saved["format_version"], FORMAT_VERSION);
+        assert_eq!(saved["speakers"]["Bob"]["embeddings"][0][1], 1.0);
         assert_eq!(
             fs::read(root.join("speakers.json.v1.bak.2")).expect("read backup"),
             legacy.as_bytes()

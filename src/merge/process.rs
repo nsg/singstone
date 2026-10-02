@@ -43,14 +43,6 @@ struct CorrectionLearning {
     migrate_legacy_database: bool,
 }
 
-#[derive(Deserialize)]
-struct LegacyCorrectionDatabase {
-    #[serde(rename = "embedding_model")]
-    _embedding_model: EmbeddingModelIdentity,
-    #[serde(rename = "speakers")]
-    _speakers: BTreeMap<String, database::SpeakerRecord>,
-}
-
 struct CorrectionLearningUpdate {
     speaker: String,
     old_names: HashSet<String>,
@@ -913,13 +905,9 @@ fn load_correction_database(
         )
     })?;
     if value.get("format_version").is_none() {
-        serde_json::from_value::<LegacyCorrectionDatabase>(value).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid speaker database {}: {error}", path.display()),
-            )
-        })?;
-        return Ok((SpeakerDatabase::empty(identity.clone()), true));
+        let (database, _) = SpeakerDatabase::import_legacy(value, path)?;
+        database.validate_identity(identity)?;
+        return Ok((database, true));
     }
     SpeakerDatabase::load_checked(path, identity).map(|database| (database, false))
 }
@@ -3523,7 +3511,7 @@ mod tests {
     }
 
     #[test]
-    fn correction_preflight_does_not_migrate_a_legacy_database() {
+    fn correction_preflight_imports_legacy_vectors_without_touching_the_file() {
         let root = std::env::temp_dir().join(format!(
             "singstone-correction-legacy-preflight-{}-{}",
             std::process::id(),
@@ -3551,8 +3539,8 @@ mod tests {
         .expect("write legacy database");
         let previous = fs::read(&path).expect("read legacy database");
         let expected = EmbeddingModelIdentity {
-            name: "new-model".into(),
-            sha256: "new-hash".into(),
+            name: "old-model".into(),
+            sha256: "old-hash".into(),
             dimension: 2,
         };
 
@@ -3561,7 +3549,7 @@ mod tests {
 
         assert!(migrate);
         assert_eq!(database.embedding_model, expected);
-        assert!(database.speakers.is_empty());
+        assert_eq!(database.speakers["Alice"].embeddings, vec![vec![1.0, 0.0]]);
         assert_eq!(fs::read(&path).expect("reread legacy database"), previous);
         assert!(!root.join("speakers.json.v1.bak").exists());
         fs::remove_dir_all(root).expect("remove fixture");

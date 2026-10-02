@@ -136,9 +136,10 @@ singstone diarize SESSION \
     --cluster-threshold 1.0
 ```
 
-**Input:** `manifest.json`, the optional per-session `meeting.json`, the system
-audio track, and two ONNX models. The microphone track is also processed when
-`--diarize-mic` is supplied.
+**Input:** `manifest.json`, the optional per-session `meeting.json`, the enabled
+audio tracks, and two ONNX models. `process` and `diarize` diarize an enabled
+microphone by default. Pass `--diarize-mic=false` to opt out for a legacy or
+single-local-speaker workflow.
 `words.jsonl` is not an input, so this stage can run before or in parallel with
 transcription.
 
@@ -182,7 +183,7 @@ inherit that policy automatically.
   "system_audio_sha256": "...",
   "segmentation_model_sha256": "...",
   "embedding_model_sha256": "...",
-  "diarize_mic": false,
+  "diarize_mic": true,
   "cluster_threshold": 1.0,
   "num_speakers": null,
   "mic_num_speakers": null,
@@ -191,7 +192,7 @@ inherit that policy automatically.
 }
 ```
 
-## 3. Recognize: anonymous clusters to enrolled names
+## 3. Recognize: anonymous clusters to learned names
 
 Speaker recognition is optional. Without it, `render` assigns anonymous display
 names such as `SPEAKER_00`. These names are deterministic for one fixed set of
@@ -206,37 +207,76 @@ singstone recognize SESSION \
     --speaker-threshold 0.6
 ```
 
-**Input:** `diarization.jsonl`, the referenced raw audio tracks, a sherpa-onnx
-speaker embedding model, and a database created by `singstone enroll`. The
-model's exact SHA-256 digest and embedding dimension must match those recorded
-when the database was enrolled. When present, `meeting.json` also controls the
-candidate names considered for each source.
+**Input:** `diarization.jsonl`, the referenced audio tracks, a sherpa-onnx
+speaker embedding model, and the local `speakers.json` database. The database
+is built from transcript corrections. Its model SHA-256 digest and embedding
+dimension must match the configured model. When present, `meeting.json` also
+controls the candidate names considered for each source.
 
 **Model:** any compatible sherpa-onnx speaker embedding model that matches the
-enrollment database. It will usually be the model used for diarization, and the
+speaker database. It will usually be the model used for diarization, and the
 documented model is NeMo TitaNet Small, but diarization and recognition do not
 require the same model. Recognition does not run the segmentation model and
 does not transcribe speech.
 
-For every distinct `(source, cluster)` pair, the stage:
+Before scoring, the stage writes normalized chunk vectors to
+`embeddings.jsonl`. Each diarization segment of length `L` is split into
+`ceil(L / 10000 ms)` equal windows. Segments of at least ten seconds therefore
+produce windows between five and ten seconds; shorter segments produce one
+window. Even a window shorter than 1.5 seconds is retained in the artifact for
+completeness, but it is never learned or scored by itself.
 
-1. Selects diarized intervals at least 1.5 seconds long, longest first, up to
-   30 seconds of speech per cluster. If the last selected interval would exceed
-   that budget, it is cut to the remaining duration.
-2. Computes a normalized embedding for each selected interval, gives each
-   interval equal weight when averaging the embeddings, and normalizes the
-   result again.
-3. Computes cosine similarity against every enrolled embedding. The highest
-   score becomes `best_candidate`.
-4. Assigns that candidate's name only when the score is at least
-   `--speaker-threshold`. A lower threshold names more clusters but raises the
-   chance of a false match. The default is `0.6`.
+```json
+{"source":"system","start_ms":12000,"end_ms":18300,"cluster":0,"embedding":[0.01,-0.02]}
+```
+
+The vector is abbreviated here; the documented model writes 192 values.
+
+`embeddings.meta.json` records format and output hashes, the diarization hash,
+both audio hashes, embedding-model hash, thread count, the 10000 ms window and
+the 1500 ms learning minimum. Correction regenerates the artifact on demand
+when it is missing or its diarization hash is stale and a model is configured.
+
+For every distinct `(source, cluster)` pair, recognition then:
+
+1. Uses that cluster's chunks of at least 1.5 seconds as query dots. With no
+   usable query dot, the cluster has no candidate.
+2. Computes the normalized mean query dot and compares it with the cached
+   centroid of every allowed person, retaining the five closest people (or all
+   of them when fewer than five are available).
+3. For each retained person and each query dot, averages the three highest
+   cosine similarities to that person's stored dots, or all dots when the
+   person has fewer than three. The person's score is the median of those
+   per-query-dot values.
+4. Records the highest score as `best_candidate` and assigns that name only
+   when the score reaches `--speaker-threshold`. A lower threshold names more
+   clusters but raises the chance of a false match. The default is `0.6`.
 
 For system clusters, known remote attendees are the allowed candidates. For
 microphone clusters, known local and remote attendees are allowed (remote names
 are needed for echo detection). A source remains unrestricted when its attendee
 list is empty or its corresponding end has unnamed people. This is a filtered
-view of the enrollment database; the database on disk is unchanged.
+view of the speaker database; the database on disk is unchanged.
+
+The version 2 speaker database stores only a model identity and unit-length
+vectors ("dots") for each name. Dot count is the weight; dots have no dates,
+provenance, or serialized weights. A normalized mean centroid is computed at
+load time for candidate prefiltering but is not written to disk.
+
+```json
+{
+  "format_version": 2,
+  "embedding_model": {"name":"nemo_en_titanet_small","sha256":"...","dimension":192},
+  "speakers": {"Alice":{"embeddings":[[0.01,-0.02]]}}
+}
+```
+
+The stored vector is likewise abbreviated in this example.
+
+On first use, a legacy database without `format_version` is moved to
+`speakers.json.v1.bak` (then `.v1.bak.2`, `.3`, and so on if needed), a warning
+is printed, and Singstone starts with an empty version 2 database. Legacy
+cluster-mean vectors are not converted.
 
 The versioned `speaker-assignments.json` contains every diarized cluster, even
 when it has no usable embedding or confident match:
@@ -267,19 +307,57 @@ when it has no usable embedding or confident match:
 `best_candidate` and `score` remain present below the threshold, while
 `speaker` is omitted. This makes threshold problems distinguishable from
 embedding failures. Recognition is performed separately for the microphone and
-system sources, and the same enrolled name may legitimately match more than one
+system sources, and the same learned name may legitimately match more than one
 cluster.
 
 ### Manual assignment and correction
 
-Naming an anonymous cluster in the app writes its `speaker` assignment. When
-the embedding model is configured, Singstone also adds the cluster embedding
-to that name in `speakers.json`.
+Naming or changing a line creates a lock on that line's exact rendered
+`[start_ms, end_ms]` and source. It does not rename the rest of the diarization
+cluster and does not edit `speaker-assignments.json`. Locks are stored in the
+versioned `speaker-corrections.json` artifact:
 
-Reassigning a cluster replaces `speaker`, learns the cluster under the new
-name, and removes near-identical embeddings (cosine similarity at least
-`0.999`) from the previous name. Without the embedding model, either change is
-limited to the current session.
+```json
+{
+  "format_version": 1,
+  "corrections": [
+    {"source":"system","start_ms":41200,"end_ms":47800,"speaker":"Alice"}
+  ]
+}
+```
+
+A newer range replaces older ranges that it overlaps on the same source. At
+render time, a word takes the correction's name when its midpoint is inside the
+range. The resulting utterance has `"locked":true`; its `speaker_id` remains
+the underlying `spk_N` or `mic_N` cluster ID. Locks are never changed by
+recognition, proposals, rendering, or reprocessing.
+
+When the embedding model is configured, correction also learns every
+same-source chunk for which at least half of the chunk overlaps the range,
+excluding chunks shorter than 1.5 seconds. If another name previously owned
+the lock or is the cluster's current first guess, vectors with cosine
+similarity at least `0.999` to a learned vector are removed from that old name.
+Without the model, the line is still locked and rendered, but learning and
+unlearning are skipped.
+A microphone correction that matches a system-track name is still stored and
+learned; rendering then marks its utterance as echo.
+
+The command-line equivalent is:
+
+```bash
+singstone correct SESSION \
+    --source system --start-ms 41200 --end-ms 47800 --name Alice \
+    --embedding-model ~/.local/share/singstone/models/nemo_en_titanet_small.onnx \
+    --speakers-db ~/.local/share/singstone/speakers.json
+```
+
+After learning, correction scores later, unlocked utterances from the same
+source and cluster. A row is proposed when the new name beats its current name
+by at least `0.05`, or, for an unnamed row, when the new score reaches the
+speaker threshold. Earlier rows are never proposed. `correct` prints the
+outcome and each forward proposal as JSON lines but does not apply proposals.
+The current GUI applies only the selected line; proposal selection in the GUI
+is deferred.
 
 ## 4. Render: intermediate artifacts to the final transcript
 
@@ -289,10 +367,11 @@ singstone render SESSION
 
 **Input:** `manifest.json`, optional `meeting.json`, `words.jsonl`,
 `diarization.jsonl`, their metadata sidecars when present, optionally
-`speaker-assignments.json`, and the raw audio tracks when both are available.
-Missing assignment data is allowed, but
-malformed or unsupported assignment metadata or diarization metadata is an
-error. This stage uses no ML model and is fast.
+`speaker-assignments.json`, optionally `speaker-corrections.json`, and the audio
+tracks when both are available. Missing assignment and correction data is
+allowed, but
+malformed or unsupported assignment, correction, or diarization metadata is
+an error. This stage uses no ML model and is fast.
 
 When both audio tracks are available, `render` builds 10 ms RMS envelopes and
 estimates the session's speaker-to-microphone delay and gain from recurring
@@ -315,13 +394,13 @@ source. It chooses the cluster with the greatest timestamp overlap. When there
 is no overlap, it can use the nearest segment within 500 ms; otherwise the word
 is assigned to `unknown`.
 
-Microphone words normally bypass diarization and use the local speaker name from
-`manifest.json`, with speaker ID `local`. If the diarization stage included the
-microphone, `render` reads that choice from `diarization.meta.json`; microphone
-words then use microphone cluster IDs and recognized or anonymous names instead
-of the manifest's local name. A word with no overlapping or nearby microphone
-segment becomes `unknown`. For legacy sessions without metadata, `render`
-infers the choice from the presence of microphone segments.
+Because microphone diarization is the processing default, microphone words
+normally use microphone cluster IDs and recognized or anonymous names instead
+of the local name in `manifest.json`. If microphone diarization was explicitly
+disabled, they use that local name with speaker ID `local`. `render` reads the
+choice from `diarization.meta.json`; a word with no overlapping or nearby
+microphone segment becomes `unknown`. For legacy sessions without metadata,
+`render` infers the choice from the presence of microphone segments.
 `--diarize-mic` and `--diarize-mic=false` provide explicit overrides; an
 override that conflicts with current metadata is rejected instead of silently
 changing speaker attribution.
@@ -331,27 +410,38 @@ order. `NN` is a display counter rather than the cluster number. Recognized
 names replace only the display name; the source and numeric cluster remain
 visible through IDs such as `spk_3` or `mic_1`.
 
-After leakage suppression, meeting details can mark diarized microphone
-utterances as echo without deleting them. A microphone cluster assigned to a
-known remote attendee gets `"echo":"remote_attendee"`. If there are no unnamed
-local attendees and every known local attendee appears on a recognized
-microphone cluster, remaining anonymous microphone utterances get
-`"echo":"local_roster"`. Named people outside either roster are left alone,
-system utterances are never marked, and no echo rule runs when the microphone
-was not diarized. The text transcript adds `[echo]` after the speaker name.
+Corrections are then overlaid per word using the midpoint rule described above.
+They override recognized and anonymous display names without replacing the
+cluster ID. Grouping starts a new utterance when the lock state changes, so a
+confirmed range cannot be merged into an unlocked row.
+
+After names and locks are resolved, microphone utterances can be marked as echo
+without deleting them. A microphone cluster assigned to a known remote
+attendee gets `"echo":"remote_attendee"`. If there are no unnamed local
+attendees and every known local attendee appears on a recognized microphone
+cluster, remaining anonymous microphone utterances get
+`"echo":"local_roster"`. These meeting-roster rules still require microphone
+diarization. In addition, a microphone utterance whose resolved name matches a
+resolved system-track name gets `"echo":"system_track_speaker"`, including
+when either name came from a correction. An earlier echo reason takes
+precedence. This marker does not remove words or add a leakage-suppression
+record. System utterances are never marked. The text transcript adds `[echo]`
+after the speaker name.
 
 Adjacent words are grouped into utterances. A new utterance starts when the
-speaker changes, the silence between words exceeds one second, or an utterance
-has reached 15 seconds and ends with sentence punctuation. Whitespace and
-punctuation spacing are normalized, and utterances from both sources are sorted
-on the common meeting timeline.
+speaker ID, display name, or lock state changes, the silence between words
+exceeds one second, or an utterance has reached 15 seconds and ends with
+sentence punctuation. Whitespace and punctuation spacing are normalized, and
+utterances from both sources are sorted on the common meeting timeline.
 
 The stage replaces the canonical `transcript.jsonl` and readable
 `transcript.txt` atomically one file at a time:
 
 ```json
-{"start_ms":12340,"end_ms":15780,"source":"system","speaker_id":"spk_0","speaker":"Alice","text":"I think we should ship it on Friday."}
+{"start_ms":12340,"end_ms":15780,"source":"system","speaker_id":"spk_0","speaker":"Alice","text":"I think we should ship it on Friday.","locked":true}
 ```
+
+Unlocked utterances omit the `locked` field.
 
 ```text
 [00:00:12.340] Alice: I think we should ship it on Friday.
@@ -361,10 +451,12 @@ Before rendering, singstone compares the available provenance hashes with the
 current intermediate files and audio. Edited or replaced word and diarization
 artifacts produce warnings but remain renderable. Speaker assignments are
 treated more strictly: if their recorded diarization path or hash does not
-match, all stored names are discarded and clusters remain anonymous. This
-staleness check does not compare the current enrollment database, embedding
-model or recognition threshold; rerun `recognize` yourself after changing any
-of those inputs.
+match, all first-guess names are discarded and clusters remain anonymous unless
+a correction covers them. Corrections are keyed by source and time range, not
+cluster, so they remain active when diarization settings or cluster numbers
+change. This staleness check does not compare the current speaker database,
+embedding model or recognition threshold; rerun `recognize` yourself after
+changing any of those inputs.
 
 ## Rerun recipes
 
@@ -372,15 +464,21 @@ of those inputs.
 |---|---|
 | Incorrect words or language | `transcribe`, then `render` |
 | Too many or too few speaker clusters | `diarize`, `recognize`, then `render` |
-| Correct clusters but incorrect names | `recognize`, then `render` |
+| Change one line's speaker | Use the app, or `correct` with that row's exact source and time range |
+| Refresh automatic first-guess names | `recognize`, then `render` |
 | Manually edited words | `render` |
 | Manually edited speaker segments | `recognize`, then `render`; or only `render` for anonymous names |
-| Anonymous transcript with no enrollment database | Skip `recognize`; run `render` |
-| Multiple people are listed in the room | Save meeting details, then `diarize --diarize-mic`, `recognize`, and `render` |
-| Changed who was in the meeting | `render` |
+| Anonymous transcript with no speaker database | Skip `recognize`; run `render` |
+| Multiple people are listed in the room | Save meeting details, then `diarize`, `recognize`, and `render` |
+| Changed who was in the meeting | `recognize`, then `render` when candidate names changed; otherwise `render` |
 
 Changing attendee names also changes the recognition candidate set, so rerun
 `recognize` before `render` when those names should be matched automatically.
+Every rerun recipe preserves `speaker-corrections.json`; `process` and the
+individual `diarize`, `recognize`, and `render` stages never edit or delete it.
+The app's **Process again** flow therefore keeps confirmed lines. Deleting or
+explicitly resetting the session removes its corrections with the other
+session artifacts.
 
 The VAD thresholds and chunk sizes described above are currently fixed. Whisper
 chunks do not overlap and do not share text context, so transcription quality

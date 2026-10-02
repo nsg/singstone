@@ -27,7 +27,7 @@ names to speakers directly from the session view.
 Run the local processing pipeline without leaving the meeting window. The
 dialog reports each stage and can be cancelled while work is in progress.
 Processed meetings can be processed again to replace their derived outputs;
-the recorded audio is preserved.
+the recorded audio and speaker corrections are preserved.
 
 ![Singstone processing a meeting in an in-window dialog](docs/images/singstone-processing.png)
 
@@ -38,21 +38,22 @@ the recorded audio is preserved.
 - Transcribes with Whisper and separates speakers with pyannote and TitaNet.
 - Automatically accelerates Whisper with Intel SYCL on a compatible Intel GPU,
   preferring Level Zero and retrying through OpenCL before using CPU.
-- Recognizes enrolled voices while leaving uncertain matches anonymous.
+- Recognizes learned voices while leaving uncertain matches anonymous.
 - Uses per-meeting attendee details to guide speaker counts and recognition,
   and marks likely microphone echo without deleting it.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback, editable
   storage folders, and a one-click header Record button.
 - Names speakers from the transcript: one-click shortcuts for people already
-  in the meeting, and reassignment when a voice was matched to the wrong person.
+  in the meeting, and line-specific correction when a voice was matched to the
+  wrong person. Confirmed lines remain locked across reprocessing.
 - Renames sessions and deletes them, after a confirmation, from the session view.
 - Archives a processed session's audio as 16-bit FLAC, about a fifth of the
   size, while keeping playback and reprocessing.
 - Optional GNOME Shell extension with a top-bar Record/Stop button and live
   level meters.
-- Learns an anonymous diarized voice when it is named in the transcript, or
-  enrolls voices from clean WAV/raw samples on the Speakers page.
+- Learns fixed-window voice embeddings when a transcript line is named or
+  corrected, building a local speaker database from confirmed speech.
 - Keeps recording and inference offline under Snap confinement.
 - Verifies every model's size, purpose, and SHA-256 before native code loads it.
 
@@ -235,8 +236,10 @@ when that end has no unnamed attendees; microphone recognition also includes
 known remote names so echo can be detected. A recognized remote voice on the
 microphone is marked as echo. When every named local attendee has been found
 and there are no unnamed local people, remaining anonymous microphone voices
-are also marked as echo. Echo lines stay in both transcript formats, carry
-metadata in `transcript.jsonl`, and can be hidden temporarily in the app.
+are also marked as echo. A microphone line resolved to the same name as a
+system-track speaker is marked with `system_track_speaker`. Echo lines stay in
+both transcript formats, carry metadata in `transcript.jsonl`, and can be
+hidden temporarily in the app.
 
 For command-line processing, `--meeting FILE` validates and copies a
 `meeting.json`-shaped file into the session. The context file is not used on
@@ -281,7 +284,7 @@ downloaded artifacts and final files, then publishes them atomically under
 
 `devices`, `record`, `render`, `archive`, and `speakers` never start the
 download service.
-`process`, `transcribe`, `diarize`, `recognize`, and `enroll` wait for setup
+`process`, `transcribe`, `diarize`, `recognize`, and `correct` wait for setup
 when they use a missing default Snap model. Interrupted downloads resume on the
 next attempt.
 
@@ -304,15 +307,17 @@ snap logs -n=100 singstone.model-download
 | `process` | Run the pipeline, optionally with `--meeting` details |
 | `transcribe` | Produce word-level text and timestamps |
 | `diarize` | Produce anonymous speaker intervals |
-| `recognize` | Match speaker clusters to enrolled voices |
+| `recognize` | Match speaker clusters to learned voices |
+| `correct` | Lock one transcript line to a name, learn it, and print forward proposals |
 | `render` | Build transcripts from persistent intermediate artifacts |
 | `archive` | Convert a processed session's raw audio to 16-bit FLAC |
-| `enroll` | Add voice samples to the speaker database |
-| `speakers` | List enrolled speakers |
+| `speakers` | List learned speakers |
 
 Run `singstone COMMAND --help` for command-specific flags. Use `process` for the
 normal path; use the split processing commands when tuning or debugging one
-stage without repeating the others.
+stage without repeating the others. `process` and `diarize` diarize an enabled
+microphone by default; pass `--diarize-mic=false` to opt out. See
+[Processing stages](docs/processing.md) for correction artifacts and the CLI.
 
 ## Build the Snap
 

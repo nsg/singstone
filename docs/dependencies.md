@@ -73,8 +73,9 @@ built CPU binary.
    this in the disposable package build environment and keeps the resulting
    source-built libraries inside the Snap.
 3. **Model files.** whisper.cpp GGML and ONNX parsers are native code fed
-   with multi-hundred-MB files. `singstone process`/`enroll` refuse models
-   not listed in `models.lock` unless `--allow-unverified-models` is passed.
+   with multi-hundred-MB files. The model-backed `process`, `transcribe`,
+   `diarize`, `recognize`, and `correct` commands refuse models not listed in
+   `models.lock` unless `--allow-unverified-models` is passed.
 4. **`whisper-rs` bus factor.** One maintainer; watch for staleness. The
    crate is thin; a fork would be maintainable.
 5. **`cookie-factory` 0.3.3** (via `libspa`): last released 2022. Small and

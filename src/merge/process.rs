@@ -701,7 +701,7 @@ fn upsert_correction(
     let mut replaced = Vec::new();
     for existing in old {
         if existing.source == correction.source
-            && ranges_overlap(
+            && locks_collide(
                 existing.start_ms,
                 existing.end_ms,
                 correction.start_ms,
@@ -719,6 +719,13 @@ fn upsert_correction(
 
 fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
     left_start <= right_end && right_start <= left_end
+}
+
+/// Adjacent lines share a boundary timestamp, so a lock only replaces locks it
+/// strictly overlaps, or an identical range.
+fn locks_collide(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
+    (left_start == right_start && left_end == right_end)
+        || (left_start < right_end && right_start < left_end)
 }
 
 fn cluster_for_request(
@@ -3561,54 +3568,50 @@ mod tests {
     }
 
     #[test]
-    fn correction_upsert_uses_closed_same_source_ranges() {
+    fn correction_upsert_replaces_only_strictly_overlapping_locks() {
+        let lock = |source, start_ms, end_ms, speaker: &str| SpeakerCorrection {
+            source,
+            start_ms,
+            end_ms,
+            speaker: speaker.into(),
+        };
         let mut artifact = SpeakerCorrections {
             format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
             corrections: vec![
-                SpeakerCorrection {
-                    source: AudioSource::System,
-                    start_ms: 0,
-                    end_ms: 100,
-                    speaker: "Old".into(),
-                },
-                SpeakerCorrection {
-                    source: AudioSource::System,
-                    start_ms: 100,
-                    end_ms: 200,
-                    speaker: "Adjacent".into(),
-                },
-                SpeakerCorrection {
-                    source: AudioSource::Mic,
-                    start_ms: 0,
-                    end_ms: 100,
-                    speaker: "Other source".into(),
-                },
+                lock(AudioSource::System, 0, 100, "Old"),
+                lock(AudioSource::System, 100, 200, "Adjacent"),
+                lock(AudioSource::System, 300, 300, "Point"),
+                lock(AudioSource::Mic, 0, 100, "Other source"),
             ],
         };
-        let replacement = SpeakerCorrection {
-            source: AudioSource::System,
-            start_ms: 50,
-            end_ms: 100,
-            speaker: "New".into(),
-        };
 
-        let replaced = upsert_correction(&mut artifact, replacement.clone());
-
+        let replaced = upsert_correction(&mut artifact, lock(AudioSource::System, 50, 100, "New"));
         assert_eq!(
             replaced
                 .iter()
-                .map(|correction| correction.speaker.as_str())
+                .map(|c| c.speaker.as_str())
                 .collect::<Vec<_>>(),
-            ["Old", "Adjacent"]
+            ["Old"]
         );
-        assert_eq!(artifact.corrections.len(), 2);
-        assert!(artifact.corrections.contains(&replacement));
-        assert!(
+        let names = |artifact: &SpeakerCorrections| {
             artifact
                 .corrections
                 .iter()
-                .any(|correction| correction.speaker == "Other source")
+                .map(|c| c.speaker.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&artifact),
+            ["Adjacent", "Point", "Other source", "New"]
         );
+
+        let replaced = upsert_correction(
+            &mut artifact,
+            lock(AudioSource::System, 300, 300, "Point again"),
+        );
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].speaker, "Point");
+        assert_eq!(artifact.corrections.len(), 4);
     }
 
     #[test]

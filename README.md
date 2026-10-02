@@ -15,21 +15,40 @@ The supported distribution is a strictly confined core24 Snap for AMD64 Linux.
 It contains the application and source-built native runtimes. Model
 weights download on first use and remain in a persistent per-user cache.
 
-![Top-to-bottom overview of the Singstone workflow](docs/workflow-overview.svg)
-
 ## Application
 
-Browse processed meetings, review speaker-attributed transcripts, and assign
-names to speakers directly from the session view.
+Browse processed meetings and review speaker-attributed transcripts from the
+session view. Confirm individual names so they stay locked across reprocessing,
+use quick speaker shortcuts on anonymous lines, or change a named line.
 
-![Singstone showing a processed speaker-attributed transcript](docs/images/singstone-transcript.png)
+![Processed transcript with confirmed speaker names and quick assignment controls](docs/images/transcript.png)
+
+Type a speaker name to filter learned voices and names already used in the
+meeting, then choose a suggestion or assign a new name.
+
+![Speaker assignment dialog filtering suggestions to Laura](docs/images/assign-autocomplete.png)
+
+After confirming a line, review scored proposals for later lines of the same
+voice and apply only the checked matches.
+
+![Later-lines proposal dialog with checked voice matches and scores](docs/images/later-lines.png)
+
+Open Speakers to inspect the locally learned voices and the number of voice
+samples stored for each person.
+
+![Speakers page listing learned voices and voice sample counts](docs/images/speakers.png)
+
+Use Meeting details… to title the meeting and place attendees in the room or on
+the remote end before re-rendering the transcript.
+
+![Meeting details dialog with a title and local and remote attendees](docs/images/meeting-details.png)
 
 Run the local processing pipeline without leaving the meeting window. The
 dialog reports each stage and can be cancelled while work is in progress.
-Processed meetings can be processed again to replace their derived outputs;
-the recorded audio and speaker corrections are preserved.
+Reprocessing replaces derived outputs and automatic speaker matches while
+preserving the recorded audio and confirmed names.
 
-![Singstone processing a meeting in an in-window dialog](docs/images/singstone-processing.png)
+![Processing dialog showing transcription progress and pipeline stages](docs/images/processing.png)
 
 ## Features
 

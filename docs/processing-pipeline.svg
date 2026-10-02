@@ -69,7 +69,7 @@
   <circle cx="105" cy="661" r="20" fill="#d97706"/>
   <text x="105" y="667" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="17" font-weight="700" fill="#ffffff">3</text>
   <text x="140" y="658" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="19" font-weight="700" fill="#0f172a">recognize</text>
-  <text x="140" y="681" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Compare cluster embeddings with enrolled speakers</text>
+  <text x="140" y="681" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="14" fill="#475569">Compare cluster embeddings with learned names</text>
   <text x="95" y="717" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="13" fill="#334155">Uses diarization, raw audio, a matching embedding model, and speakers DB</text>
   <rect x="95" y="732" width="530" height="27" rx="7" fill="#fef3c7"/>
   <text x="360" y="751" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13" font-weight="600" fill="#92400e">speaker-assignments.json · optional</text>

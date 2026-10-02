@@ -36,7 +36,26 @@ const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
 const PROPOSAL_MARGIN: f32 = 0.05;
 
-type CorrectionLearning = (Vec<EmbeddingChunk>, SpeakerDatabase, PathBuf);
+struct CorrectionLearning {
+    chunks: Vec<EmbeddingChunk>,
+    database: SpeakerDatabase,
+    database_path: PathBuf,
+    migrate_legacy_database: bool,
+}
+
+#[derive(Deserialize)]
+struct LegacyCorrectionDatabase {
+    #[serde(rename = "embedding_model")]
+    _embedding_model: EmbeddingModelIdentity,
+    #[serde(rename = "speakers")]
+    _speakers: BTreeMap<String, database::SpeakerRecord>,
+}
+
+struct CorrectionLearningUpdate {
+    speaker: String,
+    old_names: HashSet<String>,
+    vectors: Vec<Vec<f32>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessingStage {
@@ -359,21 +378,44 @@ pub fn run_recognize(args: RecognizeArgs) -> Result<(), Box<dyn std::error::Erro
     let (session, _) = open_session(&process.session)?;
     let segments: Vec<SpeakerSegment> =
         read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
-    let recognition = recognize_speakers(
-        &process,
-        &session,
-        &segments,
-        thread_count(process.threads),
-        true,
-        None,
-    )?;
-    write_speaker_assignments(&process, &session, &segments, &recognition)?;
+    let outputs = [
+        session.embeddings_path(),
+        session.embeddings_metadata_path(),
+        session.speaker_assignments_path(),
+    ];
+    let previous_outputs = outputs
+        .iter()
+        .map(|path| read_optional_file(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = (|| {
+        let recognition = recognize_speakers(
+            &process,
+            &session,
+            &segments,
+            thread_count(process.threads),
+            true,
+            None,
+        )?;
+        write_speaker_assignments(&process, &session, &segments, &recognition)
+    })();
+    if let Err(error) = result {
+        for (path, previous) in outputs.iter().zip(&previous_outputs) {
+            if let Err(restore_error) = restore_file(path, previous.as_deref()) {
+                return Err(io::Error::other(format!(
+                    "recognition failed: {error}; restoring {} also failed: {restore_error}",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
 pub fn run_correct(args: CorrectArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut process = stage_process_args(args.session);
-    process.embedding_model = Some(args.embedding_model);
+    process.embedding_model = args.embedding_model;
     process.models_lock = args.models_lock;
     process.allow_unverified_models = args.allow_unverified_models;
     process.threads = args.threads;
@@ -436,21 +478,47 @@ pub fn correct_speaker(
     args: ProcessArgs,
     request: &CorrectionRequest,
 ) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
-    apply_corrections_inner(args, std::slice::from_ref(request), true)
+    let request = validate_correction_request(request)?;
+    let session = Session::open(args.session.clone())?;
+    let segments: Vec<SpeakerSegment> =
+        read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
+    let prior_utterances = match read_jsonl_artifact(&session.transcript_path(), "transcript") {
+        Ok(utterances) => utterances,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let proposal_cluster = cluster_for_request(&request, &prior_utterances, &segments);
+    let learning_configured = args.embedding_model.is_some();
+    let database_path = args
+        .speakers_db
+        .clone()
+        .unwrap_or_else(database::default_path);
+    let threshold = args.speaker_threshold;
+    let mut outcome = apply_corrections(args, std::slice::from_ref(&request))?;
+    if outcome.learning_available
+        && let Some(cluster) = proposal_cluster
+        && learning_configured
+        && database_path.is_file()
+    {
+        let chunks: Vec<EmbeddingChunk> =
+            read_jsonl_artifact(&session.embeddings_path(), "speaker embeddings")?;
+        let database = SpeakerDatabase::load(&database_path)?;
+        outcome.proposals =
+            build_proposals(&session, &request, cluster, &chunks, &database, threshold)?;
+    }
+    Ok(outcome)
 }
 
-#[allow(dead_code)]
 pub fn apply_corrections(
     args: ProcessArgs,
     requests: &[CorrectionRequest],
 ) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
-    apply_corrections_inner(args, requests, false)
+    apply_corrections_inner(args, requests)
 }
 
 fn apply_corrections_inner(
     args: ProcessArgs,
     requests: &[CorrectionRequest],
-    include_proposals: bool,
 ) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
     let mut requests = requests
         .iter()
@@ -472,11 +540,12 @@ fn apply_corrections_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error.into()),
     };
-    let proposal_cluster = include_proposals
-        .then(|| requests.first())
-        .flatten()
-        .and_then(|request| cluster_for_request(request, &prior_utterances, &segments));
-
+    let corrections_path = session.speaker_corrections_path();
+    let previous_corrections = match fs::read(&corrections_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     let mut corrections = read_speaker_corrections(&session)?;
     let mut replaced = Vec::with_capacity(requests.len());
     for request in &requests {
@@ -490,83 +559,75 @@ fn apply_corrections_inner(
             },
         ));
     }
-    write_json_atomic(&session.speaker_corrections_path(), &corrections)?;
-
-    let mut learned = 0usize;
-    let mut forgotten = 0usize;
-    let mut learning_available = false;
-    let mut learning = match prepare_correction_learning(&args, &session, &segments) {
-        Ok(learning) => learning,
-        Err(error) => {
-            eprintln!(
-                "warning: speaker correction was saved but its voice could not be learned: {error}"
-            );
-            None
-        }
-    };
-    if let Some((chunks, database, database_path)) = learning.as_mut() {
-        learning_available = true;
-        for (request, replaced) in requests.iter().zip(&replaced) {
-            let vectors =
-                embeddings_in_range(chunks, request.source, request.start_ms, request.end_ms);
-            if vectors.is_empty() {
-                continue;
-            }
-            let mut old_names = replaced
+    let mut learning = prepare_correction_learning(&args, &session, &segments)?;
+    let learning_updates = learning
+        .as_ref()
+        .map(|learning| {
+            requests
                 .iter()
-                .map(|correction| correction.speaker.as_str())
-                .collect::<HashSet<_>>();
-            if let Some(cluster) = cluster_for_request(request, &prior_utterances, &segments)
-                && let Some(name) = recognized.get(&(request.source, cluster))
-            {
-                old_names.insert(name);
-            }
-            old_names.remove(request.speaker.as_str());
-            for old_name in old_names {
-                for vector in &vectors {
-                    forgotten += database.forget_matching(old_name, vector, 0.999);
-                }
-            }
-            learned += vectors.len();
-            database
-                .speakers
-                .entry(request.speaker.clone())
-                .or_default()
-                .embeddings
-                .extend(vectors);
-        }
-        database.refresh_centroids();
-        if learned > 0 || forgotten > 0 {
-            database.save(database_path)?;
-        }
-    }
+                .zip(&replaced)
+                .map(|(request, replaced)| {
+                    let mut old_names = replaced
+                        .iter()
+                        .map(|correction| correction.speaker.clone())
+                        .collect::<HashSet<_>>();
+                    if let Some(cluster) =
+                        cluster_for_request(request, &prior_utterances, &segments)
+                        && let Some(name) = recognized.get(&(request.source, cluster))
+                    {
+                        old_names.insert(name.clone());
+                    }
+                    old_names.remove(&request.speaker);
+                    CorrectionLearningUpdate {
+                        speaker: request.speaker.clone(),
+                        old_names,
+                        vectors: embeddings_in_range(
+                            &learning.chunks,
+                            request.source,
+                            request.start_ms,
+                            request.end_ms,
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
-    run_render(RenderArgs {
+    write_json_atomic(&corrections_path, &corrections)?;
+    if let Err(render_error) = run_render(RenderArgs {
         session: session.dir.clone(),
         diarize_mic: None,
-    })?;
-    let echo = correction_is_system_echo(&requests, &recognized, &corrections.corrections);
-    let proposals = if include_proposals {
-        match (requests.first(), proposal_cluster, learning.as_ref()) {
-            (Some(request), Some(cluster), Some((chunks, database, _))) => build_proposals(
-                &session,
-                request,
-                cluster,
-                chunks,
-                database,
-                args.speaker_threshold,
-            )?,
-            _ => Vec::new(),
+    }) {
+        if let Err(rollback_error) =
+            restore_file(&corrections_path, previous_corrections.as_deref())
+        {
+            return Err(io::Error::other(format!(
+                "render failed: {render_error}; restoring {} also failed: {rollback_error}",
+                corrections_path.display()
+            ))
+            .into());
         }
-    } else {
-        Vec::new()
-    };
+        return Err(render_error);
+    }
+
+    let learning_available = learning.is_some();
+    let (mut learned, mut forgotten) = (0, 0);
+    if let Some(learning) = learning.as_mut() {
+        if learning.migrate_legacy_database {
+            SpeakerDatabase::load(&learning.database_path)?;
+        }
+        (learned, forgotten) = apply_correction_learning(&mut learning.database, &learning_updates);
+        if learned > 0 || forgotten > 0 {
+            learning.database.save(&learning.database_path)?;
+        }
+    }
+    let echo = correction_is_system_echo(&requests, &recognized, &corrections.corrections);
     Ok(CorrectionOutcome {
         learned,
         forgotten,
         learning_available,
         echo,
-        proposals,
+        proposals: Vec::new(),
     })
 }
 
@@ -579,10 +640,10 @@ fn validate_correction_request(
             io::Error::new(io::ErrorKind::InvalidInput, "speaker name cannot be empty").into(),
         );
     }
-    if request.end_ms <= request.start_ms {
+    if request.end_ms < request.start_ms {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "speaker correction end must be after its start",
+            "speaker correction end must not be before its start",
         )
         .into());
     }
@@ -657,7 +718,7 @@ fn upsert_correction(
 }
 
 fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
-    left_start < right_end && right_start < left_end
+    left_start <= right_end && right_start <= left_end
 }
 
 fn cluster_for_request(
@@ -684,7 +745,13 @@ fn cluster_for_request(
                         .end_ms
                         .min(request.end_ms)
                         .saturating_sub(segment.start_ms.max(request.start_ms));
-                    (overlap > 0).then_some((overlap, segment.start_ms, segment.cluster))
+                    ranges_overlap(
+                        segment.start_ms,
+                        segment.end_ms,
+                        request.start_ms,
+                        request.end_ms,
+                    )
+                    .then_some((overlap, segment.start_ms, segment.cluster))
                 })
                 .max_by_key(|(overlap, start, cluster)| {
                     (
@@ -801,17 +868,84 @@ fn prepare_correction_learning(
     let threads = thread_count(args.threads);
     let extractor = EmbeddingExtractor::new(model, threads)?;
     let identity = database::identity(model, extractor.dimension())?;
-    let chunks = ensure_embeddings(session, segments, &extractor, &identity, threads)?;
     let path = args
         .speakers_db
         .clone()
         .unwrap_or_else(database::default_path);
-    let database = match SpeakerDatabase::load_checked(&path, &identity) {
-        Ok(database) => database,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => SpeakerDatabase::empty(identity),
-        Err(error) => return Err(error.into()),
+    let (database, migrate_legacy_database) = load_correction_database(&path, &identity)?;
+    let chunks = ensure_embeddings(
+        session,
+        segments,
+        &extractor,
+        &database.embedding_model,
+        threads,
+    )?;
+    Ok(Some(CorrectionLearning {
+        chunks,
+        database,
+        database_path: path,
+        migrate_legacy_database,
+    }))
+}
+
+fn load_correction_database(
+    path: &Path,
+    identity: &EmbeddingModelIdentity,
+) -> io::Result<(SpeakerDatabase, bool)> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((SpeakerDatabase::empty(identity.clone()), false));
+        }
+        Err(error) => return Err(error),
     };
-    Ok(Some((chunks, database, path)))
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid speaker database {}: {error}", path.display()),
+        )
+    })?;
+    if value.get("format_version").is_none() {
+        serde_json::from_value::<LegacyCorrectionDatabase>(value).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid speaker database {}: {error}", path.display()),
+            )
+        })?;
+        return Ok((SpeakerDatabase::empty(identity.clone()), true));
+    }
+    SpeakerDatabase::load_checked(path, identity).map(|database| (database, false))
+}
+
+fn apply_correction_learning(
+    database: &mut SpeakerDatabase,
+    updates: &[CorrectionLearningUpdate],
+) -> (usize, usize) {
+    let mut learned = 0;
+    let mut forgotten = 0;
+    for update in updates {
+        for old_name in &update.old_names {
+            for vector in &update.vectors {
+                forgotten += database.forget_matching(old_name, vector, 0.999);
+            }
+        }
+        let embeddings = &mut database
+            .speakers
+            .entry(update.speaker.clone())
+            .or_default()
+            .embeddings;
+        for vector in &update.vectors {
+            if embeddings.iter().any(|existing| {
+                embedding::cosine(existing, vector).is_some_and(|score| score >= 0.999)
+            }) {
+                continue;
+            }
+            embeddings.push(vector.clone());
+            learned += 1;
+        }
+    }
+    database.refresh_centroids();
+    (learned, forgotten)
 }
 
 fn stage_process_args(session: PathBuf) -> ProcessArgs {
@@ -985,8 +1119,8 @@ fn read_enabled_audio(
     }
     match session.read_audio(source) {
         Ok(samples) => Ok(samples),
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !strict => {
-            eprintln!("warning: enabled {source} track is missing; skipping it");
+        Err(error) if !strict => {
+            eprintln!("warning: cannot read enabled {source} audio; skipping it: {error}");
             Ok(Vec::new())
         }
         Err(error) => Err(io::Error::new(
@@ -1145,6 +1279,10 @@ fn recognize_speakers(
     strict: bool,
     progress: Option<&dyn Fn(f64)>,
 ) -> Result<RecognitionResult, Box<dyn std::error::Error>> {
+    if segments.is_empty() {
+        eprintln!("speaker recognition: no diarized clusters; skipped");
+        return Ok(RecognitionResult::default());
+    }
     let Some(model) = args.embedding_model.as_deref() else {
         if strict {
             return Err(io::Error::new(
@@ -1188,8 +1326,33 @@ fn recognize_speakers(
             return Ok(RecognitionResult::default());
         }
     };
-    let chunks = match write_embeddings(session, segments, &extractor, &identity, threads, progress)
-    {
+    let meeting = meeting::read_details(&session.meeting_path())?;
+    let path = args
+        .speakers_db
+        .clone()
+        .unwrap_or_else(database::default_path);
+    let strict_database = if strict {
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("speaker database {} does not exist", path.display()),
+            )
+            .into());
+        }
+        let database = SpeakerDatabase::load(&path)?;
+        validate_recognition_database(&database, &identity)?;
+        for source in [AudioSource::System, AudioSource::Mic] {
+            if segments.iter().any(|segment| segment.source == source) {
+                read_enabled_audio(session, source, true, true)?;
+            }
+        }
+        Some(database)
+    } else {
+        None
+    };
+    let chunks = match write_embeddings(
+        session, segments, &extractor, &identity, threads, strict, progress,
+    ) {
         Ok(chunks) => chunks,
         Err(error) => {
             if strict {
@@ -1199,60 +1362,28 @@ fn recognize_speakers(
             return Ok(RecognitionResult::default());
         }
     };
-    if segments.is_empty() {
-        eprintln!("speaker recognition: no diarized clusters; skipped");
-        return Ok(RecognitionResult::default());
-    }
-
-    let path = args
-        .speakers_db
-        .clone()
-        .unwrap_or_else(database::default_path);
-    if !path.is_file() {
-        if strict {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("speaker database {} does not exist", path.display()),
-            )
-            .into());
-        }
+    if !strict && !path.is_file() {
         eprintln!("speaker recognition: no database; skipped");
         return Ok(RecognitionResult::default());
     }
-    let database = match SpeakerDatabase::load(&path) {
-        Ok(database) => database,
-        Err(error) => {
-            if strict {
-                return Err(error.into());
+    let database = if let Some(database) = strict_database {
+        database
+    } else {
+        match SpeakerDatabase::load(&path) {
+            Ok(database) => database,
+            Err(error) => {
+                eprintln!("warning: speaker recognition skipped: {error}");
+                return Ok(RecognitionResult::default());
             }
-            eprintln!("warning: speaker recognition skipped: {error}");
-            return Ok(RecognitionResult::default());
         }
     };
-    if database
-        .speakers
-        .values()
-        .all(|speaker| speaker.embeddings.is_empty())
-    {
-        if strict {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "speaker database has no embeddings",
-            )
-            .into());
-        }
-        eprintln!("speaker recognition: database has no embeddings; skipped");
-        return Ok(RecognitionResult::default());
-    }
-    if let Err(error) = database.validate_identity(&identity) {
+    if let Err(error) = validate_recognition_database(&database, &identity) {
         if strict {
             return Err(error.into());
         }
         eprintln!("warning: speaker recognition skipped: {error}");
         return Ok(RecognitionResult::default());
     }
-
-    let meeting = meeting::read_details(&session.meeting_path())?;
     let mut result = RecognitionResult::default();
     for source in [AudioSource::System, AudioSource::Mic] {
         let mut cluster_embeddings = BTreeMap::<u32, Vec<Vec<f32>>>::new();
@@ -1305,6 +1436,23 @@ fn recognize_speakers(
         }
     }
     Ok(result)
+}
+
+fn validate_recognition_database(
+    database: &SpeakerDatabase,
+    identity: &EmbeddingModelIdentity,
+) -> io::Result<()> {
+    if database
+        .speakers
+        .values()
+        .all(|speaker| speaker.embeddings.is_empty())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "speaker database has no embeddings",
+        ));
+    }
+    database.validate_identity(identity)
 }
 
 fn allowed_candidate_names(
@@ -1450,21 +1598,28 @@ fn write_speaker_assignments(
         .speakers_db
         .clone()
         .unwrap_or_else(database::default_path);
+    let (embedding_model_sha256, speakers_database_sha256) = if segments.is_empty() {
+        (None, None)
+    } else {
+        (
+            args.embedding_model
+                .as_deref()
+                .filter(|path| path.is_file())
+                .map(models::sha256_file)
+                .transpose()?,
+            database
+                .is_file()
+                .then(|| models::sha256_file(&database))
+                .transpose()?,
+        )
+    };
     let artifact = SpeakerAssignments {
         format_version: SPEAKER_ASSIGNMENTS_FORMAT_VERSION,
         provenance: SpeakerAssignmentProvenance {
             diarization_file: "diarization.jsonl".into(),
             diarization_sha256: models::sha256_file(&session.diarization_path())?,
-            embedding_model_sha256: args
-                .embedding_model
-                .as_deref()
-                .filter(|path| path.is_file())
-                .map(models::sha256_file)
-                .transpose()?,
-            speakers_database_sha256: database
-                .is_file()
-                .then(|| models::sha256_file(&database))
-                .transpose()?,
+            embedding_model_sha256,
+            speakers_database_sha256,
             meeting_sha256: session
                 .meeting_path()
                 .is_file()
@@ -1849,6 +2004,36 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     fs::rename(tmp, path)
 }
 
+fn read_optional_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>) -> io::Result<()> {
+    match (fs::read(path), previous) {
+        (Ok(current), Some(previous)) if current == previous => return Ok(()),
+        (Err(error), None) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        _ => {}
+    }
+    let Some(previous) = previous else {
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+    };
+    let tmp = jsonl::tmp_path(path);
+    {
+        let mut file = crate::session::create_private_file(&tmp)?;
+        file.write_all(previous)?;
+        file.sync_all()?;
+    }
+    fs::rename(tmp, path)
+}
+
 fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
     let bytes = fs::read(path)?;
     serde_json::from_slice(&bytes).map_err(|error| {
@@ -1875,6 +2060,17 @@ fn ensure_embeddings(
     identity: &EmbeddingModelIdentity,
     threads: usize,
 ) -> Result<Vec<EmbeddingChunk>, Box<dyn std::error::Error>> {
+    ensure_embeddings_with(session, segments, identity, || {
+        write_embeddings(session, segments, extractor, identity, threads, true, None)
+    })
+}
+
+fn ensure_embeddings_with(
+    session: &Session,
+    segments: &[SpeakerSegment],
+    identity: &EmbeddingModelIdentity,
+    regenerate: impl FnOnce() -> Result<Vec<EmbeddingChunk>, Box<dyn std::error::Error>>,
+) -> Result<Vec<EmbeddingChunk>, Box<dyn std::error::Error>> {
     let current = (|| -> Result<Option<Vec<EmbeddingChunk>>, Box<dyn std::error::Error>> {
         let metadata: EmbeddingsMetadata = read_json(&session.embeddings_metadata_path())?;
         if !embeddings_metadata_is_current(session, segments, identity, &metadata)? {
@@ -1886,7 +2082,7 @@ fn ensure_embeddings(
     if let Ok(Some(chunks)) = current {
         return Ok(chunks);
     }
-    write_embeddings(session, segments, extractor, identity, threads, None)
+    regenerate()
 }
 
 fn write_embeddings(
@@ -1895,6 +2091,7 @@ fn write_embeddings(
     extractor: &EmbeddingExtractor,
     identity: &EmbeddingModelIdentity,
     threads: usize,
+    strict_audio: bool,
     progress: Option<&dyn Fn(f64)>,
 ) -> Result<Vec<EmbeddingChunk>, Box<dyn std::error::Error>> {
     let total_chunks = segments
@@ -1906,6 +2103,7 @@ fn write_embeddings(
     }
     let mut completed = 0usize;
     let mut chunks = Vec::with_capacity(total_chunks);
+    let mut readable_sources = HashSet::new();
     for source in [AudioSource::System, AudioSource::Mic] {
         let source_segments = segments
             .iter()
@@ -1914,7 +2112,19 @@ fn write_embeddings(
         if source_segments.is_empty() {
             continue;
         }
-        let samples = session.read_audio(source)?;
+        let Some(samples) = read_embedding_audio(session, source, strict_audio)? else {
+            completed += source_segments
+                .iter()
+                .map(|segment| chunk_ranges(segment).len())
+                .sum::<usize>();
+            if let Some(progress) = progress
+                && total_chunks > 0
+            {
+                progress(completed as f64 / total_chunks as f64);
+            }
+            continue;
+        };
+        readable_sources.insert(source);
         for segment in source_segments {
             for (start_ms, end_ms) in chunk_ranges(segment) {
                 let start = ms_to_index(start_ms, samples.len());
@@ -1949,24 +2159,76 @@ fn write_embeddings(
             chunk.end_ms,
         )
     });
-    jsonl::write_all_atomic(&session.embeddings_path(), &chunks)?;
-    let (mic_audio_sha256, system_audio_sha256) = embeddings_audio_hashes(session, segments)?;
-    write_json_atomic(
-        &session.embeddings_metadata_path(),
-        &EmbeddingsMetadata {
+    let mic_audio_sha256 = hash_audio(
+        session,
+        AudioSource::Mic,
+        readable_sources.contains(&AudioSource::Mic),
+    )?;
+    let system_audio_sha256 = hash_audio(
+        session,
+        AudioSource::System,
+        readable_sources.contains(&AudioSource::System),
+    )?;
+    let diarization_sha256 = models::sha256_file(&session.diarization_path())?;
+    let outputs = [
+        session.embeddings_path(),
+        session.embeddings_metadata_path(),
+    ];
+    let previous_outputs = outputs
+        .iter()
+        .map(|path| read_optional_file(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        jsonl::write_all_atomic(&session.embeddings_path(), &chunks)?;
+        let metadata = EmbeddingsMetadata {
             format_version: EMBEDDINGS_FORMAT_VERSION,
             output_file: "embeddings.jsonl".into(),
             output_sha256: models::sha256_file(&session.embeddings_path())?,
-            diarization_sha256: models::sha256_file(&session.diarization_path())?,
+            diarization_sha256,
             mic_audio_sha256,
             system_audio_sha256,
             embedding_model_sha256: identity.sha256.clone(),
             threads,
             window_ms: EMBEDDING_WINDOW_MS,
             min_learn_ms: MIN_LEARN_MS,
-        },
-    )?;
+        };
+        write_json_atomic(&session.embeddings_metadata_path(), &metadata)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        for (path, previous) in outputs.iter().zip(&previous_outputs) {
+            if let Err(restore_error) = restore_file(path, previous.as_deref()) {
+                return Err(io::Error::other(format!(
+                    "writing speaker embeddings failed: {error}; restoring {} also failed: {restore_error}",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+        return Err(error);
+    }
     Ok(chunks)
+}
+
+fn read_embedding_audio(
+    session: &Session,
+    source: AudioSource,
+    strict: bool,
+) -> io::Result<Option<Vec<f32>>> {
+    match session.read_audio(source) {
+        Ok(samples) => Ok(Some(samples)),
+        Err(error) if strict => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "cannot read {source} audio {}: {error}",
+                session.stored_audio_path(source).display()
+            ),
+        )),
+        Err(error) => {
+            eprintln!("warning: cannot read {source} audio for speaker recognition: {error}");
+            Ok(None)
+        }
+    }
 }
 
 fn embeddings_metadata_is_current(
@@ -2256,25 +2518,98 @@ mod tests {
     }
 
     #[test]
-    fn microphone_diarization_is_effective_only_with_mic_segments() {
-        assert!(!effective_diarize_mic(true, &[]));
-        assert!(!effective_diarize_mic(
-            false,
-            &[SpeakerSegment {
-                source: AudioSource::Mic,
-                start_ms: 0,
-                end_ms: 1_000,
-                cluster: 0,
-            }]
-        ));
-        assert!(effective_diarize_mic(
-            true,
-            &[SpeakerSegment {
-                source: AudioSource::Mic,
-                start_ms: 0,
-                end_ms: 1_000,
-                cluster: 0,
-            }]
+    fn cluster_for_request_prefers_an_exact_transcript_row() {
+        let request = CorrectionRequest {
+            source: AudioSource::System,
+            start_ms: 10,
+            end_ms: 20,
+            speaker: "Alice".into(),
+        };
+        let utterances = [Utterance {
+            start_ms: 10,
+            end_ms: 20,
+            source: AudioSource::System,
+            speaker_id: "spk_9".into(),
+            speaker: "SPEAKER_09".into(),
+            text: "hello".into(),
+            locked: false,
+            echo: None,
+        }];
+        let segments = [SpeakerSegment {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 30,
+            cluster: 7,
+        }];
+
+        assert_eq!(
+            cluster_for_request(&request, &utterances, &segments),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn cluster_for_request_falls_back_to_closed_segment_overlap() {
+        let request = CorrectionRequest {
+            source: AudioSource::System,
+            start_ms: 30,
+            end_ms: 30,
+            speaker: "Alice".into(),
+        };
+        let segments = [SpeakerSegment {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 30,
+            cluster: 7,
+        }];
+
+        assert_eq!(cluster_for_request(&request, &[], &segments), Some(7));
+    }
+
+    #[test]
+    fn correction_validation_accepts_a_point_range() {
+        let request = CorrectionRequest {
+            source: AudioSource::System,
+            start_ms: 30,
+            end_ms: 30,
+            speaker: "Alice".into(),
+        };
+
+        assert_eq!(validate_correction_request(&request).unwrap(), request);
+    }
+
+    #[test]
+    fn correction_echo_uses_recognized_system_names() {
+        let requests = [CorrectionRequest {
+            source: AudioSource::Mic,
+            start_ms: 0,
+            end_ms: 0,
+            speaker: "Laura".into(),
+        }];
+        let recognized = HashMap::from([((AudioSource::System, 2), "Laura".into())]);
+
+        assert!(correction_is_system_echo(&requests, &recognized, &[]));
+    }
+
+    #[test]
+    fn correction_echo_uses_hand_corrected_system_names() {
+        let requests = [CorrectionRequest {
+            source: AudioSource::Mic,
+            start_ms: 0,
+            end_ms: 0,
+            speaker: "Laura".into(),
+        }];
+        let corrections = [SpeakerCorrection {
+            source: AudioSource::System,
+            start_ms: 10,
+            end_ms: 20,
+            speaker: "Laura".into(),
+        }];
+
+        assert!(correction_is_system_echo(
+            &requests,
+            &HashMap::new(),
+            &corrections
         ));
     }
 
@@ -2498,6 +2833,120 @@ mod tests {
             })
             .expect("write manifest");
         session
+    }
+
+    fn embedding_cache_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        Session,
+        Vec<SpeakerSegment>,
+        EmbeddingModelIdentity,
+        Vec<EmbeddingChunk>,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        let segments = vec![SpeakerSegment {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            cluster: 7,
+        }];
+        jsonl::write_all_atomic(&session.diarization_path(), &segments).expect("write diarization");
+        fs::write(
+            session.audio_path(AudioSource::System),
+            [0.0f32, 0.25, -0.25, 0.5]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .expect("write audio");
+        let chunks = vec![EmbeddingChunk {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            cluster: 7,
+            embedding: vec![1.0, 0.0],
+        }];
+        jsonl::write_all_atomic(&session.embeddings_path(), &chunks).expect("write embeddings");
+        let identity = EmbeddingModelIdentity {
+            name: "model".into(),
+            sha256: "model-hash".into(),
+            dimension: 2,
+        };
+        write_json_atomic(
+            &session.embeddings_metadata_path(),
+            &EmbeddingsMetadata {
+                format_version: EMBEDDINGS_FORMAT_VERSION,
+                output_file: "embeddings.jsonl".into(),
+                output_sha256: models::sha256_file(&session.embeddings_path())
+                    .expect("hash embeddings"),
+                diarization_sha256: models::sha256_file(&session.diarization_path())
+                    .expect("hash diarization"),
+                mic_audio_sha256: None,
+                system_audio_sha256: Some(
+                    models::sha256_file(&session.audio_path(AudioSource::System))
+                        .expect("hash audio"),
+                ),
+                embedding_model_sha256: identity.sha256.clone(),
+                threads: 1,
+                window_ms: EMBEDDING_WINDOW_MS,
+                min_learn_ms: MIN_LEARN_MS,
+            },
+        )
+        .expect("write metadata");
+        (root, session, segments, identity, chunks)
+    }
+
+    #[test]
+    fn ensure_embeddings_reuses_current_artifacts() {
+        let (root, session, segments, identity, chunks) =
+            embedding_cache_fixture("embeddings-reuse");
+        let regenerated = std::cell::Cell::new(false);
+
+        let actual = ensure_embeddings_with(&session, &segments, &identity, || {
+            regenerated.set(true);
+            Ok(Vec::new())
+        })
+        .expect("reuse embeddings");
+
+        assert_eq!(actual, chunks);
+        assert!(!regenerated.get());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn ensure_embeddings_regenerates_after_diarization_changes() {
+        let (root, session, mut segments, identity, _) =
+            embedding_cache_fixture("embeddings-regenerate");
+        segments[0].cluster = 8;
+        jsonl::write_all_atomic(&session.diarization_path(), &segments)
+            .expect("replace diarization");
+        let replacement = vec![EmbeddingChunk {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            cluster: 8,
+            embedding: vec![0.0, 1.0],
+        }];
+        let regenerated = std::cell::Cell::new(false);
+
+        let actual = ensure_embeddings_with(&session, &segments, &identity, || {
+            regenerated.set(true);
+            Ok(replacement.clone())
+        })
+        .expect("regenerate embeddings");
+
+        assert_eq!(actual, replacement);
+        assert!(regenerated.get());
+        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[test]
@@ -2857,7 +3306,262 @@ mod tests {
     }
 
     #[test]
-    fn correction_upsert_replaces_only_same_source_overlaps() {
+    fn apply_corrections_locks_and_renders_without_proposals() {
+        let (root, session) = assignment_fixture("apply-corrections", None);
+        let outcome = apply_corrections(
+            stage_process_args(session.dir.clone()),
+            &[CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 10,
+                end_ms: 20,
+                speaker: "Carol".into(),
+            }],
+        )
+        .expect("apply correction batch");
+
+        assert!(outcome.proposals.is_empty());
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read transcript");
+        assert_eq!(transcript[0].speaker, "Carol");
+        assert!(transcript[0].locked);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn correction_learning_failure_does_not_write_correction() {
+        let (root, session) = assignment_fixture("correction-learning-failure", None);
+        let mut args = stage_process_args(session.dir.clone());
+        args.embedding_model = Some(root.join("missing-embedding.onnx"));
+        args.allow_unverified_models = true;
+
+        correct_speaker(
+            args,
+            &CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 10,
+                end_ms: 20,
+                speaker: "Carol".into(),
+            },
+        )
+        .expect_err("invalid learning setup fails correction");
+
+        assert!(!session.speaker_corrections_path().exists());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_render_restores_previous_corrections() {
+        let (root, session) = assignment_fixture("correction-render-rollback", None);
+        let previous = SpeakerCorrections {
+            format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
+            corrections: vec![SpeakerCorrection {
+                source: AudioSource::Mic,
+                start_ms: 1,
+                end_ms: 2,
+                speaker: "Pat".into(),
+            }],
+        };
+        write_json_atomic(&session.speaker_corrections_path(), &previous)
+            .expect("write previous corrections");
+        let previous_bytes =
+            fs::read(session.speaker_corrections_path()).expect("read previous corrections");
+        fs::write(
+            session.diarization_metadata_path(),
+            br#"{"format_version":999}"#,
+        )
+        .expect("write invalid metadata version");
+
+        correct_speaker(
+            stage_process_args(session.dir.clone()),
+            &CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 10,
+                end_ms: 20,
+                speaker: "Carol".into(),
+            },
+        )
+        .expect_err("render failure rolls back correction");
+
+        assert_eq!(
+            fs::read(session.speaker_corrections_path()).expect("read restored corrections"),
+            previous_bytes
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_render_removes_a_new_corrections_file() {
+        let (root, session) = assignment_fixture("correction-render-delete", None);
+        fs::write(
+            session.diarization_metadata_path(),
+            br#"{"format_version":999}"#,
+        )
+        .expect("write invalid metadata version");
+
+        correct_speaker(
+            stage_process_args(session.dir.clone()),
+            &CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 10,
+                end_ms: 20,
+                speaker: "Carol".into(),
+            },
+        )
+        .expect_err("render failure rolls back correction");
+
+        assert!(!session.speaker_corrections_path().exists());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_render_does_not_apply_prepared_learning() {
+        let Some(models) = std::env::var_os("SINGSTONE_TEST_MODELS") else {
+            return;
+        };
+        let (root, session) = assignment_fixture("correction-render-learning", None);
+        let model = PathBuf::from(models).join("nemo_en_titanet_small.onnx");
+        let extractor = EmbeddingExtractor::new(&model, 1).expect("open embedding model");
+        let identity = database::identity(&model, extractor.dimension()).expect("model identity");
+        let database_path = root.join("speakers.json");
+        SpeakerDatabase::empty(identity.clone())
+            .save(&database_path)
+            .expect("write database");
+        let previous_database = fs::read(&database_path).expect("read database");
+        let segments = [SpeakerSegment {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            cluster: 7,
+        }];
+        jsonl::write_all_atomic(&session.diarization_path(), &segments)
+            .expect("replace diarization");
+        let mut vector = vec![0.0; identity.dimension];
+        vector[0] = 1.0;
+        let chunks = [EmbeddingChunk {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            cluster: 7,
+            embedding: vector,
+        }];
+        jsonl::write_all_atomic(&session.embeddings_path(), &chunks)
+            .expect("write cached embeddings");
+        write_json_atomic(
+            &session.embeddings_metadata_path(),
+            &EmbeddingsMetadata {
+                format_version: EMBEDDINGS_FORMAT_VERSION,
+                output_file: "embeddings.jsonl".into(),
+                output_sha256: models::sha256_file(&session.embeddings_path())
+                    .expect("hash embeddings"),
+                diarization_sha256: models::sha256_file(&session.diarization_path())
+                    .expect("hash diarization"),
+                mic_audio_sha256: None,
+                system_audio_sha256: None,
+                embedding_model_sha256: identity.sha256,
+                threads: 1,
+                window_ms: EMBEDDING_WINDOW_MS,
+                min_learn_ms: MIN_LEARN_MS,
+            },
+        )
+        .expect("write embeddings metadata");
+        fs::write(
+            session.diarization_metadata_path(),
+            br#"{"format_version":999}"#,
+        )
+        .expect("write invalid diarization metadata");
+        let mut args = stage_process_args(session.dir.clone());
+        args.embedding_model = Some(model);
+        args.allow_unverified_models = true;
+        args.threads = Some(1);
+        args.speakers_db = Some(database_path.clone());
+
+        correct_speaker(
+            args,
+            &CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 2_000,
+                speaker: "Carol".into(),
+            },
+        )
+        .expect_err("render failure prevents learning");
+
+        assert_eq!(
+            fs::read(database_path).expect("reread database"),
+            previous_database
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn correcting_same_voice_twice_does_not_duplicate_learning() {
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "model".into(),
+            sha256: "hash".into(),
+            dimension: 2,
+        });
+        let updates = [CorrectionLearningUpdate {
+            speaker: "Carol".into(),
+            old_names: HashSet::new(),
+            vectors: vec![vec![1.0, 0.0]],
+        }];
+
+        assert_eq!(apply_correction_learning(&mut database, &updates), (1, 0));
+        let after_first = serde_json::to_vec(&database).expect("serialize database");
+        assert_eq!(apply_correction_learning(&mut database, &updates), (0, 0));
+        assert_eq!(
+            serde_json::to_vec(&database).expect("serialize database again"),
+            after_first
+        );
+    }
+
+    #[test]
+    fn correction_preflight_does_not_migrate_a_legacy_database() {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-correction-legacy-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create fixture");
+        let path = root.join("speakers.json");
+        let legacy = serde_json::json!({
+            "embedding_model": {
+                "name": "old-model",
+                "sha256": "old-hash",
+                "dimension": 2
+            },
+            "speakers": {
+                "Alice": { "embeddings": [[1.0, 0.0]] }
+            }
+        });
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy).expect("serialize legacy database"),
+        )
+        .expect("write legacy database");
+        let previous = fs::read(&path).expect("read legacy database");
+        let expected = EmbeddingModelIdentity {
+            name: "new-model".into(),
+            sha256: "new-hash".into(),
+            dimension: 2,
+        };
+
+        let (database, migrate) =
+            load_correction_database(&path, &expected).expect("load correction database");
+
+        assert!(migrate);
+        assert_eq!(database.embedding_model, expected);
+        assert!(database.speakers.is_empty());
+        assert_eq!(fs::read(&path).expect("reread legacy database"), previous);
+        assert!(!root.join("speakers.json.v1.bak").exists());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn correction_upsert_uses_closed_same_source_ranges() {
         let mut artifact = SpeakerCorrections {
             format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
             corrections: vec![
@@ -2890,16 +3594,15 @@ mod tests {
 
         let replaced = upsert_correction(&mut artifact, replacement.clone());
 
-        assert_eq!(replaced.len(), 1);
-        assert_eq!(replaced[0].speaker, "Old");
-        assert_eq!(artifact.corrections.len(), 3);
-        assert!(artifact.corrections.contains(&replacement));
-        assert!(
-            artifact
-                .corrections
+        assert_eq!(
+            replaced
                 .iter()
-                .any(|correction| correction.speaker == "Adjacent")
+                .map(|correction| correction.speaker.as_str())
+                .collect::<Vec<_>>(),
+            ["Old", "Adjacent"]
         );
+        assert_eq!(artifact.corrections.len(), 2);
+        assert!(artifact.corrections.contains(&replacement));
         assert!(
             artifact
                 .corrections
@@ -3209,6 +3912,150 @@ mod tests {
             render_error
                 .to_string()
                 .contains(session.words_path().to_string_lossy().as_ref())
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn empty_diarization_skips_recognition_before_model_and_database() {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-empty-recognition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        jsonl::write_all_atomic::<SpeakerSegment>(&session.diarization_path(), &[])
+            .expect("write empty diarization");
+        fs::write(session.embeddings_path(), b"prior embeddings\n")
+            .expect("write prior embeddings");
+        let model_path = root.join("unused-embedding.onnx");
+        let database_path = root.join("unused-speakers.json");
+        fs::write(&model_path, b"not a model").expect("write unused model");
+        fs::write(&database_path, b"not a database").expect("write unused database");
+
+        run_recognize(RecognizeArgs {
+            session: session.dir.clone(),
+            embedding_model: model_path,
+            models_lock: None,
+            allow_unverified_models: false,
+            threads: Some(1),
+            speakers_db: Some(database_path),
+            speaker_threshold: 0.6,
+        })
+        .expect("empty diarization needs no recognition inputs");
+
+        assert_eq!(
+            fs::read(session.embeddings_path()).expect("read prior embeddings"),
+            b"prior embeddings\n"
+        );
+        let assignments: SpeakerAssignments =
+            read_json(&session.speaker_assignments_path()).expect("read empty assignments");
+        assert!(assignments.assignments.is_empty());
+        assert_eq!(assignments.provenance.embedding_model_sha256, None);
+        assert_eq!(assignments.provenance.speakers_database_sha256, None);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn non_strict_embedding_audio_keeps_a_readable_source_and_skips_an_unreadable_one() {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-unreadable-recognition-audio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        let system_samples = [0.25f32, -0.25, 0.5, -0.5];
+        fs::write(
+            session.audio_path(AudioSource::System),
+            system_samples
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("write readable system audio");
+        fs::create_dir(session.audio_path(AudioSource::Mic))
+            .expect("put directory where audio file belongs");
+
+        assert_eq!(
+            read_embedding_audio(&session, AudioSource::System, false)
+                .expect("readable non-strict source")
+                .expect("system source remains available"),
+            system_samples
+        );
+        assert!(
+            read_embedding_audio(&session, AudioSource::Mic, false)
+                .expect("non-strict read")
+                .is_none()
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn strict_recognition_validates_database_before_writing_outputs() {
+        let Some(models) = std::env::var_os("SINGSTONE_TEST_MODELS") else {
+            return;
+        };
+        let root = std::env::temp_dir().join(format!(
+            "singstone-recognition-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 2_000,
+                cluster: 0,
+            }],
+        )
+        .expect("write diarization");
+        fs::write(
+            session.audio_path(AudioSource::System),
+            vec![0u8; SAMPLE_RATE as usize * 2 * std::mem::size_of::<f32>()],
+        )
+        .expect("write audio");
+        let database_path = root.join("speakers.json");
+        fs::write(&database_path, b"not JSON\n").expect("write invalid database");
+        fs::write(session.embeddings_path(), b"prior embeddings\n")
+            .expect("write prior embeddings");
+        fs::write(session.embeddings_metadata_path(), b"prior metadata\n")
+            .expect("write prior metadata");
+        fs::write(session.speaker_assignments_path(), b"prior assignments\n")
+            .expect("write prior assignments");
+
+        run_recognize(RecognizeArgs {
+            session: session.dir.clone(),
+            embedding_model: PathBuf::from(models).join("nemo_en_titanet_small.onnx"),
+            models_lock: None,
+            allow_unverified_models: true,
+            threads: Some(1),
+            speakers_db: Some(database_path),
+            speaker_threshold: 0.6,
+        })
+        .expect_err("invalid database fails preflight");
+
+        assert_eq!(
+            fs::read(session.embeddings_path()).expect("read embeddings"),
+            b"prior embeddings\n"
+        );
+        assert_eq!(
+            fs::read(session.embeddings_metadata_path()).expect("read metadata"),
+            b"prior metadata\n"
+        );
+        assert_eq!(
+            fs::read(session.speaker_assignments_path()).expect("read assignments"),
+            b"prior assignments\n"
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }

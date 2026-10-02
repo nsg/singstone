@@ -149,7 +149,11 @@ fn required_default_models<'a>(
             requested.push(("speaker-embedding", &args.embedding_model));
         }
         Command::Recognize(args) => requested.push(("speaker-embedding", &args.embedding_model)),
-        Command::Correct(args) => requested.push(("speaker-embedding", &args.embedding_model)),
+        Command::Correct(args) => {
+            if let Some(path) = args.embedding_model.as_deref() {
+                requested.push(("speaker-embedding", path));
+            }
+        }
         _ => {}
     }
     requested

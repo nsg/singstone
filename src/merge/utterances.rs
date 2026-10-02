@@ -138,15 +138,25 @@ fn mark_echoes(
     meeting: Option<&MeetingDetails>,
 ) {
     if let Some(meeting) = meeting.filter(|_| diarize_mic) {
+        let resolved_microphone_speakers = recognized
+            .iter()
+            .filter(|((source, _), _)| *source == AudioSource::Mic)
+            .map(|(_, speaker)| speaker.as_str())
+            .chain(
+                corrections
+                    .iter()
+                    .filter(|correction| correction.source == AudioSource::Mic)
+                    .map(|correction| correction.speaker.as_str()),
+            )
+            .filter(|name| meeting.is_local_attendee(name))
+            .collect::<HashSet<_>>();
         let complete_local_roster = meeting.local.unknown == 0
             && !meeting.local.known.is_empty()
-            && meeting.local.known.iter().all(|name| {
-                recognized.iter().any(|((source, _), recognized)| {
-                    *source == AudioSource::Mic
-                        && recognized == name
-                        && meeting.is_local_attendee(recognized)
-                })
-            });
+            && meeting
+                .local
+                .known
+                .iter()
+                .all(|name| resolved_microphone_speakers.contains(name.as_str()));
         for utterance in utterances
             .iter_mut()
             .filter(|utterance| utterance.source == AudioSource::Mic)
@@ -222,7 +232,7 @@ fn word_speaker(
     let correction = corrections.iter().rev().find(|correction| {
         correction.source == word.source
             && midpoint >= correction.start_ms
-            && midpoint < correction.end_ms
+            && midpoint <= correction.end_ms
     });
     if let Some(correction) = correction {
         speaker.clone_from(&correction.speaker);
@@ -422,7 +432,7 @@ mod tests {
             SpeakerCorrection {
                 source: AudioSource::System,
                 start_ms: 50,
-                end_ms: 150,
+                end_ms: 149,
                 speaker: "Alice".into(),
             },
         ];
@@ -445,6 +455,38 @@ mod tests {
         assert_eq!(utterances[1].speaker_id, "spk_4");
         assert_eq!(utterances[1].speaker, "SPEAKER_00");
         assert!(!utterances[1].locked);
+    }
+
+    #[test]
+    fn closed_correction_range_includes_zero_length_trailing_word() {
+        let words = [
+            word(AudioSource::System, 0, 99, "first"),
+            word(AudioSource::System, 100, 100, "trailing"),
+        ];
+        let segments = [segment(AudioSource::System, 0, 100, 4)];
+        let corrections = [SpeakerCorrection {
+            source: AudioSource::System,
+            start_ms: 100,
+            end_ms: 100,
+            speaker: "Alice".into(),
+        }];
+
+        let utterances = build_utterances(
+            &words,
+            &segments,
+            &HashMap::new(),
+            &corrections,
+            "Me",
+            false,
+            0,
+            None,
+        );
+
+        assert_eq!(utterances.len(), 2);
+        assert_eq!(utterances[1].start_ms, 100);
+        assert_eq!(utterances[1].end_ms, 100);
+        assert_eq!(utterances[1].speaker, "Alice");
+        assert!(utterances[1].locked);
     }
 
     fn details(local: (&[&str], u32), remote: (&[&str], u32)) -> MeetingDetails {
@@ -498,6 +540,42 @@ mod tests {
             one_utterance_echo(AudioSource::Mic, 2, recognized, &meeting),
             Some(EchoEvidence::LocalRoster)
         );
+    }
+
+    #[test]
+    fn complete_local_roster_counts_microphone_corrections() {
+        let meeting = details((&["Laura", "Pat"], 0), (&[], 0));
+        let words = [
+            word(AudioSource::Mic, 0, 100, "Laura"),
+            word(AudioSource::Mic, 200, 300, "Pat"),
+            word(AudioSource::Mic, 400, 500, "anonymous"),
+        ];
+        let segments = [
+            segment(AudioSource::Mic, 0, 100, 1),
+            segment(AudioSource::Mic, 200, 300, 2),
+            segment(AudioSource::Mic, 400, 500, 3),
+        ];
+        let recognized = HashMap::from([((AudioSource::Mic, 1), "Laura".into())]);
+        let corrections = [SpeakerCorrection {
+            source: AudioSource::Mic,
+            start_ms: 200,
+            end_ms: 300,
+            speaker: "Pat".into(),
+        }];
+
+        let utterances = build_utterances(
+            &words,
+            &segments,
+            &recognized,
+            &corrections,
+            "Me",
+            true,
+            0,
+            Some(&meeting),
+        );
+
+        assert_eq!(utterances[2].speaker, "SPEAKER_01");
+        assert_eq!(utterances[2].echo, Some(EchoEvidence::LocalRoster));
     }
 
     #[test]

@@ -256,7 +256,7 @@ pub struct CorrectArgs {
     pub name: String,
     /// Path to the sherpa-onnx speaker embedding model.
     #[arg(long, env = "SINGSTONE_EMBEDDING_MODEL")]
-    pub embedding_model: PathBuf,
+    pub embedding_model: Option<PathBuf>,
     /// Trusted model manifest with SHA-256 hashes.
     #[arg(long, env = "SINGSTONE_MODELS_LOCK")]
     pub models_lock: Option<PathBuf>,
@@ -411,10 +411,8 @@ mod tests {
             "200",
             "--name",
             "Alice",
-            "--embedding-model",
-            "embed.onnx",
         ])
-        .expect("parse correction");
+        .expect("parse correction without learning model");
         assert!(matches!(
             correct.command,
             Command::Correct(CorrectArgs {
@@ -422,6 +420,7 @@ mod tests {
                 start_ms: 100,
                 end_ms: 200,
                 ref name,
+                embedding_model: None,
                 ..
             }) if name == "Alice"
         ));

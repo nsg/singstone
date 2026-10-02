@@ -10,12 +10,28 @@ mod types;
 use diarization::Diarizer;
 use diarization::sherpa::SherpaDiarizer;
 use embedding::EmbeddingExtractor;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
-use types::{AudioSource, SAMPLE_RATE, SpeakerSegment};
+use types::{AudioSource, DEFAULT_SPEAKER_THRESHOLD, SAMPLE_RATE, SpeakerSegment};
+
+#[derive(Debug, Deserialize)]
+struct SpeakerAssignments {
+    assignments: Vec<SpeakerAssignment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpeakerAssignment {
+    source: String,
+    cluster: u32,
+    score: Option<f32>,
+    speaker: Option<String>,
+}
 
 #[test]
 fn isolated_sherpa_diarization_and_embedding_calibration() {
@@ -46,47 +62,98 @@ fn isolated_sherpa_diarization_and_embedding_calibration() {
     assert!(clusters.len() >= 2);
     assert!(coverage >= 72_000);
 
-    let extractor = EmbeddingExtractor::new(&models.join("nemo_en_titanet_small.onnx"), 4)
-        .expect("create extractor");
+    let model = models.join("nemo_en_titanet_small.onnx");
+    let extractor = EmbeddingExtractor::new(&model, 4).expect("create extractor");
     let meeting =
         read_wav_pcm16(&samples.join("ES2002a.Mix-Headset.wav")).expect("read AMI meeting");
     let learned = learn_ground_truth_speakers(&samples, &meeting, &extractor)
         .expect("learn ground-truth speakers");
     assert!(learned.values().all(|dots| !dots.is_empty()));
-    let cluster_embeddings = embed_cluster_chunks(&segments, &audio, &extractor);
     let truth = ground_truth_segments(&samples).expect("parse ground truth segments");
+    let root = unique_dir("singstone-sherpa-calibration").expect("create calibration directory");
+    let session = root.join("session");
+    copy_dir(&samples.join("session-ami-3min"), &session).expect("copy AMI session");
+    write_jsonl(&session.join("diarization.jsonl"), &segments).expect("write diarization");
+
+    let database = root.join("speakers.json");
+    let mut scores_by_speaker = BTreeMap::new();
+    for speaker in ['A', 'B', 'C', 'D'] {
+        let singleton = BTreeMap::from([(speaker, learned[&speaker].clone())]);
+        write_speaker_database(&database, &model, extractor.dimension(), &singleton)
+            .expect("write singleton speaker database");
+        run_recognize(&session, &model, &database).expect("score singleton database");
+        scores_by_speaker.insert(
+            speaker,
+            read_system_assignments(&session)
+                .expect("read singleton assignments")
+                .into_iter()
+                .filter_map(|(cluster, assignment)| assignment.score.map(|score| (cluster, score)))
+                .collect::<BTreeMap<_, _>>(),
+        );
+    }
+
+    write_speaker_database(&database, &model, extractor.dimension(), &learned)
+        .expect("write complete speaker database");
+    run_recognize(&session, &model, &database).expect("recognize complete database");
+    let assignments = read_system_assignments(&session).expect("read complete assignments");
     let mut same_scores = Vec::new();
     let mut different_scores = Vec::new();
-    for (cluster, cluster_embedding) in cluster_embeddings {
-        let speaker = dominant_speaker(cluster, &segments, &truth).expect("dominant speaker");
-        let scores = learned
+    let mut recognized_names = BTreeSet::new();
+    for cluster in clusters {
+        if !scores_by_speaker
+            .values()
+            .all(|scores| scores.contains_key(&cluster))
+        {
+            eprintln!("cluster {cluster}: no usable production embedding score");
+            continue;
+        }
+        let overlaps = speaker_overlaps(cluster, &segments, &truth);
+        let (&speaker, &dominant_overlap) = overlaps
             .iter()
-            .filter_map(|(name, learned_dots)| {
-                embedding::speaker_score(&cluster_embedding, learned_dots)
-                    .map(|score| (*name, score))
-            })
-            .collect::<Vec<_>>();
-        let same = scores
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .filter(|(_, overlap)| **overlap > 0.0)
+            .expect("dominant speaker");
+        let same = scores_by_speaker[&speaker][&cluster];
+        let (wrong_speaker, different) = scores_by_speaker
             .iter()
-            .find(|(name, _)| *name == speaker)
-            .map(|(_, score)| *score)
-            .expect("same-speaker score");
-        let different = scores
-            .iter()
-            .filter(|(name, _)| *name != speaker)
-            .map(|(_, score)| *score)
-            .max_by(f32::total_cmp)
+            .filter(|(name, _)| **name != speaker)
+            .map(|(name, scores)| (*name, scores[&cluster]))
+            .max_by(|left, right| left.1.total_cmp(&right.1))
             .expect("different-speaker score");
+        let assignment = &assignments[&cluster];
+        let expected = format!("AMI {speaker}");
         same_scores.push(same);
         different_scores.push(different);
         eprintln!(
-            "cluster {cluster}: ground truth {speaker}, correct {same:.6}, best wrong {different:.6}"
+            "cluster {cluster}: ground truth {speaker} ({dominant_overlap:.3}s), correct {same:.6}, best wrong {wrong_speaker} {different:.6}, assigned {:?}, overlaps {:?}",
+            assignment.speaker, overlaps
         );
+        if different >= DEFAULT_SPEAKER_THRESHOLD {
+            eprintln!(
+                "cluster {cluster}: wrong speaker {wrong_speaker} is above the default threshold ({different:.6} >= {DEFAULT_SPEAKER_THRESHOLD:.3})"
+            );
+        }
+        if same >= DEFAULT_SPEAKER_THRESHOLD {
+            assert_eq!(
+                assignment.speaker.as_deref(),
+                Some(expected.as_str()),
+                "cluster {cluster} has a qualifying correct score but was not named correctly"
+            );
+        }
+        if let Some(name) = assignment.speaker.as_deref() {
+            assert_eq!(name, expected, "cluster {cluster} was named incorrectly");
+            recognized_names.insert(name.to_owned());
+        }
     }
+    assert!(
+        recognized_names.len() >= 2,
+        "threshold must still recognize multiple speakers"
+    );
     eprintln!(
-        "calibration ranges: same {}; best-different {}",
+        "calibration ranges: correct {}; best-wrong {}; default threshold {:.3}",
         score_range(&same_scores),
-        score_range(&different_scores)
+        score_range(&different_scores),
+        DEFAULT_SPEAKER_THRESHOLD
     );
 }
 
@@ -136,27 +203,6 @@ fn diarize(
     diarizer.diarize(audio)
 }
 
-fn embed_cluster_chunks(
-    segments: &[SpeakerSegment],
-    audio: &[f32],
-    extractor: &EmbeddingExtractor,
-) -> BTreeMap<u32, Vec<Vec<f32>>> {
-    let mut output = BTreeMap::<u32, Vec<Vec<f32>>>::new();
-    for segment in segments {
-        for (start_ms, end_ms) in fixed_windows(segment.start_ms, segment.end_ms) {
-            if end_ms.saturating_sub(start_ms) < 1_500 {
-                continue;
-            }
-            let start = to_sample(start_ms).min(audio.len());
-            let end = to_sample(end_ms).min(audio.len());
-            if let Some(value) = extractor.embed(&audio[start..end]) {
-                output.entry(segment.cluster).or_default().push(value);
-            }
-        }
-    }
-    output
-}
-
 fn learn_ground_truth_speakers(
     samples: &Path,
     meeting: &[f32],
@@ -178,6 +224,9 @@ fn learn_ground_truth_speakers(
             let Some(end) = attribute(line, "transcriber_end").and_then(parse_number) else {
                 continue;
             };
+            if start < 250.0 {
+                continue;
+            }
             let start_ms = (start * 1_000.0).round() as u64;
             let end_ms = (end * 1_000.0).round() as u64;
             for (window_start, window_end) in fixed_windows(start_ms, end_ms) {
@@ -240,11 +289,11 @@ fn ground_truth_segments(samples: &Path) -> io::Result<BTreeMap<char, Vec<(f64, 
     Ok(output)
 }
 
-fn dominant_speaker(
+fn speaker_overlaps(
     cluster: u32,
     segments: &[SpeakerSegment],
     truth: &BTreeMap<char, Vec<(f64, f64)>>,
-) -> Option<char> {
+) -> BTreeMap<char, f64> {
     truth
         .iter()
         .map(|(speaker, truth_segments)| {
@@ -261,9 +310,7 @@ fn dominant_speaker(
                 .sum::<f64>();
             (*speaker, overlap)
         })
-        .max_by(|left, right| left.1.total_cmp(&right.1))
-        .filter(|(_, overlap)| *overlap > 0.0)
-        .map(|(speaker, _)| speaker)
+        .collect()
 }
 
 fn score_range(scores: &[f32]) -> String {
@@ -320,6 +367,115 @@ fn read_wav_pcm16(path: &Path) -> io::Result<Vec<f32>> {
         io::ErrorKind::InvalidData,
         "WAV has no data chunk",
     ))
+}
+
+fn write_speaker_database(
+    path: &Path,
+    model: &Path,
+    dimension: usize,
+    learned: &BTreeMap<char, Vec<Vec<f32>>>,
+) -> io::Result<()> {
+    let speakers = learned
+        .iter()
+        .map(|(speaker, embeddings)| {
+            (
+                format!("AMI {speaker}"),
+                serde_json::json!({ "embeddings": embeddings }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let value = serde_json::json!({
+        "format_version": 2,
+        "embedding_model": {
+            "name": model.file_stem().and_then(|name| name.to_str()).unwrap_or("model"),
+            "sha256": sha256_file(model)?,
+            "dimension": dimension,
+        },
+        "speakers": speakers,
+    });
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&value).map_err(io::Error::other)?,
+    )
+}
+
+fn run_recognize(session: &Path, model: &Path, database: &Path) -> io::Result<()> {
+    let status = Command::new(env!("CARGO_BIN_EXE_singstone"))
+        .arg("recognize")
+        .arg(session)
+        .arg("--embedding-model")
+        .arg(model)
+        .arg("--speakers-db")
+        .arg(database)
+        .arg("--allow-unverified-models")
+        .args(["--threads", "4"])
+        .status()?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| io::Error::other(format!("recognize exited with {status}")))
+}
+
+fn read_system_assignments(session: &Path) -> io::Result<BTreeMap<u32, SpeakerAssignment>> {
+    let artifact: SpeakerAssignments =
+        serde_json::from_slice(&fs::read(session.join("speaker-assignments.json"))?)
+            .map_err(io::Error::other)?;
+    Ok(artifact
+        .assignments
+        .into_iter()
+        .filter(|assignment| assignment.source == "system")
+        .map(|assignment| (assignment.cluster, assignment))
+        .collect())
+}
+
+fn write_jsonl<T: serde::Serialize>(path: &Path, values: &[T]) -> io::Result<()> {
+    let mut output = String::new();
+    for value in values {
+        output.push_str(&serde_json::to_string(value).map_err(io::Error::other)?);
+        output.push('\n');
+    }
+    fs::write(path, output)
+}
+
+fn sha256_file(path: &Path) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn unique_dir(prefix: &str) -> io::Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos()
+    ));
+    fs::create_dir(&path)?;
+    Ok(path)
+}
+
+fn copy_dir(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 fn attribute<'a>(line: &'a str, name: &str) -> Option<&'a str> {

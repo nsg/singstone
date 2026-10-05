@@ -30,7 +30,8 @@ meeting, then choose a suggestion or assign a new name.
 
 Naming a line locks that line and also names the later lines that Singstone
 recognizes as the same voice. Those later lines stay unlocked, so a later
-choice can rename them. Earlier lines are never changed.
+choice can rename them. Earlier lines are never changed. A lock icon marks a
+line you named, and a fingerprint icon marks a line whose voice was learned.
 
 Open Speakers to inspect the locally learned voices and the number of voice
 samples stored for each person.

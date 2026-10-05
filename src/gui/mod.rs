@@ -858,9 +858,7 @@ fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
         .title("Learned voices")
         .description("Voices are matched locally; uncertain matches stay anonymous")
         .build();
-    let db_path = std::env::var_os("SINGSTONE_SPEAKERS_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(database::default_path);
+    let db_path = speakers_database_path();
     body.append(&group);
     let path = gtk::Label::new(Some(&format!("Database: {}", db_path.display())));
     path.set_xalign(0.0);
@@ -3013,10 +3011,13 @@ impl SessionDetail {
                 append_empty(&self.transcript, "The transcript is empty.");
             } else {
                 let frequent = Rc::new(frequent_speakers(&utterances, 3));
-                for utterance in &utterances {
+                let learned =
+                    process::learned_lines(&session, &speakers_database_path(), &utterances);
+                for (utterance, learned) in utterances.iter().zip(learned) {
                     let audio_path = session.stored_audio_path(utterance.source);
-                    self.transcript
-                        .append(&transcript_row(utterance, self, audio_path, &frequent));
+                    self.transcript.append(&transcript_row(
+                        utterance, learned, self, audio_path, &frequent,
+                    ));
                 }
             }
         } else {
@@ -3221,6 +3222,7 @@ fn session_row(summary: &SessionSummary) -> gtk::ListBoxRow {
 
 fn transcript_row(
     utterance: &Utterance,
+    learned: bool,
     detail: &SessionDetail,
     audio_path: PathBuf,
     frequent: &Rc<Vec<String>>,
@@ -3265,6 +3267,17 @@ fn transcript_row(
         lock.add_css_class("dim-label");
         lock.set_valign(gtk::Align::Center);
         head.append(&lock);
+    }
+    if learned {
+        let voice = gtk::Image::from_icon_name("auth-fingerprint-symbolic");
+        voice.set_pixel_size(14);
+        voice.set_tooltip_text(Some("Voice learned from this line"));
+        voice.update_property(&[gtk::accessible::Property::Label(
+            "Voice learned from this line",
+        )]);
+        voice.add_css_class("dim-label");
+        voice.set_valign(gtk::Align::Center);
+        head.append(&voice);
     }
     let timestamp = gtk::Label::new(Some(&format_timestamp(utterance.start_ms)));
     timestamp.add_css_class("dim-label");
@@ -3608,12 +3621,16 @@ fn show_assignment_dialog(
     entry.grab_focus();
 }
 
+fn speakers_database_path() -> PathBuf {
+    std::env::var_os("SINGSTONE_SPEAKERS_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(database::default_path)
+}
+
 fn assignment_suggestion_names(detail: &SessionDetail) -> Vec<String> {
     let mut names = Vec::new();
     let mut seen = BTreeMap::new();
-    let database_path = std::env::var_os("SINGSTONE_SPEAKERS_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(database::default_path);
+    let database_path = speakers_database_path();
     if let Ok(database) = SpeakerDatabase::load(&database_path) {
         for name in database.speakers.into_keys() {
             if seen.insert(canonical_name_key(&name), ()).is_none() {

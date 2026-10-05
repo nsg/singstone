@@ -35,6 +35,7 @@ const SPEAKER_CORRECTIONS_FORMAT_VERSION: u32 = 1;
 const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
 const PROPOSAL_MARGIN: f32 = 0.05;
+const SAME_VECTOR_SIMILARITY: f32 = 0.999;
 
 struct CorrectionLearning {
     chunks: Vec<EmbeddingChunk>,
@@ -986,7 +987,7 @@ fn apply_correction_learning(
     for update in updates {
         for old_name in &update.old_names {
             for vector in &update.vectors {
-                forgotten += database.forget_matching(old_name, vector, 0.999);
+                forgotten += database.forget_matching(old_name, vector, SAME_VECTOR_SIMILARITY);
             }
         }
         let embeddings = &mut database
@@ -996,7 +997,8 @@ fn apply_correction_learning(
             .embeddings;
         for vector in &update.vectors {
             if embeddings.iter().any(|existing| {
-                embedding::cosine(existing, vector).is_some_and(|score| score >= 0.999)
+                embedding::cosine(existing, vector)
+                    .is_some_and(|score| score >= SAME_VECTOR_SIMILARITY)
             }) {
                 continue;
             }
@@ -2390,6 +2392,51 @@ fn embeddings_in_range(
         })
         .map(|chunk| chunk.embedding.clone())
         .collect()
+}
+
+/// Marks the locked lines whose voice is stored under their name in the database.
+pub fn learned_lines(
+    session: &Session,
+    database_path: &Path,
+    utterances: &[Utterance],
+) -> Vec<bool> {
+    if !utterances.iter().any(|utterance| utterance.locked) {
+        return vec![false; utterances.len()];
+    }
+    let chunks: Vec<EmbeddingChunk> =
+        jsonl::read_all(&session.embeddings_path()).unwrap_or_default();
+    let Ok(database) = SpeakerDatabase::load(database_path) else {
+        return vec![false; utterances.len()];
+    };
+    utterances
+        .iter()
+        .map(|utterance| line_is_learned(utterance, &chunks, &database))
+        .collect()
+}
+
+fn line_is_learned(
+    utterance: &Utterance,
+    chunks: &[EmbeddingChunk],
+    database: &SpeakerDatabase,
+) -> bool {
+    if !utterance.locked {
+        return false;
+    }
+    let Some(record) = database.speakers.get(&utterance.speaker) else {
+        return false;
+    };
+    embeddings_in_range(
+        chunks,
+        utterance.source,
+        utterance.start_ms,
+        utterance.end_ms,
+    )
+    .iter()
+    .any(|vector| {
+        record.embeddings.iter().any(|stored| {
+            embedding::cosine(stored, vector).is_some_and(|score| score >= SAME_VECTOR_SIMILARITY)
+        })
+    })
 }
 
 fn score_speaker_name(database: &SpeakerDatabase, name: &str, query: &[Vec<f32>]) -> Option<f32> {
@@ -3850,6 +3897,54 @@ mod tests {
             .is_none()
         );
         assert!(proposal_for_utterance(&request, 8, candidate, &chunks, &database, 0.6).is_none());
+    }
+
+    #[test]
+    fn learned_lines_are_locked_lines_whose_voice_is_stored_under_their_name() {
+        let chunks = [EmbeddingChunk {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            cluster: 7,
+            embedding: vec![1.0, 0.0],
+        }];
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "model".into(),
+            sha256: "hash".into(),
+            dimension: 2,
+        });
+        let record = |embedding| SpeakerRecord {
+            embeddings: vec![embedding],
+            centroid: None,
+        };
+        database
+            .speakers
+            .insert("Alice".into(), record(vec![1.0, 0.0]));
+        database
+            .speakers
+            .insert("Bob".into(), record(vec![0.0, 1.0]));
+        let line = Utterance {
+            start_ms: 0,
+            end_ms: 2_000,
+            source: AudioSource::System,
+            speaker_id: "spk_7".into(),
+            speaker: "Alice".into(),
+            text: "line".into(),
+            locked: true,
+            echo: None,
+        };
+
+        assert!(line_is_learned(&line, &chunks, &database));
+        let unlocked = Utterance {
+            locked: false,
+            ..line.clone()
+        };
+        assert!(!line_is_learned(&unlocked, &chunks, &database));
+        let other_voice = Utterance {
+            speaker: "Bob".into(),
+            ..line
+        };
+        assert!(!line_is_learned(&other_voice, &chunks, &database));
     }
 
     #[test]

@@ -371,6 +371,11 @@ unlearning are skipped.
 A microphone correction that matches a system-track name is still stored and
 learned; rendering then marks its utterance as echo.
 
+The app marks a locked line as learned when one of its chunks is stored under
+the line's name in the database (cosine similarity at least `0.999`). This is
+derived when the session is shown, not recorded: the mark disappears when the
+speaker is deleted, or when reprocessing moves the chunk boundaries.
+
 The command-line equivalent is:
 
 ```bash

@@ -315,13 +315,19 @@ fn parse_stream_header(header: &[u8; STREAM_HEADER_LEN]) -> Result<u64, String> 
     Ok(packed & ((1 << 36) - 1))
 }
 
-/// `SINGSTONE_FLAC`, else the copy bundled in the snap, else `flac` on `PATH`.
-/// A snap without its bundled copy does not fall back: under confinement
-/// `PATH` only reaches the base snap, and the error should name the real gap.
+/// `SINGSTONE_FLAC`, else the copy bundled in our snap, else `flac` on `PATH`.
+/// Our snap never falls back: under confinement `PATH` only reaches the base
+/// snap, and the error should name the real gap. Other snaps' environments,
+/// such as the rustup build snap that runs the tests, are not ours.
 fn flac_command() -> Command {
     let executable = std::env::var_os("SINGSTONE_FLAC")
         .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(std::env::var_os("SNAP")?).join("usr/bin/flac")))
+        .or_else(|| {
+            if std::env::var_os("SNAP_NAME")? != env!("CARGO_PKG_NAME") {
+                return None;
+            }
+            Some(PathBuf::from(std::env::var_os("SNAP")?).join("usr/bin/flac"))
+        })
         .unwrap_or_else(|| PathBuf::from("flac"));
     Command::new(executable)
 }

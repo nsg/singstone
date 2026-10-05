@@ -372,8 +372,9 @@ source and cluster. A row is proposed when the new name beats its current name
 by at least `0.05`, or, for an unnamed row, when the new score reaches the
 speaker threshold. Earlier rows are never proposed. `correct` prints the
 outcome and each forward proposal as JSON lines but does not apply proposals.
-The current GUI applies only the selected line; proposal selection in the GUI
-is deferred.
+The GUI applies every proposed row without asking: each one is locked and
+learned like a line named by hand, and rows that are not proposed keep their
+current name.
 
 ## 4. Render: intermediate artifacts to the final transcript
 

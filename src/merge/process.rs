@@ -509,6 +509,40 @@ pub fn apply_corrections(
     apply_corrections_inner(args, requests).map(|(outcome, _)| outcome)
 }
 
+pub fn correct_speaker_forward(
+    args: ProcessArgs,
+    request: &CorrectionRequest,
+) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+    let mut outcome = correct_speaker(args.clone(), request)?;
+    let later = proposed_requests(&outcome.proposals, &request.speaker);
+    if later.is_empty() {
+        return Ok(outcome);
+    }
+    let applied = apply_corrections(args, &later).map_err(|error| {
+        io::Error::other(format!(
+            "the line was named, but later lines of the same voice were not: {error}"
+        ))
+    })?;
+    outcome.learned += applied.learned;
+    outcome.forgotten += applied.forgotten;
+    outcome.learning_available &= applied.learning_available;
+    outcome.echo |= applied.echo;
+    Ok(outcome)
+}
+
+fn proposed_requests(proposals: &[Proposal], speaker: &str) -> Vec<CorrectionRequest> {
+    proposals
+        .iter()
+        .filter(|proposal| proposal.proposed)
+        .map(|proposal| CorrectionRequest {
+            source: proposal.source,
+            start_ms: proposal.start_ms,
+            end_ms: proposal.end_ms,
+            speaker: speaker.to_owned(),
+        })
+        .collect()
+}
+
 fn apply_corrections_inner(
     args: ProcessArgs,
     requests: &[CorrectionRequest],
@@ -3816,6 +3850,30 @@ mod tests {
             .is_none()
         );
         assert!(proposal_for_utterance(&request, 8, candidate, &chunks, &database, 0.6).is_none());
+    }
+
+    #[test]
+    fn only_proposed_later_lines_become_corrections() {
+        let proposal = |start_ms, proposed| Proposal {
+            source: AudioSource::System,
+            cluster: 7,
+            start_ms,
+            end_ms: start_ms + 1_000,
+            text: "later".into(),
+            current_speaker: None,
+            score_new: 0.7,
+            score_old: None,
+            proposed,
+        };
+        assert_eq!(
+            proposed_requests(&[proposal(2_000, true), proposal(4_000, false)], "Alice"),
+            [CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 2_000,
+                end_ms: 3_000,
+                speaker: "Alice".into(),
+            }]
+        );
     }
 
     #[test]

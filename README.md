@@ -28,10 +28,8 @@ meeting, then choose a suggestion or assign a new name.
 
 ![Speaker assignment dialog filtering suggestions to Laura](docs/images/assign-autocomplete.png)
 
-After confirming a line, review scored proposals for later lines of the same
-voice and apply only the checked matches.
-
-![Later-lines proposal dialog with checked voice matches and scores](docs/images/later-lines.png)
+Naming a line also names the later lines that Singstone recognizes as the
+same voice. Earlier lines are never changed.
 
 Open Speakers to inspect the locally learned voices and the number of voice
 samples stored for each person.

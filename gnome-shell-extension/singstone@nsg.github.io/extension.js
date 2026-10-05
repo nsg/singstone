@@ -116,10 +116,10 @@ class SingstoneButton extends PanelMenu.Button {
         this.menu.addMenuItem(openItem);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this._snapUpdateItem = new PopupMenu.PopupMenuItem(
-            'Reinstall Singstone'
+        this._updateItem = new PopupMenu.PopupMenuItem(
+            'Reinstall Singstone and extension'
         );
-        this._snapUpdateItem.connect('activate', () => {
+        this._updateItem.connect('activate', () => {
             if (this._client.status.recording) {
                 Main.notify(
                     'Singstone',
@@ -127,29 +127,9 @@ class SingstoneButton extends PanelMenu.Button {
                 );
                 return;
             }
-            this._updater.updateSnap({
-                beforeInstall: async () => {
-                    if (!this._client.available)
-                        return false;
-                    this._client.quit();
-                    await this._client.waitUntilUnavailable(15_000);
-                    return true;
-                },
-                afterInstall: wasRunning => {
-                    if (wasRunning)
-                        this._client.openApp();
-                },
-            });
+            this._updater.update();
         });
-        this.menu.addMenuItem(this._snapUpdateItem);
-
-        this._extensionUpdateItem = new PopupMenu.PopupMenuItem(
-            'Reinstall extension'
-        );
-        this._extensionUpdateItem.connect(
-            'activate', () => this._updater.updateExtension()
-        );
-        this.menu.addMenuItem(this._extensionUpdateItem);
+        this.menu.addMenuItem(this._updateItem);
 
         this._checkUpdateItem = new PopupMenu.PopupMenuItem(
             'Check for updates'
@@ -205,7 +185,7 @@ class SingstoneButton extends PanelMenu.Button {
             this._recordIcon.remove_style_class_name(
                 'singstone-record-icon-live'
             );
-            this._elapsedLabel.text = this._updateProgressText() ?? 'Record';
+            this._elapsedLabel.text = 'Record';
             this._meters.hide();
             this._micMeter.reset();
             this._systemMeter.reset();
@@ -236,86 +216,32 @@ class SingstoneButton extends PanelMenu.Button {
     }
 
     _syncUpdates() {
-        const snapTask = this._updater.snapTask;
-        this._snapUpdateItem.visible = this._updater.snapInstalled;
-        if (snapTask?.phase === 'checking') {
-            this._snapUpdateItem.label.text = 'Checking for updates…';
-            this._snapUpdateItem.setSensitive(false);
-        } else if (snapTask?.phase === 'downloading') {
-            this._snapUpdateItem.label.text = downloadLabel(
-                'Downloading Singstone…', snapTask.progress
-            );
-            this._snapUpdateItem.setSensitive(false);
-        } else if (snapTask?.phase === 'installing') {
-            this._snapUpdateItem.label.text = 'Installing Singstone…';
-            this._snapUpdateItem.setSensitive(false);
-        } else if (snapTask?.phase === 'stopping') {
-            this._snapUpdateItem.label.text = 'Stopping Singstone…';
-            this._snapUpdateItem.setSensitive(false);
-        } else {
-            this._snapUpdateItem.label.text = this._updater.snapUpdateAvailable
-                ? `Update Singstone to ${shortCommit(
+        if (this._updater.updateAvailable) {
+            this._updateItem.label.text =
+                `Update Singstone and extension to ${shortCommit(
                     this._updater.remote.commit
-                )}`
-                : 'Reinstall Singstone';
-            this._snapUpdateItem.setSensitive(!this._updater.checking);
-        }
-
-        const extensionTask = this._updater.extensionTask;
-        if (extensionTask?.phase === 'checking') {
-            this._extensionUpdateItem.label.text = 'Checking for updates…';
-            this._extensionUpdateItem.setSensitive(false);
-        } else if (extensionTask?.phase === 'downloading') {
-            this._extensionUpdateItem.label.text = downloadLabel(
-                'Downloading extension…', extensionTask.progress
-            );
-            this._extensionUpdateItem.setSensitive(false);
-        } else if (extensionTask?.phase === 'installing') {
-            this._extensionUpdateItem.label.text = 'Installing extension…';
-            this._extensionUpdateItem.setSensitive(false);
-        } else if (this._updater.extensionRestartPending &&
-            !this._updater.extensionUpdateAvailable) {
-            this._extensionUpdateItem.label.text =
+                )}`;
+            this._updateItem.setSensitive(!this._updater.checking);
+        } else if (this._updater.extensionRestartPending) {
+            this._updateItem.label.text =
                 'Extension updated; log out to load it';
-            this._extensionUpdateItem.setSensitive(false);
+            this._updateItem.setSensitive(false);
         } else {
-            this._extensionUpdateItem.label.text =
-                this._updater.extensionUpdateAvailable
-                    ? `Update extension to ${shortCommit(
-                        this._updater.remote.commit
-                    )}`
-                    : 'Reinstall extension';
-            this._extensionUpdateItem.setSensitive(!this._updater.checking);
+            this._updateItem.label.text = 'Reinstall Singstone and extension';
+            this._updateItem.setSensitive(!this._updater.checking);
         }
 
         this._checkUpdateItem.label.text = this._updater.checking
             ? 'Checking for updates…'
             : 'Check for updates';
         this._checkUpdateItem.setSensitive(!this._updater.checking);
-        this._updateIcon.visible = this._updater.snapUpdateAvailable ||
-            this._updater.extensionUpdateAvailable ||
+        this._updateIcon.visible = this._updater.updateAvailable ||
             this._updater.extensionRestartPending;
-        this._sync();
-    }
-
-    _updateProgressText() {
-        const task = this._updater.snapTask ?? this._updater.extensionTask;
-        if (!task)
-            return null;
-        if (task.phase === 'downloading')
-            return downloadLabel('Updating', task.progress);
-        return 'Updating…';
     }
 });
 
 function shortCommit(commit) {
     return commit?.slice(0, 7) ?? '';
-}
-
-function downloadLabel(label, progress) {
-    if (progress < 0)
-        return label;
-    return `${label} ${Math.round(progress * 100)}%`;
 }
 
 function formatElapsed(elapsed) {

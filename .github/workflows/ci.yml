@@ -280,11 +280,11 @@ jobs:
           must be installed; it is launched automatically if it is not running.
           The extension supports GNOME Shell 45 through 49.
 
-          The top bar menu (right-click the Record button) shows an update icon when
-          a newer build is available. "Update Singstone" closes Singstone if it is
-          running (stop any recording first), installs the snap after the password
-          prompt, and reopens Singstone. "Update extension" installs the zip; log out
-          and back in again to load it.
+          The top bar menu (click the Record button) shows an update icon when a
+          newer build is available. "Update Singstone and extension" opens a
+          terminal that downloads both, closes Singstone if it is running (stop
+          any recording first), installs them after the sudo password prompt, and
+          reopens Singstone. Log out and back in again to load the new extension.
           EOF
           } > release-notes.md
 

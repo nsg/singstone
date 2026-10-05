@@ -19,6 +19,7 @@ fi
 for file in "$extension_dir"/*.js; do
   node --input-type=module --check < "$file"
 done
+bash -n "$extension_dir/update.sh"
 
 cp -a "$extension_dir/." "$staging/"
 cp "$repo_root/LICENSE" "$staging/LICENSE"

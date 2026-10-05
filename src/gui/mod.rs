@@ -4151,6 +4151,8 @@ fn open_path(path: &Path) {
 }
 
 fn show_error(parent: &adw::ApplicationWindow, heading: &str, body: &str) {
+    // Also reach the terminal or journal, where a dismissed dialog can be found again.
+    eprintln!("error: {heading}: {body}");
     let dialog = adw::AlertDialog::new(Some(heading), Some(body));
     dialog.add_response("close", "Close");
     dialog.set_default_response(Some("close"));

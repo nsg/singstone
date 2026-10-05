@@ -229,15 +229,20 @@ fn word_speaker(
     let midpoint = word
         .start_ms
         .saturating_add(word.end_ms.saturating_sub(word.start_ms) / 2);
-    let correction = corrections.iter().rev().find(|correction| {
-        correction.source == word.source
-            && midpoint >= correction.start_ms
-            && midpoint <= correction.end_ms
-    });
+    let correction = corrections
+        .iter()
+        .rev()
+        .filter(|correction| {
+            correction.source == word.source
+                && midpoint >= correction.start_ms
+                && midpoint <= correction.end_ms
+        })
+        .min_by_key(|correction| correction.inferred);
     if let Some(correction) = correction {
         speaker.clone_from(&correction.speaker);
     }
-    (speaker_id, speaker, correction.is_some())
+    let locked = correction.is_some_and(|correction| !correction.inferred);
+    (speaker_id, speaker, locked)
 }
 
 fn source_order(source: AudioSource) -> u8 {
@@ -428,12 +433,14 @@ mod tests {
                 start_ms: 0,
                 end_ms: 200,
                 speaker: "Wrong source".into(),
+                inferred: false,
             },
             SpeakerCorrection {
                 source: AudioSource::System,
                 start_ms: 50,
                 end_ms: 149,
                 speaker: "Alice".into(),
+                inferred: false,
             },
         ];
 
@@ -458,6 +465,40 @@ mod tests {
     }
 
     #[test]
+    fn inferred_corrections_name_words_without_locking_and_yield_to_locks() {
+        let words = vec![
+            word(AudioSource::System, 0, 100, "first"),
+            word(AudioSource::System, 100, 200, "second"),
+        ];
+        let segments = [segment(AudioSource::System, 0, 200, 4)];
+        let correction = |end_ms, speaker: &str, inferred| SpeakerCorrection {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms,
+            speaker: speaker.into(),
+            inferred,
+        };
+        let corrections = [correction(99, "Alice", false), correction(200, "Bob", true)];
+
+        let utterances = build_utterances(
+            &words,
+            &segments,
+            &HashMap::new(),
+            &corrections,
+            "Me",
+            false,
+            0,
+            None,
+        );
+
+        assert_eq!(utterances.len(), 2);
+        assert_eq!(utterances[0].speaker, "Alice");
+        assert!(utterances[0].locked);
+        assert_eq!(utterances[1].speaker, "Bob");
+        assert!(!utterances[1].locked);
+    }
+
+    #[test]
     fn closed_correction_range_includes_zero_length_trailing_word() {
         let words = [
             word(AudioSource::System, 0, 99, "first"),
@@ -469,6 +510,7 @@ mod tests {
             start_ms: 100,
             end_ms: 100,
             speaker: "Alice".into(),
+            inferred: false,
         }];
 
         let utterances = build_utterances(
@@ -561,6 +603,7 @@ mod tests {
             start_ms: 200,
             end_ms: 300,
             speaker: "Pat".into(),
+            inferred: false,
         }];
 
         let utterances = build_utterances(
@@ -614,6 +657,7 @@ mod tests {
             start_ms: 500,
             end_ms: 600,
             speaker: "Alice".into(),
+            inferred: false,
         }];
         let recognized = HashMap::from([((AudioSource::Mic, 1), "Alice".into())]);
         let utterances = build_utterances(

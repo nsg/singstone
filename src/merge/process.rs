@@ -470,6 +470,82 @@ pub fn correct_speaker(
     args: ProcessArgs,
     request: &CorrectionRequest,
 ) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+    correct_speaker_resolved(args, request).map(|(outcome, _)| outcome)
+}
+
+pub fn correct_speaker_forward(
+    args: ProcessArgs,
+    request: &CorrectionRequest,
+) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+    let session = Session::open(args.session.clone())?;
+    let (outcome, request) = correct_speaker_resolved(args, request)?;
+    let later = inferred_corrections(&outcome.proposals, &request.speaker);
+    if !later.is_empty() {
+        infer_later_lines(&session, later).map_err(|error| {
+            io::Error::other(format!(
+                "the line was named, but later lines of the same voice were not: {error}"
+            ))
+        })?;
+    }
+    Ok(outcome)
+}
+
+fn inferred_corrections(proposals: &[Proposal], speaker: &str) -> Vec<SpeakerCorrection> {
+    proposals
+        .iter()
+        .filter(|proposal| proposal.proposed)
+        .map(|proposal| SpeakerCorrection {
+            source: proposal.source,
+            start_ms: proposal.start_ms,
+            end_ms: proposal.end_ms,
+            speaker: speaker.to_owned(),
+            inferred: true,
+        })
+        .collect()
+}
+
+fn infer_later_lines(
+    session: &Session,
+    later: Vec<SpeakerCorrection>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut corrections = read_speaker_corrections(session)?;
+    for correction in later {
+        upsert_correction(&mut corrections, correction);
+    }
+    save_corrections_and_render(session, &corrections)
+}
+
+fn save_corrections_and_render(
+    session: &Session,
+    corrections: &SpeakerCorrections,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = session.speaker_corrections_path();
+    let previous = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    write_json_atomic(&path, corrections)?;
+    if let Err(render_error) = run_render(RenderArgs {
+        session: session.dir.clone(),
+        diarize_mic: None,
+    }) {
+        if let Err(rollback_error) = restore_file(&path, previous.as_deref()) {
+            return Err(io::Error::other(format!(
+                "render failed: {render_error}; restoring {} also failed: {rollback_error}",
+                path.display()
+            ))
+            .into());
+        }
+        return Err(render_error);
+    }
+    Ok(())
+}
+
+fn correct_speaker_resolved(
+    args: ProcessArgs,
+    request: &CorrectionRequest,
+) -> Result<(CorrectionOutcome, CorrectionRequest), Box<dyn std::error::Error>> {
     let request = validate_correction_request(request)?;
     let session = Session::open(args.session.clone())?;
     let segments: Vec<SpeakerSegment> =
@@ -486,8 +562,9 @@ pub fn correct_speaker(
         .clone()
         .unwrap_or_else(database::default_path);
     let threshold = args.speaker_threshold;
-    let (mut outcome, requests) = apply_corrections_inner(args, std::slice::from_ref(&request))?;
-    let request = &requests[0];
+    let (mut outcome, mut requests) =
+        apply_corrections_inner(args, std::slice::from_ref(&request))?;
+    let request = requests.remove(0);
     if outcome.learning_available
         && let Some(cluster) = proposal_cluster
         && learning_configured
@@ -497,50 +574,9 @@ pub fn correct_speaker(
             read_jsonl_artifact(&session.embeddings_path(), "speaker embeddings")?;
         let database = SpeakerDatabase::load(&database_path)?;
         outcome.proposals =
-            build_proposals(&session, request, cluster, &chunks, &database, threshold)?;
+            build_proposals(&session, &request, cluster, &chunks, &database, threshold)?;
     }
-    Ok(outcome)
-}
-
-pub fn apply_corrections(
-    args: ProcessArgs,
-    requests: &[CorrectionRequest],
-) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
-    apply_corrections_inner(args, requests).map(|(outcome, _)| outcome)
-}
-
-pub fn correct_speaker_forward(
-    args: ProcessArgs,
-    request: &CorrectionRequest,
-) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
-    let mut outcome = correct_speaker(args.clone(), request)?;
-    let later = proposed_requests(&outcome.proposals, &request.speaker);
-    if later.is_empty() {
-        return Ok(outcome);
-    }
-    let applied = apply_corrections(args, &later).map_err(|error| {
-        io::Error::other(format!(
-            "the line was named, but later lines of the same voice were not: {error}"
-        ))
-    })?;
-    outcome.learned += applied.learned;
-    outcome.forgotten += applied.forgotten;
-    outcome.learning_available &= applied.learning_available;
-    outcome.echo |= applied.echo;
-    Ok(outcome)
-}
-
-fn proposed_requests(proposals: &[Proposal], speaker: &str) -> Vec<CorrectionRequest> {
-    proposals
-        .iter()
-        .filter(|proposal| proposal.proposed)
-        .map(|proposal| CorrectionRequest {
-            source: proposal.source,
-            start_ms: proposal.start_ms,
-            end_ms: proposal.end_ms,
-            speaker: speaker.to_owned(),
-        })
-        .collect()
+    Ok((outcome, request))
 }
 
 fn apply_corrections_inner(
@@ -567,12 +603,6 @@ fn apply_corrections_inner(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(error) => return Err(error.into()),
     };
-    let corrections_path = session.speaker_corrections_path();
-    let previous_corrections = match fs::read(&corrections_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
     let mut corrections = read_speaker_corrections(&session)?;
     let mut learning = prepare_correction_learning(&args, &session, &segments)?;
     if let Some(learning) = learning.as_ref() {
@@ -589,6 +619,7 @@ fn apply_corrections_inner(
                 start_ms: request.start_ms,
                 end_ms: request.end_ms,
                 speaker: request.speaker.clone(),
+                inferred: false,
             },
         ));
     }
@@ -601,6 +632,7 @@ fn apply_corrections_inner(
                 .map(|(request, replaced)| {
                     let mut old_names = replaced
                         .iter()
+                        .filter(|correction| !correction.inferred)
                         .map(|correction| correction.speaker.clone())
                         .collect::<HashSet<_>>();
                     if let Some(cluster) =
@@ -625,22 +657,7 @@ fn apply_corrections_inner(
         })
         .unwrap_or_default();
 
-    write_json_atomic(&corrections_path, &corrections)?;
-    if let Err(render_error) = run_render(RenderArgs {
-        session: session.dir.clone(),
-        diarize_mic: None,
-    }) {
-        if let Err(rollback_error) =
-            restore_file(&corrections_path, previous_corrections.as_deref())
-        {
-            return Err(io::Error::other(format!(
-                "render failed: {render_error}; restoring {} also failed: {rollback_error}",
-                corrections_path.display()
-            ))
-            .into());
-        }
-        return Err(render_error);
-    }
+    save_corrections_and_render(&session, &corrections)?;
 
     let learning_available = learning.is_some();
     let (mut learned, mut forgotten) = (0, 0);
@@ -740,6 +757,7 @@ fn upsert_correction(
     let mut replaced = Vec::new();
     for existing in old {
         if existing.source == correction.source
+            && (existing.inferred || !correction.inferred)
             && locks_collide(
                 existing.start_ms,
                 existing.end_ms,
@@ -2646,6 +2664,7 @@ mod tests {
             start_ms: 10,
             end_ms: 20,
             speaker: "Laura".into(),
+            inferred: false,
         }];
 
         assert!(correction_is_system_echo(
@@ -3121,6 +3140,7 @@ mod tests {
                 start_ms: 10,
                 end_ms: 20,
                 speaker: "Alice".into(),
+                inferred: false,
             }],
         };
         write_json_atomic(&session.speaker_corrections_path(), &corrections)
@@ -3451,28 +3471,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_corrections_locks_and_renders_without_proposals() {
-        let (root, session) = assignment_fixture("apply-corrections", None);
-        let outcome = apply_corrections(
-            stage_process_args(session.dir.clone()),
-            &[CorrectionRequest {
-                source: AudioSource::System,
-                start_ms: 10,
-                end_ms: 20,
-                speaker: "Carol".into(),
-            }],
-        )
-        .expect("apply correction batch");
-
-        assert!(outcome.proposals.is_empty());
-        let transcript: Vec<Utterance> =
-            jsonl::read_all(&session.transcript_path()).expect("read transcript");
-        assert_eq!(transcript[0].speaker, "Carol");
-        assert!(transcript[0].locked);
-        fs::remove_dir_all(root).expect("remove fixture");
-    }
-
-    #[test]
     fn correction_learning_failure_does_not_write_correction() {
         let (root, session) = assignment_fixture("correction-learning-failure", None);
         let mut args = stage_process_args(session.dir.clone());
@@ -3504,6 +3502,7 @@ mod tests {
                 start_ms: 1,
                 end_ms: 2,
                 speaker: "Pat".into(),
+                inferred: false,
             }],
         };
         write_json_atomic(&session.speaker_corrections_path(), &previous)
@@ -3712,6 +3711,7 @@ mod tests {
             start_ms,
             end_ms,
             speaker: speaker.into(),
+            inferred: false,
         };
         let mut artifact = SpeakerCorrections {
             format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
@@ -3853,7 +3853,7 @@ mod tests {
     }
 
     #[test]
-    fn only_proposed_later_lines_become_corrections() {
+    fn only_proposed_later_lines_become_inferred_corrections() {
         let proposal = |start_ms, proposed| Proposal {
             source: AudioSource::System,
             cluster: 7,
@@ -3866,14 +3866,39 @@ mod tests {
             proposed,
         };
         assert_eq!(
-            proposed_requests(&[proposal(2_000, true), proposal(4_000, false)], "Alice"),
-            [CorrectionRequest {
+            inferred_corrections(&[proposal(2_000, true), proposal(4_000, false)], "Alice"),
+            [SpeakerCorrection {
                 source: AudioSource::System,
                 start_ms: 2_000,
                 end_ms: 3_000,
                 speaker: "Alice".into(),
+                inferred: true,
             }]
         );
+    }
+
+    #[test]
+    fn inferred_corrections_replace_each_other_but_never_a_lock() {
+        let correction = |speaker: &str, inferred| SpeakerCorrection {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 100,
+            speaker: speaker.into(),
+            inferred,
+        };
+        let mut artifact = SpeakerCorrections {
+            format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
+            corrections: vec![correction("Locked", false), correction("Guess", true)],
+        };
+
+        upsert_correction(&mut artifact, correction("New guess", true));
+        assert_eq!(
+            artifact.corrections,
+            [correction("Locked", false), correction("New guess", true)]
+        );
+
+        upsert_correction(&mut artifact, correction("Chosen", false));
+        assert_eq!(artifact.corrections, [correction("Chosen", false)]);
     }
 
     #[test]

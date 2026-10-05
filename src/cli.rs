@@ -70,7 +70,7 @@ pub struct RecordArgs {
     pub duration: Option<f64>,
 }
 
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug)]
 pub struct ProcessArgs {
     /// Session directory.
     pub session: PathBuf,

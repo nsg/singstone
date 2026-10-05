@@ -103,6 +103,9 @@ pub struct SpeakerCorrection {
     pub start_ms: u64,
     pub end_ms: u64,
     pub speaker: String,
+    /// A name carried forward from a lock rather than chosen for this range.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inferred: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3430,13 +3430,13 @@ fn show_assignment_dialog(
         (
             "Change this speaker",
             format!(
-                "Currently {current}. The new name applies to this line and to later lines that Singstone recognizes as the same voice. Earlier lines stay as they are. When the local voice model is available, it also learns the voice under the new name."
+                "Currently {current}. The new name is locked on this line. Later lines that Singstone recognizes as the same voice get the name too, without a lock. Earlier lines stay as they are. When the local voice model is available, it also learns the voice under the new name."
             ),
         )
     } else {
         (
             "Who is this speaker?",
-            "The name applies to this line and to later lines that Singstone recognizes as the same voice. Earlier lines stay as they are. When the local voice model is available, it also learns this voice for future meetings.".to_owned(),
+            "The name is locked on this line. Later lines that Singstone recognizes as the same voice get the name too, without a lock. Earlier lines stay as they are. When the local voice model is available, it also learns this voice for future meetings.".to_owned(),
         )
     };
     let dialog = adw::AlertDialog::new(Some(heading), Some(&body));

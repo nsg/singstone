@@ -28,8 +28,9 @@ meeting, then choose a suggestion or assign a new name.
 
 ![Speaker assignment dialog filtering suggestions to Laura](docs/images/assign-autocomplete.png)
 
-Naming a line also names the later lines that Singstone recognizes as the
-same voice. Earlier lines are never changed.
+Naming a line locks that line and also names the later lines that Singstone
+recognizes as the same voice. Those later lines stay unlocked, so a later
+choice can rename them. Earlier lines are never changed.
 
 Open Speakers to inspect the locally learned voices and the number of voice
 samples stored for each person.

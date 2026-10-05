@@ -340,6 +340,19 @@ range. The resulting utterance has `"locked":true`; its `speaker_id` remains
 the underlying `spk_N` or `mic_N` cluster ID. Locks are never changed by
 recognition, proposals, rendering, or reprocessing.
 
+An entry with `"inferred":true` is a name carried forward from a lock to a
+later line of the same voice, not a lock:
+
+```json
+{"source":"system","start_ms":52950,"end_ms":58560,"speaker":"Alice","inferred":true}
+```
+
+Its words take the name but the utterance is not locked, nothing is learned
+from it, and it stays a candidate for later proposals. A lock replaces the
+inferred entries it overlaps and wins where both cover a word; an inferred
+entry replaces only other inferred entries. Like locks, inferred entries are
+kept across reprocessing.
+
 Names assigned by hand before this version lived in
 `speaker-assignments.json` and are not carried over; reprocessing such a
 session loses those names.
@@ -372,9 +385,9 @@ source and cluster. A row is proposed when the new name beats its current name
 by at least `0.05`, or, for an unnamed row, when the new score reaches the
 speaker threshold. Earlier rows are never proposed. `correct` prints the
 outcome and each forward proposal as JSON lines but does not apply proposals.
-The GUI applies every proposed row without asking: each one is locked and
-learned like a line named by hand, and rows that are not proposed keep their
-current name.
+The GUI applies every proposed row without asking, as an inferred entry. Only
+the line named by hand is locked and learned; rows that are not proposed keep
+their current name.
 
 ## 4. Render: intermediate artifacts to the final transcript
 

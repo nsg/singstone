@@ -266,7 +266,7 @@ the command line, since placing attendees needs a person to answer.
 ## Archive audio
 
 Recordings are raw 32-bit float audio, about 230 MB per hour and track.
-**Archive audio…** on a processed session, or `singstone archive SESSION`,
+**Archive…** on a processed session, or `singstone archive SESSION`,
 converts each track to 16-bit FLAC, typically a fifth of the size:
 
 ```bash

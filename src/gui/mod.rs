@@ -105,10 +105,10 @@ struct SessionDetail {
     subtitle: gtk::Label,
     status: gtk::Label,
     process_button: gtk::Button,
+    archive_button: gtk::Button,
     meeting_button: gtk::Button,
     rename_button: gtk::Button,
     delete_button: gtk::Button,
-    archive_button: gtk::Button,
     hide_echo: gtk::ToggleButton,
     transcript: gtk::Box,
     screenshots: gtk::FlowBox,
@@ -710,6 +710,12 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     process_button.add_css_class("suggested-action");
     process_button.set_visible(false);
     top.append(&process_button);
+    let archive_button = gtk::Button::with_label("Archive…");
+    archive_button.set_tooltip_text(Some(
+        "Convert the recorded audio to 16-bit FLAC to save disk space",
+    ));
+    archive_button.set_visible(false);
+    top.append(&archive_button);
     let meeting_button = gtk::Button::with_label("Meeting details…");
     meeting_button.set_visible(false);
     top.append(&meeting_button);
@@ -807,11 +813,6 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     files.set_margin_start(16);
     files.set_margin_end(16);
     root.append(&files);
-    let archive_button = gtk::Button::with_label("Archive audio…");
-    archive_button.set_halign(gtk::Align::Start);
-    archive_button.set_tooltip_text(Some(
-        "Convert the recorded audio to 16-bit FLAC to save disk space",
-    ));
 
     SessionDetail {
         root,
@@ -819,10 +820,10 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         subtitle,
         status,
         process_button,
+        archive_button,
         meeting_button,
         rename_button,
         delete_button,
-        archive_button,
         hide_echo,
         transcript,
         screenshots,
@@ -2994,6 +2995,9 @@ impl SessionDetail {
         }));
         self.process_button
             .set_visible(manifest.state != SessionState::Recording);
+        self.archive_button.set_visible(
+            processed && manifest.state != SessionState::Recording && !session.is_archived(),
+        );
         self.meeting_button
             .set_visible(processed && manifest.state != SessionState::Recording);
         self.rename_button.set_visible(true);
@@ -3067,10 +3071,6 @@ impl SessionDetail {
                 ),
             ));
         }
-        self.archive_button.set_visible(
-            processed && manifest.state != SessionState::Recording && !session.is_archived(),
-        );
-        self.metadata.append(&self.archive_button);
 
         clear_box(&self.files);
         let outputs = gtk::Label::new(Some("Outputs:"));
@@ -3109,6 +3109,7 @@ impl SessionDetail {
         for widget in [
             self.status.upcast_ref::<gtk::Widget>(),
             self.process_button.upcast_ref(),
+            self.archive_button.upcast_ref(),
             self.meeting_button.upcast_ref(),
             self.rename_button.upcast_ref(),
             self.delete_button.upcast_ref(),

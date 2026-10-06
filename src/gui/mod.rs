@@ -110,6 +110,9 @@ struct SessionDetail {
     rename_button: gtk::Button,
     delete_button: gtk::Button,
     hide_echo: gtk::ToggleButton,
+    hide_mic: gtk::ToggleButton,
+    hide_system: gtk::ToggleButton,
+    loading_hidden_sources: Rc<Cell<bool>>,
     transcript: gtk::Box,
     screenshots: gtk::FlowBox,
     metadata: gtk::Box,
@@ -754,9 +757,24 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     transcript_heading.set_xalign(0.0);
     transcript_heading.set_hexpand(true);
     transcript_header.append(&transcript_heading);
+    let transcript_toggles = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    transcript_toggles.set_layout_manager(Some(WrapLayout::new(8, 4)));
+    transcript_header.append(&transcript_toggles);
     let hide_echo = gtk::ToggleButton::with_label("Hide echo");
     hide_echo.set_visible(false);
-    transcript_header.append(&hide_echo);
+    transcript_toggles.append(&hide_echo);
+    let hide_mic = gtk::ToggleButton::with_label("Hide microphone");
+    hide_mic.set_tooltip_text(Some(
+        "Leave microphone lines out of transcript.jsonl and transcript.txt. Nothing is deleted.",
+    ));
+    hide_mic.set_visible(false);
+    transcript_toggles.append(&hide_mic);
+    let hide_system = gtk::ToggleButton::with_label("Hide system");
+    hide_system.set_tooltip_text(Some(
+        "Leave system audio lines out of transcript.jsonl and transcript.txt. Nothing is deleted.",
+    ));
+    hide_system.set_visible(false);
+    transcript_toggles.append(&hide_system);
     transcript_frame.append(&transcript_header);
     let transcript = gtk::Box::new(gtk::Orientation::Vertical, 0);
     transcript_frame.append(
@@ -814,7 +832,7 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     files.set_margin_end(16);
     root.append(&files);
 
-    SessionDetail {
+    let detail = SessionDetail {
         root,
         title,
         subtitle,
@@ -825,6 +843,9 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         rename_button,
         delete_button,
         hide_echo,
+        hide_mic,
+        hide_system,
+        loading_hidden_sources: Rc::new(Cell::new(false)),
         transcript,
         screenshots,
         metadata,
@@ -832,7 +853,16 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         selected: Rc::new(RefCell::new(None)),
         playback: PlaybackController::default(),
         window: window.clone(),
+    };
+    for button in [&detail.hide_mic, &detail.hide_system] {
+        let detail_for_toggle = detail.clone();
+        button.connect_toggled(move |_| {
+            if !detail_for_toggle.loading_hidden_sources.get() {
+                start_hidden_sources_update(&detail_for_toggle);
+            }
+        });
     }
+    detail
 }
 
 #[derive(Clone)]
@@ -3001,6 +3031,18 @@ impl SessionDetail {
         self.rename_button.set_visible(true);
         self.delete_button.set_visible(true);
         self.hide_echo.set_active(false);
+        let hidden = process::read_hidden_sources(&session).unwrap_or_default();
+        let mic_hidden = hidden.contains(&AudioSource::Mic);
+        let system_hidden = hidden.contains(&AudioSource::System);
+        self.loading_hidden_sources.set(true);
+        self.hide_mic.set_active(mic_hidden);
+        self.hide_system.set_active(system_hidden);
+        self.loading_hidden_sources.set(false);
+        let can_hide_sources = processed && manifest.state != SessionState::Recording;
+        self.hide_mic
+            .set_visible(can_hide_sources && manifest.mic.enabled);
+        self.hide_system
+            .set_visible(can_hide_sources && manifest.system.enabled);
 
         clear_box(&self.transcript);
         if processed {
@@ -3008,7 +3050,14 @@ impl SessionDetail {
             self.hide_echo
                 .set_visible(utterances.iter().any(|utterance| utterance.echo.is_some()));
             if utterances.is_empty() {
-                append_empty(&self.transcript, "The transcript is empty.");
+                append_empty(
+                    &self.transcript,
+                    if mic_hidden || system_hidden {
+                        "Every line of this transcript is hidden."
+                    } else {
+                        "The transcript is empty."
+                    },
+                );
             } else {
                 let frequent = Rc::new(frequent_speakers(&utterances, 3));
                 let learned =
@@ -3115,6 +3164,8 @@ impl SessionDetail {
             self.rename_button.upcast_ref(),
             self.delete_button.upcast_ref(),
             self.hide_echo.upcast_ref(),
+            self.hide_mic.upcast_ref(),
+            self.hide_system.upcast_ref(),
         ] {
             widget.set_visible(false);
         }
@@ -3735,26 +3786,11 @@ fn start_assignment(
     let Some(session) = detail.selected.borrow().clone() else {
         return;
     };
-    let progress = gtk::Window::builder()
-        .title("Assigning speaker")
-        .transient_for(&detail.window)
-        .modal(true)
-        .deletable(false)
-        .default_width(360)
-        .build();
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    body.set_margin_top(24);
-    body.set_margin_bottom(24);
-    body.set_margin_start(24);
-    body.set_margin_end(24);
-    let spinner = gtk::Spinner::new();
-    spinner.set_spinning(true);
-    body.append(&spinner);
-    let label = gtk::Label::new(Some("Updating transcript and learning the voice locally…"));
-    label.set_wrap(true);
-    body.append(&label);
-    progress.set_child(Some(&body));
-    progress.present();
+    let progress = progress_window(
+        &detail.window,
+        "Assigning speaker",
+        "Updating transcript and learning the voice locally…",
+    );
 
     let result = Arc::new(Mutex::new(None));
     let thread_result = result.clone();
@@ -3789,6 +3825,67 @@ fn start_assignment(
                 show_assignment_notice(&detail, outcome.learning_available, outcome.echo);
             }
             Err(error) => show_error(&detail.window, "Could not assign speaker", &error),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn progress_window(parent: &adw::ApplicationWindow, title: &str, text: &str) -> gtk::Window {
+    let progress = gtk::Window::builder()
+        .title(title)
+        .transient_for(parent)
+        .modal(true)
+        .deletable(false)
+        .default_width(360)
+        .build();
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_top(24);
+    body.set_margin_bottom(24);
+    body.set_margin_start(24);
+    body.set_margin_end(24);
+    let spinner = gtk::Spinner::new();
+    spinner.set_spinning(true);
+    body.append(&spinner);
+    let label = gtk::Label::new(Some(text));
+    label.set_wrap(true);
+    body.append(&label);
+    progress.set_child(Some(&body));
+    progress.present();
+    progress
+}
+
+fn start_hidden_sources_update(detail: &SessionDetail) {
+    let Some(session) = detail.selected.borrow().clone() else {
+        return;
+    };
+    let hidden = [
+        (AudioSource::Mic, detail.hide_mic.is_active()),
+        (AudioSource::System, detail.hide_system.is_active()),
+    ]
+    .into_iter()
+    .filter_map(|(source, hidden)| hidden.then_some(source))
+    .collect::<Vec<_>>();
+    let progress = progress_window(
+        &detail.window,
+        "Updating transcript",
+        "Updating transcript…",
+    );
+    let result = Arc::new(Mutex::new(None));
+    let thread_result = result.clone();
+    std::thread::spawn(move || {
+        let value =
+            process::set_hidden_sources(&session, &hidden).map_err(|error| error.to_string());
+        *thread_result.lock().expect("hidden sources result mutex") = Some(value);
+    });
+    let detail = detail.clone();
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        let Some(result) = result.lock().expect("hidden sources result mutex").take() else {
+            return glib::ControlFlow::Continue;
+        };
+        progress.close();
+        reload_session(&detail);
+        if let Err(error) = result {
+            show_error(&detail.window, "Could not update the transcript", &error);
         }
         glib::ControlFlow::Break
     });

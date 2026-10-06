@@ -20,6 +20,9 @@ weights download on first use and remain in a persistent per-user cache.
 Browse processed meetings and review speaker-attributed transcripts from the
 session view. Confirm individual names so they stay locked across reprocessing,
 use quick speaker shortcuts on anonymous lines, or change a named line.
+Use **Hide microphone** or **Hide system** to leave that source out of
+both transcript files without deleting anything. Hiding the microphone is
+useful when you only listened and it recorded nothing but leaked speaker audio.
 
 ![Processed transcript with confirmed speaker names and quick assignment controls](docs/images/transcript.png)
 
@@ -60,6 +63,7 @@ preserving the recorded audio and confirmed names.
 - Recognizes learned voices while leaving uncertain matches anonymous.
 - Uses per-meeting attendee details to guide speaker counts and recognition,
   and marks likely microphone echo without deleting it.
+- Hides either audio source from a session's transcript without deleting it.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback, editable
   storage folders, and a one-click header Record button.

@@ -522,17 +522,21 @@ fn save_corrections_and_render(
     corrections: &SpeakerCorrections,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let path = session.speaker_corrections_path();
-    let previous = match fs::read(&path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    write_json_atomic(&path, corrections)?;
+    write_render_input_and_render(session, &path, |path| write_json_atomic(path, corrections))
+}
+
+fn write_render_input_and_render(
+    session: &Session,
+    path: &Path,
+    write: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let previous = read_optional_file(path)?;
+    write(path)?;
     if let Err(render_error) = run_render(RenderArgs {
         session: session.dir.clone(),
         diarize_mic: None,
     }) {
-        if let Err(rollback_error) = restore_file(&path, previous.as_deref()) {
+        if let Err(rollback_error) = restore_file(path, previous.as_deref()) {
             return Err(io::Error::other(format!(
                 "render failed: {render_error}; restoring {} also failed: {rollback_error}",
                 path.display()
@@ -542,6 +546,29 @@ fn save_corrections_and_render(
         return Err(render_error);
     }
     Ok(())
+}
+
+pub fn set_hidden_sources(
+    session: &Path,
+    hidden: &[AudioSource],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session = Session::open(session.to_owned())?;
+    let artifact = HiddenSources {
+        format_version: HIDDEN_SOURCES_FORMAT_VERSION,
+        hidden: normalize_hidden_sources(hidden),
+    };
+    let path = session.hidden_sources_path();
+    write_render_input_and_render(&session, &path, |path| {
+        if artifact.hidden.is_empty() {
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            write_json_atomic(path, &artifact)
+        }
+    })
 }
 
 fn correct_speaker_resolved(
@@ -4215,6 +4242,53 @@ mod tests {
             fs::read(session.words_path()).expect("reread words"),
             original_words
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn set_hidden_sources_normalizes_and_round_trips() {
+        let (root, session) = hidden_sources_fixture("hidden-sources-round-trip");
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect("render original");
+        let original = fs::read(session.transcript_path()).expect("read original transcript");
+
+        set_hidden_sources(
+            &session.dir,
+            &[AudioSource::System, AudioSource::Mic, AudioSource::System],
+        )
+        .expect("hide sources");
+        let hidden: HiddenSources =
+            read_json(&session.hidden_sources_path()).expect("read hidden sources");
+        assert_eq!(hidden.hidden, [AudioSource::Mic, AudioSource::System]);
+        let utterances: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read hidden transcript");
+        assert!(utterances.is_empty());
+
+        set_hidden_sources(&session.dir, &[]).expect("show sources");
+        assert!(!session.hidden_sources_path().exists());
+        assert_eq!(
+            fs::read(session.transcript_path()).expect("read restored transcript"),
+            original
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_hidden_source_render_restores_absent_file() {
+        let (root, session) = hidden_sources_fixture("hidden-sources-rollback");
+        fs::write(
+            session.diarization_metadata_path(),
+            br#"{"format_version":999}"#,
+        )
+        .expect("write invalid metadata version");
+
+        set_hidden_sources(&session.dir, &[AudioSource::Mic])
+            .expect_err("render failure rolls back hidden sources");
+
+        assert!(!session.hidden_sources_path().exists());
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

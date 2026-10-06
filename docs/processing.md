@@ -402,10 +402,10 @@ singstone render SESSION
 
 **Input:** `manifest.json`, optional `meeting.json`, `words.jsonl`,
 `diarization.jsonl`, their metadata sidecars when present, optionally
-`speaker-assignments.json`, optionally `speaker-corrections.json`, and the audio
-tracks when both are available. Missing assignment and correction data is
-allowed, but
-malformed or unsupported assignment, correction, or diarization metadata is
+`speaker-assignments.json`, optionally `speaker-corrections.json`, optionally
+`hidden-sources.json`, and the audio tracks when both are available. Missing
+assignment, correction, and hidden-source data is allowed, but malformed or
+unsupported assignment, correction, hidden-source, or diarization metadata is
 an error. This stage uses no ML model and is fast.
 
 When both audio tracks are available, `render` builds 10 ms RMS envelopes and
@@ -471,6 +471,20 @@ exceeds one second, or an utterance has reached 15 seconds and ends with
 sentence punctuation. Whitespace and punctuation spacing are normalized, and
 utterances from both sources are sorted on the common meeting timeline.
 
+`hidden-sources.json` can leave one or both sources out of the final transcript:
+
+```json
+{
+  "format_version": 1,
+  "hidden": ["mic"]
+}
+```
+
+Hidden-source utterances are omitted from `transcript.jsonl` and
+`transcript.txt`; no other artifact changes. Use the app to toggle a source,
+or edit the file and run `singstone render SESSION`. Remove a source from
+`hidden`, or remove the file, and render again to bring its lines back.
+
 The stage replaces the canonical `transcript.jsonl` and readable
 `transcript.txt` atomically one file at a time:
 
@@ -505,14 +519,17 @@ changing any of those inputs.
 | Refresh automatic first-guess names | `recognize`, then `render` |
 | Manually edited words | `render` |
 | Manually edited speaker segments | `recognize`, then `render`; or only `render` for anonymous names |
+| Leave out the microphone or system-audio lines | Use the app, or edit `hidden-sources.json`, then `render` |
 | Anonymous transcript with no speaker database | Skip `recognize`; run `render` |
 | Multiple people are listed in the room | Save meeting details, then `diarize`, `recognize`, and `render` |
 | Changed who was in the meeting | `recognize`, then `render` when candidate names changed; otherwise `render` |
 
 Changing attendee names also changes the recognition candidate set, so rerun
 `recognize` before `render` when those names should be matched automatically.
-Every rerun recipe preserves `speaker-corrections.json`; `process` and the
-individual `diarize`, `recognize`, and `render` stages never edit or delete it.
+Every rerun recipe preserves `speaker-corrections.json` and
+`hidden-sources.json`; `process` and the individual `transcribe`, `diarize`,
+`recognize`, `render`, `correct`, and `archive` stages never edit or delete
+either file.
 The app's **Process again** flow therefore keeps confirmed lines. To discard
 every confirmed line, remove `speaker-corrections.json` manually.
 

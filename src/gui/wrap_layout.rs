@@ -66,6 +66,8 @@ mod imp {
     pub struct WrapLayout {
         pub column_spacing: Cell<i32>,
         pub row_spacing: Cell<i32>,
+        pub end_aligned: Cell<bool>,
+        pub reversed: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -119,9 +121,20 @@ mod imp {
 
             for line in &lines {
                 let line_height = line_height(&children, line);
+                let line_width = flow_line_width(line);
+                let offset = if self.end_aligned.get() {
+                    width.saturating_sub(line_width).max(0)
+                } else {
+                    0
+                };
                 for item in &line.items {
+                    let item_x = if self.reversed.get() {
+                        width.saturating_sub(item.x).saturating_sub(item.width)
+                    } else {
+                        item.x.saturating_add(offset)
+                    };
                     children[item.index].size_allocate(
-                        &gtk::Allocation::new(item.x, y, item.width, line_height),
+                        &gtk::Allocation::new(item_x, y, item.width, line_height),
                         -1,
                     );
                 }
@@ -174,6 +187,13 @@ mod imp {
                     .saturating_mul(lines.len().saturating_sub(1) as i32),
             )
     }
+
+    fn flow_line_width(line: &FlowLine) -> i32 {
+        line.items
+            .last()
+            .map(|item| item.x.saturating_add(item.width))
+            .unwrap_or(0)
+    }
 }
 
 glib::wrapper! {
@@ -186,6 +206,13 @@ impl WrapLayout {
         let layout: Self = glib::Object::new();
         layout.imp().column_spacing.set(column_spacing.max(0));
         layout.imp().row_spacing.set(row_spacing.max(0));
+        layout
+    }
+
+    pub fn new_end_aligned(column_spacing: i32, row_spacing: i32) -> Self {
+        let layout = Self::new(column_spacing, row_spacing);
+        layout.imp().end_aligned.set(true);
+        layout.imp().reversed.set(true);
         layout
     }
 }

@@ -1,5 +1,6 @@
 mod config;
 mod remote;
+mod timeline_layout;
 mod wrap_layout;
 
 use crate::audio::{archive, devices, record};
@@ -28,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use self::config::GuiConfig;
+use self::timeline_layout::{TimelineLayout, TimelineRow, timeline_rows};
 use self::wrap_layout::WrapLayout;
 
 const APP_ID: &str = "io.github.nsg.Singstone";
@@ -51,7 +53,14 @@ const CSS: &str = r#"
 .navigation-sidebar row { border-radius: 10px; margin: 2px 6px; }
 .shot-card { padding: 8px; border-radius: 12px; background: alpha(currentColor, 0.05); }
 .mono-button { font-family: monospace; font-size: 12px; }
-.transcript-row { padding: 8px 12px; }
+.timeline-pane-headers { padding: 2px 6px 6px; }
+.timeline-pane-header { padding: 0 6px; }
+.timeline-cell { padding: 8px 2px; }
+.transcript-card { padding: 10px; border: 1px solid @borders; border-radius: 12px; background: @card_bg_color; }
+.timeline-marker { min-width: 54px; }
+.timeline-time { padding: 2px 5px; border: 1px solid @borders; border-radius: 999px; background: @window_bg_color; font-feature-settings: "tnum"; }
+.transcript-icon { min-width: 18px; min-height: 18px; padding: 0; }
+.transcript-card .pill { padding-left: 3px; padding-right: 3px; }
 .echo-row { opacity: 0.55; }
 .speaker-shortcut { border: 1px solid alpha(@accent_color, 0.28); border-radius: 999px; padding: 1px 7px; color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
 "#;
@@ -110,6 +119,7 @@ struct SessionDetail {
     hide_mic: gtk::ToggleButton,
     hide_system: gtk::ToggleButton,
     loading_hidden_sources: Rc<Cell<bool>>,
+    transcript_panes: gtk::Box,
     transcript: gtk::Box,
     screenshots: gtk::FlowBox,
     metadata: gtk::Box,
@@ -143,7 +153,7 @@ fn build_window(app: &adw::Application) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Singstone")
-        .default_width(1080)
+        .default_width(1280)
         .default_height(700)
         .build();
 
@@ -739,7 +749,7 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
 
     let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
     paned.set_vexpand(true);
-    paned.set_position(570);
+    paned.set_position(650);
     paned.set_resize_start_child(true);
     paned.set_shrink_start_child(false);
     paned.set_resize_end_child(false);
@@ -770,6 +780,10 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     hide_system.set_visible(false);
     transcript_toggles.append(&hide_system);
     transcript_frame.append(&transcript_header);
+    let transcript_panes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    transcript_panes.add_css_class("timeline-pane-headers");
+    transcript_panes.set_visible(false);
+    transcript_frame.append(&transcript_panes);
     let transcript = gtk::Box::new(gtk::Orientation::Vertical, 0);
     transcript_frame.append(
         &gtk::ScrolledWindow::builder()
@@ -828,6 +842,7 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         hide_mic,
         hide_system,
         loading_hidden_sources: Rc::new(Cell::new(false)),
+        transcript_panes,
         transcript,
         screenshots,
         metadata,
@@ -3026,6 +3041,8 @@ impl SessionDetail {
             .set_visible(can_hide_sources && manifest.system.enabled);
 
         clear_box(&self.transcript);
+        clear_box(&self.transcript_panes);
+        self.transcript_panes.set_visible(false);
         if processed {
             let utterances: Vec<Utterance> = jsonl::read_all(&session.transcript_path())?;
             if utterances.is_empty() {
@@ -3041,10 +3058,24 @@ impl SessionDetail {
                 let frequent = Rc::new(frequent_speakers(&utterances, 3));
                 let learned =
                     process::learned_lines(&session, &speakers_database_path(), &utterances);
-                for (utterance, learned) in utterances.iter().zip(learned) {
-                    let audio_path = session.stored_audio_path(utterance.source);
-                    self.transcript.append(&transcript_row(
-                        utterance, learned, self, audio_path, &frequent,
+                let has_mic = utterances
+                    .iter()
+                    .any(|utterance| utterance.source == AudioSource::Mic);
+                let has_system = utterances
+                    .iter()
+                    .any(|utterance| utterance.source == AudioSource::System);
+                let one_sided = !(has_mic && has_system);
+                populate_timeline_headers(&self.transcript_panes, has_mic, has_system, one_sided);
+                self.transcript_panes.set_visible(true);
+                for row in timeline_rows(&utterances) {
+                    self.transcript.append(&transcript_timeline_row(
+                        &row,
+                        &utterances,
+                        &learned,
+                        self,
+                        &session,
+                        &frequent,
+                        one_sided,
                     ));
                 }
             }
@@ -3147,6 +3178,8 @@ impl SessionDetail {
             widget.set_visible(false);
         }
         clear_box(&self.transcript);
+        clear_box(&self.transcript_panes);
+        self.transcript_panes.set_visible(false);
         clear_flow(&self.screenshots);
         clear_box(&self.metadata);
         clear_box(&self.files);
@@ -3248,20 +3281,147 @@ fn session_row(summary: &SessionSummary) -> gtk::ListBoxRow {
     row
 }
 
-fn transcript_row(
+fn populate_timeline_headers(headers: &gtk::Box, has_mic: bool, has_system: bool, one_sided: bool) {
+    headers.set_layout_manager(Some(TimelineLayout::new(one_sided)));
+
+    let left = timeline_pane_header(
+        "Microphone",
+        "audio-input-microphone-symbolic",
+        if one_sided {
+            gtk::Align::Start
+        } else {
+            gtk::Align::End
+        },
+    );
+    left.set_visible(has_mic);
+    headers.append(&left);
+
+    let marker = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    marker.add_css_class("timeline-marker");
+    headers.append(&marker);
+
+    let right = timeline_pane_header("System audio", "audio-speakers-symbolic", gtk::Align::Start);
+    right.set_visible(has_system);
+    headers.append(&right);
+}
+
+fn timeline_pane_header(text: &str, icon_name: &str, align: gtk::Align) -> gtk::Box {
+    let cell = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    cell.add_css_class("timeline-pane-header");
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    content.set_valign(gtk::Align::Center);
+    let icon = gtk::Image::from_icon_name(icon_name);
+    icon.set_pixel_size(15);
+    icon.add_css_class("dim-label");
+    content.append(&icon);
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("heading");
+    label.add_css_class("caption");
+    label.add_css_class("dim-label");
+    content.append(&label);
+    if align == gtk::Align::End {
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        cell.append(&spacer);
+    }
+    cell.append(&content);
+    cell
+}
+
+fn transcript_timeline_row(
+    timeline_row: &TimelineRow,
+    utterances: &[Utterance],
+    learned: &[bool],
+    detail: &SessionDetail,
+    session: &Session,
+    frequent: &Rc<Vec<String>>,
+    one_sided: bool,
+) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    row.set_layout_manager(Some(TimelineLayout::new(one_sided)));
+
+    let mic = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    mic.add_css_class("timeline-cell");
+    mic.set_visible(!one_sided || !timeline_row.mic.is_empty());
+    for &index in &timeline_row.mic {
+        let utterance = &utterances[index];
+        let card = transcript_card(
+            utterance,
+            learned[index],
+            detail,
+            session.stored_audio_path(utterance.source),
+            frequent,
+            !one_sided,
+            format_timeline_timestamp(utterance.start_ms)
+                != format_timeline_timestamp(timeline_row.start_ms),
+        );
+        card.set_halign(if one_sided {
+            gtk::Align::Start
+        } else {
+            gtk::Align::End
+        });
+        mic.append(&card);
+    }
+    row.append(&mic);
+
+    row.append(&timeline_marker(timeline_row.start_ms));
+
+    let system = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    system.add_css_class("timeline-cell");
+    system.set_visible(!one_sided || !timeline_row.system.is_empty());
+    for &index in &timeline_row.system {
+        let utterance = &utterances[index];
+        let card = transcript_card(
+            utterance,
+            learned[index],
+            detail,
+            session.stored_audio_path(utterance.source),
+            frequent,
+            false,
+            format_timeline_timestamp(utterance.start_ms)
+                != format_timeline_timestamp(timeline_row.start_ms),
+        );
+        card.set_halign(gtk::Align::Start);
+        system.append(&card);
+    }
+    row.append(&system);
+    row
+}
+
+fn timeline_marker(start_ms: u64) -> gtk::Overlay {
+    let marker = gtk::Overlay::new();
+    marker.add_css_class("timeline-marker");
+    let line = gtk::Separator::new(gtk::Orientation::Vertical);
+    line.set_halign(gtk::Align::Center);
+    line.set_vexpand(true);
+    marker.set_child(Some(&line));
+    let timestamp = gtk::Label::new(Some(&format_timeline_timestamp(start_ms)));
+    timestamp.add_css_class("timeline-time");
+    timestamp.add_css_class("caption");
+    timestamp.set_width_chars(5);
+    timestamp.set_halign(gtk::Align::Center);
+    timestamp.set_valign(gtk::Align::Start);
+    timestamp.set_margin_top(8);
+    marker.add_overlay(&timestamp);
+    marker
+}
+
+fn transcript_card(
     utterance: &Utterance,
     learned: bool,
     detail: &SessionDetail,
     audio_path: PathBuf,
     frequent: &Rc<Vec<String>>,
+    mirrored: bool,
+    show_timestamp: bool,
 ) -> gtk::Box {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    row.add_css_class("transcript-row");
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
+    card.add_css_class("transcript-card");
     if utterance.echo {
-        row.add_css_class("echo-row");
+        card.add_css_class("echo-row");
     }
     let avatar = gtk::Image::from_icon_name("avatar-default-symbolic");
-    avatar.set_pixel_size(28);
+    avatar.set_pixel_size(18);
     avatar.add_css_class("speaker-avatar");
     if is_anonymous_speaker(utterance) {
         avatar.add_css_class("speaker-unknown");
@@ -3276,17 +3436,33 @@ fn transcript_row(
         avatar.add_css_class(&format!("speaker-{speaker_number}"));
     }
     avatar.set_valign(gtk::Align::Start);
-    row.append(&avatar);
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    column.set_hexpand(true);
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    head.set_layout_manager(Some(WrapLayout::new(8, 4)));
+    head.set_layout_manager(Some(if mirrored {
+        WrapLayout::new_end_aligned(6, 4)
+    } else {
+        WrapLayout::new(6, 4)
+    }));
+    head.set_hexpand(true);
+    let identity = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let speaker = gtk::Label::new(Some(&utterance.speaker));
     speaker.add_css_class("heading");
+    speaker.set_xalign(if mirrored { 1.0 } else { 0.0 });
+    speaker.set_single_line_mode(true);
+    if utterance.speaker.chars().count() > 6 {
+        speaker.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        speaker.set_width_chars(6);
+    }
+    if mirrored {
+        identity.append(&speaker);
+        identity.append(&avatar);
+    } else {
+        identity.append(&avatar);
+        identity.append(&speaker);
+    }
     if is_anonymous_speaker(utterance) {
         speaker.add_css_class("warning-text");
     }
-    head.append(&speaker);
+    head.append(&identity);
     if utterance.locked {
         let lock = gtk::Image::from_icon_name("changes-prevent-symbolic");
         lock.set_pixel_size(14);
@@ -3307,21 +3483,12 @@ fn transcript_row(
         voice.set_valign(gtk::Align::Center);
         head.append(&voice);
     }
-    let timestamp = gtk::Label::new(Some(&format_timestamp(utterance.start_ms)));
-    timestamp.add_css_class("dim-label");
-    timestamp.add_css_class("caption");
-    head.append(&timestamp);
-    let (source_icon_name, source_label) = match utterance.source {
-        AudioSource::Mic => ("audio-input-microphone-symbolic", "Microphone audio"),
-        AudioSource::System => ("audio-speakers-symbolic", "System audio"),
-    };
-    let source_icon = gtk::Image::from_icon_name(source_icon_name);
-    source_icon.set_pixel_size(16);
-    source_icon.set_tooltip_text(Some(source_label));
-    source_icon.update_property(&[gtk::accessible::Property::Label(source_label)]);
-    source_icon.add_css_class("dim-label");
-    source_icon.set_valign(gtk::Align::Center);
-    head.append(&source_icon);
+    if show_timestamp {
+        let timestamp = gtk::Label::new(Some(&format_timeline_timestamp(utterance.start_ms)));
+        timestamp.add_css_class("dim-label");
+        timestamp.add_css_class("caption");
+        head.append(&timestamp);
+    }
     if utterance.echo {
         let echo = status_pill("Echo", "idle");
         echo.add_css_class("caption");
@@ -3330,6 +3497,7 @@ fn transcript_row(
     }
     let play = gtk::Button::new();
     play.add_css_class("flat");
+    play.add_css_class("transcript-icon");
     play.set_valign(gtk::Align::Center);
     set_playback_button(&play, false);
     let playback = detail.playback.clone();
@@ -3342,40 +3510,34 @@ fn transcript_row(
     });
     head.append(&play);
     if has_assignable_id(utterance) {
-        if is_anonymous_speaker(utterance) {
-            for name in frequent.iter() {
-                let shortcut = shortcut_button(name);
-                shortcut.set_tooltip_text(Some(&format!("Assign this voice to {name}")));
-                let detail = detail.clone();
-                let source = utterance.source;
-                let start_ms = utterance.start_ms;
-                let end_ms = utterance.end_ms;
-                let name = name.clone();
-                shortcut.connect_clicked(move |_| {
-                    start_assignment(&detail, source, start_ms, end_ms, name.clone());
-                });
-                head.append(&shortcut);
-            }
-            let assign = caption_button("Assign…");
+        let anonymous = is_anonymous_speaker(utterance);
+        let edit = gtk::Button::from_icon_name("document-edit-symbolic");
+        edit.add_css_class("flat");
+        edit.add_css_class("transcript-icon");
+        let edit_label = if anonymous {
+            "Assign speaker…"
+        } else {
+            "Change speaker…"
+        };
+        edit.set_tooltip_text(Some(edit_label));
+        edit.update_property(&[gtk::accessible::Property::Label(edit_label)]);
+        if anonymous {
             let detail = detail.clone();
             let source = utterance.source;
             let start_ms = utterance.start_ms;
             let end_ms = utterance.end_ms;
             let frequent = frequent.clone();
-            assign.connect_clicked(move |_| {
+            edit.connect_clicked(move |_| {
                 show_assignment_dialog(&detail, source, start_ms, end_ms, None, &frequent);
             });
-            head.append(&assign);
         } else {
-            let change = caption_button("Change…");
-            change.set_tooltip_text(Some("Reassign this voice to someone else"));
             let detail = detail.clone();
             let source = utterance.source;
             let start_ms = utterance.start_ms;
             let end_ms = utterance.end_ms;
             let current = utterance.speaker.clone();
             let frequent = frequent.clone();
-            change.connect_clicked(move |_| {
+            edit.connect_clicked(move |_| {
                 show_assignment_dialog(
                     &detail,
                     source,
@@ -3385,17 +3547,32 @@ fn transcript_row(
                     &frequent,
                 );
             });
-            head.append(&change);
+        }
+        head.append(&edit);
+    }
+    if has_assignable_id(utterance) && is_anonymous_speaker(utterance) && !utterance.echo {
+        for name in frequent.iter() {
+            let shortcut = shortcut_button(name);
+            shortcut.set_tooltip_text(Some(&format!("Assign this voice to {name}")));
+            let detail = detail.clone();
+            let source = utterance.source;
+            let start_ms = utterance.start_ms;
+            let end_ms = utterance.end_ms;
+            let name = name.clone();
+            shortcut.connect_clicked(move |_| {
+                start_assignment(&detail, source, start_ms, end_ms, name.clone());
+            });
+            head.append(&shortcut);
         }
     }
-    column.append(&head);
+    card.append(&head);
     let text = gtk::Label::new(Some(&utterance.text));
     text.set_xalign(0.0);
     text.set_wrap(true);
+    text.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     text.set_selectable(true);
-    column.append(&text);
-    row.append(&column);
-    row
+    card.append(&text);
+    card
 }
 
 fn caption_button(text: &str) -> gtk::Button {
@@ -4005,6 +4182,20 @@ fn format_timestamp(ms: u64) -> String {
     )
 }
 
+fn format_timeline_timestamp(ms: u64) -> String {
+    let seconds = ms / 1000;
+    if seconds < 3600 {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    } else {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds % 3600 / 60,
+            seconds % 60
+        )
+    }
+}
+
 fn safe_session_path(root: &Path, relative: &str) -> Option<PathBuf> {
     let relative = Path::new(relative);
     if relative.is_absolute()
@@ -4132,6 +4323,13 @@ mod tests {
         assert_eq!(format_duration(42_000), "42 s");
         assert_eq!(format_duration(125_000), "2 min 05 s");
         assert_eq!(format_timestamp(3_723_000), "01:02:03");
+    }
+
+    #[test]
+    fn timeline_timestamps_are_compact_below_one_hour() {
+        assert_eq!(format_timeline_timestamp(4_999), "0:04");
+        assert_eq!(format_timeline_timestamp(751_000), "12:31");
+        assert_eq!(format_timeline_timestamp(3_723_000), "1:02:03");
     }
 
     #[test]

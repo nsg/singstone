@@ -23,12 +23,10 @@ const AUDIO_FRAME_SAMPLES: usize = SAMPLE_RATE as usize * AUDIO_FRAME_MS as usiz
 const MIN_DELAY_FRAMES: i32 = -25;
 const MAX_DELAY_FRAMES: i32 = 100;
 const CALIBRATION_WINDOW_FRAMES: usize = 2_000 / AUDIO_FRAME_MS as usize;
-const MAX_CALIBRATION_WINDOWS: usize = 600;
 const CALIBRATION_MIN_ACTIVE_FRACTION: f32 = 0.5;
 const CALIBRATION_MIN_CORRELATION: f32 = 0.8;
-const CALIBRATION_MIN_SUPPORTING_WINDOWS: usize = 3;
 const CALIBRATION_DELAY_TOLERANCE_FRAMES: i32 = 3;
-const CALIBRATION_MIN_DELAY_AGREEMENT: f32 = 0.6;
+const REFERENCE_HORIZON_MS: u64 = 180_000;
 const AUDIO_WORD_MIN_EVALUATED_MS: u64 = 200;
 const AUDIO_WORD_MIN_CONTEXT_MS: u64 = 1_500;
 const AUDIO_WORD_DELAY_SEARCH_FRAMES: i32 = 3;
@@ -36,12 +34,12 @@ const AUDIO_WORD_MIN_CORRELATION: f32 = 0.75;
 const AUDIO_WORD_MAX_EXCESS_LN: f32 = 0.7;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct LeakageSuppression {
+pub struct EchoDetection {
     pub mic_start_ms: u64,
     pub mic_end_ms: u64,
     pub system_start_ms: u64,
     pub system_end_ms: u64,
-    pub suppressed_words: usize,
+    pub words: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_similarity: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,19 +50,18 @@ pub struct LeakageSuppression {
 }
 
 #[derive(Debug)]
-pub struct SuppressionResult {
-    pub words: Vec<TimedWord>,
-    pub suppressions: Vec<LeakageSuppression>,
+pub struct DetectionResult {
+    pub echo: Vec<bool>,
+    pub detections: Vec<EchoDetection>,
 }
 
-pub fn suppress_leaked_mic_words(
+pub fn detect_leaked_mic_words(
     words: &[TimedWord],
     audio: Option<&AudioEnvelopes>,
-) -> SuppressionResult {
-    let mut suppressed = vec![false; words.len()];
-    let mut suppressions = audio
-        .and_then(|audio| audio.calibration.map(|calibration| (audio, calibration)))
-        .map(|(audio, calibration)| suppress_with_audio(words, audio, calibration, &mut suppressed))
+) -> DetectionResult {
+    let mut echo = vec![false; words.len()];
+    let mut detections = audio
+        .map(|audio| detect_with_audio(words, audio, &mut echo))
         .unwrap_or_default();
 
     let system_tokens = source_tokens(words, AudioSource::System);
@@ -75,7 +72,7 @@ pub fn suppress_leaked_mic_words(
         maximum_system_ends.push(maximum_end);
     }
 
-    for phrase in mic_phrases(words, &suppressed) {
+    for phrase in mic_phrases(words, &echo) {
         let mic_tokens = phrase
             .iter()
             .filter_map(|&index| normalize_token(&words[index].text).map(|text| (index, text)))
@@ -149,7 +146,7 @@ pub fn suppress_leaked_mic_words(
         }
 
         for (mic, _) in &matches {
-            suppressed[*mic] = true;
+            echo[*mic] = true;
         }
         let mic_match_start = matches
             .iter()
@@ -161,12 +158,12 @@ pub fn suppress_leaked_mic_words(
             .map(|(mic, _)| words[*mic].end_ms)
             .max()
             .unwrap_or(mic_end_ms);
-        suppressions.push(LeakageSuppression {
+        detections.push(EchoDetection {
             mic_start_ms: mic_match_start,
             mic_end_ms: mic_match_end,
             system_start_ms: matched_system_start,
             system_end_ms: matched_system_end,
-            suppressed_words: matches.len(),
+            words: matches.len(),
             text_similarity: Some(similarity),
             audio_similarity: audio_match.map(|(correlation, _)| correlation),
             audio_delay_ms: audio_match.map(|(_, delay)| delay),
@@ -178,59 +175,49 @@ pub fn suppress_leaked_mic_words(
         });
     }
 
-    suppressions.sort_by_key(|suppression| suppression.mic_start_ms);
+    detections.sort_by_key(|detection| detection.mic_start_ms);
 
-    let words = words
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !suppressed[*index])
-        .map(|(_, word)| word.clone())
-        .collect();
-    SuppressionResult {
-        words,
-        suppressions,
-    }
+    DetectionResult { echo, detections }
 }
 
-fn suppress_with_audio(
+fn detect_with_audio(
     words: &[TimedWord],
     audio: &AudioEnvelopes,
-    calibration: AudioCalibration,
-    suppressed: &mut [bool],
-) -> Vec<LeakageSuppression> {
-    let mut suppressions = Vec::new();
-    for phrase in mic_phrases(words, suppressed) {
+    echo: &mut [bool],
+) -> Vec<EchoDetection> {
+    let mut detections = Vec::new();
+    for phrase in mic_phrases(words, echo) {
         let evidence = phrase
             .iter()
-            .map(|&index| audio.word_evidence(&words[index], calibration))
+            .map(|&index| audio.word_evidence(&words[index]))
             .collect::<Vec<_>>();
-        let mut phrase_suppressed = evidence
+        let mut phrase_echo = evidence
             .iter()
             .map(AudioWordEvidence::passes)
             .collect::<Vec<_>>();
-        let smoothed = (1..phrase_suppressed.len().saturating_sub(1))
+        let smoothed = (1..phrase_echo.len().saturating_sub(1))
             .filter(|&position| {
-                !phrase_suppressed[position]
-                    && phrase_suppressed[position - 1]
-                    && phrase_suppressed[position + 1]
+                !phrase_echo[position]
+                    && phrase_echo[position - 1]
+                    && phrase_echo[position + 1]
                     && evidence[position].is_explained()
             })
             .collect::<Vec<_>>();
         for position in smoothed {
-            phrase_suppressed[position] = true;
+            phrase_echo[position] = true;
         }
-        for (&index, &is_suppressed) in phrase.iter().zip(&phrase_suppressed) {
-            suppressed[index] = is_suppressed;
+        for (&index, &is_echo) in phrase.iter().zip(&phrase_echo) {
+            echo[index] = is_echo;
         }
 
         let mut run_start = 0;
         while run_start < phrase.len() {
-            if !phrase_suppressed[run_start] {
+            if !phrase_echo[run_start] {
                 run_start += 1;
                 continue;
             }
             let mut run_end = run_start + 1;
-            while run_end < phrase.len() && phrase_suppressed[run_end] {
+            while run_end < phrase.len() && phrase_echo[run_end] {
                 run_end += 1;
             }
             let run = &phrase[run_start..run_end];
@@ -250,13 +237,17 @@ fn suppress_with_audio(
                 .collect::<Vec<_>>();
             let audio_similarity =
                 correlations.iter().sum::<f32>() / correlations.len().max(1) as f32;
-            let delay_ms = i64::from(calibration.delay_frames) * AUDIO_FRAME_MS as i64;
-            suppressions.push(LeakageSuppression {
+            let delay_ms = i64::from(
+                evidence[run_start]
+                    .delay_frames
+                    .expect("an audio-flagged run starts with an estimate"),
+            ) * AUDIO_FRAME_MS as i64;
+            detections.push(EchoDetection {
                 mic_start_ms,
                 mic_end_ms,
                 system_start_ms: shifted_to_system_time(mic_start_ms, delay_ms),
                 system_end_ms: shifted_to_system_time(mic_end_ms, delay_ms),
-                suppressed_words: run.len(),
+                words: run.len(),
                 text_similarity: None,
                 audio_similarity: Some(audio_similarity),
                 audio_delay_ms: Some(delay_ms),
@@ -265,7 +256,7 @@ fn suppress_with_audio(
             run_start = run_end;
         }
     }
-    suppressions
+    detections
 }
 
 fn shifted_to_system_time(mic_time_ms: u64, delay_ms: i64) -> u64 {
@@ -414,11 +405,18 @@ pub struct AudioEnvelopes {
     mic: Vec<f32>,
     system: Vec<f32>,
     activity_threshold: Option<f32>,
-    calibration: Option<AudioCalibration>,
+    reference_points: Vec<AudioReferencePoint>,
 }
 
 #[derive(Clone, Copy)]
-struct AudioCalibration {
+struct AudioReferencePoint {
+    center_frame: usize,
+    delay_frames: i32,
+    gain_ln: f32,
+}
+
+#[derive(Clone, Copy)]
+struct AudioEstimate {
     delay_frames: i32,
     gain_ln: f32,
 }
@@ -426,6 +424,7 @@ struct AudioCalibration {
 struct AudioWordEvidence {
     excess_ln: Option<f32>,
     correlation: Option<f32>,
+    delay_frames: Option<i32>,
 }
 
 impl AudioWordEvidence {
@@ -456,13 +455,14 @@ impl AudioEnvelopes {
 
     fn from_envelopes(mic: Vec<f32>, system: Vec<f32>) -> Self {
         let activity_threshold = activity_threshold(&system);
-        let calibration =
-            activity_threshold.and_then(|threshold| calibrate_audio(&mic, &system, threshold));
+        let reference_points = activity_threshold
+            .map(|threshold| calibrate_audio(&mic, &system, threshold))
+            .unwrap_or_default();
         Self {
             mic,
             system,
             activity_threshold,
-            calibration,
+            reference_points,
         }
     }
 
@@ -498,10 +498,59 @@ impl AudioEnvelopes {
             .max_by(|left, right| left.0.total_cmp(&right.0))
     }
 
-    fn word_evidence(&self, word: &TimedWord, calibration: AudioCalibration) -> AudioWordEvidence {
+    fn word_evidence(&self, word: &TimedWord) -> AudioWordEvidence {
+        self.estimates_for_word(word)
+            .into_iter()
+            .map(|estimate| self.word_evidence_for_estimate(word, estimate))
+            .max_by(|left, right| {
+                left.passes()
+                    .cmp(&right.passes())
+                    .then_with(|| left.is_explained().cmp(&right.is_explained()))
+                    .then_with(|| {
+                        left.correlation
+                            .unwrap_or(f32::NEG_INFINITY)
+                            .total_cmp(&right.correlation.unwrap_or(f32::NEG_INFINITY))
+                    })
+            })
+            .unwrap_or(AudioWordEvidence {
+                excess_ln: None,
+                correlation: None,
+                delay_frames: None,
+            })
+    }
+
+    fn estimates_for_word(&self, word: &TimedWord) -> Vec<AudioEstimate> {
+        let midpoint_ms = word
+            .start_ms
+            .saturating_add(word.end_ms.saturating_sub(word.start_ms) / 2);
+        let midpoint_frame = usize::try_from(midpoint_ms / AUDIO_FRAME_MS).unwrap_or(usize::MAX);
+        let horizon_frames = usize::try_from(REFERENCE_HORIZON_MS / AUDIO_FRAME_MS)
+            .expect("reference horizon fits usize");
+        let first = self.reference_points.partition_point(|point| {
+            point.center_frame < midpoint_frame.saturating_sub(horizon_frames)
+        });
+        let split = self
+            .reference_points
+            .partition_point(|point| point.center_frame <= midpoint_frame);
+        let last = self.reference_points.partition_point(|point| {
+            point.center_frame <= midpoint_frame.saturating_add(horizon_frames)
+        });
+        let before = self.reference_points[first..split].iter().rev().take(3);
+        let after = self.reference_points[split..last].iter().take(3);
+        [estimate_from_points(before), estimate_from_points(after)]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn word_evidence_for_estimate(
+        &self,
+        word: &TimedWord,
+        estimate: AudioEstimate,
+    ) -> AudioWordEvidence {
         let threshold = self
             .activity_threshold
-            .expect("calibration requires an activity threshold");
+            .expect("reference points require an activity threshold");
         let (evaluated_start_ms, evaluated_end_ms) =
             padded_interval(word, AUDIO_WORD_MIN_EVALUATED_MS);
         let mic_start = usize::try_from(evaluated_start_ms / AUDIO_FRAME_MS)
@@ -513,7 +562,7 @@ impl AudioEnvelopes {
                 .min(self.mic.len());
         let (mic_energy, predicted_energy) =
             (mic_start..mic_end).fold((0.0f64, 0.0f64), |(mic, predicted), mic_index| {
-                let system_value = signed_frame_index(mic_index, -calibration.delay_frames)
+                let system_value = signed_frame_index(mic_index, -estimate.delay_frames)
                     .and_then(|index| self.system.get(index).copied())
                     .unwrap_or(0.0)
                     .max(threshold);
@@ -523,8 +572,7 @@ impl AudioEnvelopes {
                 )
             });
         let excess_ln = (mic_end > mic_start).then(|| {
-            0.5 * ((mic_energy + 1e-12) / (predicted_energy + 1e-12)).ln() as f32
-                - calibration.gain_ln
+            0.5 * ((mic_energy + 1e-12) / (predicted_energy + 1e-12)).ln() as f32 - estimate.gain_ln
         });
 
         let (context_start_ms, context_end_ms) = padded_interval(word, AUDIO_WORD_MIN_CONTEXT_MS);
@@ -535,18 +583,18 @@ impl AudioEnvelopes {
             usize::try_from(context_end_ms.saturating_add(AUDIO_FRAME_MS - 1) / AUDIO_FRAME_MS)
                 .unwrap_or(usize::MAX)
                 .min(self.mic.len());
-        let system_start = signed_frame_index(context_mic_start, -calibration.delay_frames)
+        let system_start = signed_frame_index(context_mic_start, -estimate.delay_frames)
             .unwrap_or(0)
             .min(self.system.len());
-        let system_end = signed_frame_index(context_mic_end, -calibration.delay_frames)
+        let system_end = signed_frame_index(context_mic_end, -estimate.delay_frames)
             .unwrap_or(0)
             .min(self.system.len());
         let correlation = self
             .system
             .get(system_start..system_end)
             .and_then(|system| {
-                (calibration.delay_frames - AUDIO_WORD_DELAY_SEARCH_FRAMES
-                    ..=calibration.delay_frames + AUDIO_WORD_DELAY_SEARCH_FRAMES)
+                (estimate.delay_frames - AUDIO_WORD_DELAY_SEARCH_FRAMES
+                    ..=estimate.delay_frames + AUDIO_WORD_DELAY_SEARCH_FRAMES)
                     .filter_map(|delay| {
                         envelope_correlation(system, system_start, &self.mic, 0, delay, threshold)
                     })
@@ -556,8 +604,25 @@ impl AudioEnvelopes {
         AudioWordEvidence {
             excess_ln,
             correlation,
+            delay_frames: Some(estimate.delay_frames),
         }
     }
+}
+
+fn estimate_from_points<'a>(
+    points: impl Iterator<Item = &'a AudioReferencePoint>,
+) -> Option<AudioEstimate> {
+    let points = points.copied().collect::<Vec<_>>();
+    let mut delays = points
+        .iter()
+        .map(|point| point.delay_frames)
+        .collect::<Vec<_>>();
+    let mut gains = points.iter().map(|point| point.gain_ln).collect::<Vec<_>>();
+    delays.sort_unstable();
+    Some(AudioEstimate {
+        delay_frames: *delays.get(delays.len() / 2)?,
+        gain_ln: median_f32(&mut gains)?,
+    })
 }
 
 fn padded_interval(word: &TimedWord, minimum_ms: u64) -> (u64, u64) {
@@ -649,90 +714,153 @@ fn activity_threshold(system: &[f32]) -> Option<f32> {
     (percentile > 1e-5).then_some((0.1 * percentile).max(1e-4))
 }
 
-fn calibrate_audio(mic: &[f32], system: &[f32], threshold: f32) -> Option<AudioCalibration> {
+fn calibrate_audio(mic: &[f32], system: &[f32], threshold: f32) -> Vec<AudioReferencePoint> {
     if system.len() < CALIBRATION_WINDOW_FRAMES {
-        return None;
+        return Vec::new();
     }
     let minimum_active =
         (CALIBRATION_WINDOW_FRAMES as f32 * CALIBRATION_MIN_ACTIVE_FRACTION) as usize;
-    let mut candidates = (0..=system.len().saturating_sub(CALIBRATION_WINDOW_FRAMES))
+    let mut active_prefix = Vec::with_capacity(system.len() + 1);
+    active_prefix.push(0usize);
+    for &level in system {
+        active_prefix
+            .push(active_prefix.last().copied().unwrap_or(0) + usize::from(level >= threshold));
+    }
+    let system_log = system
+        .iter()
+        .map(|level| (level + 1e-6).ln())
+        .collect::<Vec<_>>();
+    let mic_log = mic
+        .iter()
+        .map(|level| (level + 1e-6).ln())
+        .collect::<Vec<_>>();
+    let candidates = (0..=system.len().saturating_sub(CALIBRATION_WINDOW_FRAMES))
         .step_by(CALIBRATION_WINDOW_FRAMES)
         .filter(|&start| {
-            system[start..start + CALIBRATION_WINDOW_FRAMES]
-                .iter()
-                .filter(|&&level| level >= threshold)
-                .count()
+            active_prefix[start + CALIBRATION_WINDOW_FRAMES] - active_prefix[start]
                 >= minimum_active
         })
-        .collect::<Vec<_>>();
-    if candidates.len() > MAX_CALIBRATION_WINDOWS {
-        candidates = (0..MAX_CALIBRATION_WINDOWS)
-            .map(|index| index * (candidates.len() - 1) / (MAX_CALIBRATION_WINDOWS - 1))
-            .map(|index| candidates[index])
-            .collect();
-    }
-
-    let supporting = candidates
-        .into_iter()
         .filter_map(|start| {
-            let window = &system[start..start + CALIBRATION_WINDOW_FRAMES];
+            let active_frames = (start..start + CALIBRATION_WINDOW_FRAMES)
+                .filter(|&index| system[index] >= threshold)
+                .collect::<Vec<_>>();
             let (correlation, delay) = (MIN_DELAY_FRAMES..=MAX_DELAY_FRAMES)
                 .filter_map(|delay| {
-                    envelope_correlation(window, start, mic, 0, delay, threshold)
+                    calibration_correlation(&active_frames, &system_log, start, &mic_log, delay)
                         .map(|correlation| (correlation, delay))
                 })
                 .max_by(|left, right| left.0.total_cmp(&right.0))?;
             if correlation < CALIBRATION_MIN_CORRELATION {
                 return None;
             }
-            let gain_ln = mean_gain_ln(window, start, mic, delay, threshold)?;
-            Some((delay, gain_ln))
+            let gain_ln = mean_gain_ln(&active_frames, &system_log, start, &mic_log, delay)?;
+            Some(AudioReferencePoint {
+                center_frame: start + CALIBRATION_WINDOW_FRAMES / 2,
+                delay_frames: delay,
+                gain_ln,
+            })
         })
         .collect::<Vec<_>>();
-    if supporting.len() < CALIBRATION_MIN_SUPPORTING_WINDOWS {
-        return None;
-    }
-    let mut delays = supporting
+    let horizon_frames = usize::try_from(REFERENCE_HORIZON_MS / AUDIO_FRAME_MS)
+        .expect("reference horizon fits usize");
+    candidates
         .iter()
-        .map(|(delay, _)| *delay)
-        .collect::<Vec<_>>();
-    delays.sort_unstable();
-    let delay_frames = delays[delays.len() / 2];
-    let agreeing = delays
-        .iter()
-        .filter(|&&delay| (delay - delay_frames).abs() <= CALIBRATION_DELAY_TOLERANCE_FRAMES)
-        .count();
-    if agreeing as f32 / (delays.len() as f32) < CALIBRATION_MIN_DELAY_AGREEMENT {
-        return None;
-    }
-    let mut gains = supporting.iter().map(|(_, gain)| *gain).collect::<Vec<_>>();
-    Some(AudioCalibration {
-        delay_frames,
-        gain_ln: median_f32(&mut gains)?,
-    })
+        .copied()
+        .filter(|candidate| {
+            let first = candidates.partition_point(|point| {
+                point.center_frame < candidate.center_frame.saturating_sub(horizon_frames)
+            });
+            let last = candidates.partition_point(|point| {
+                point.center_frame <= candidate.center_frame.saturating_add(horizon_frames)
+            });
+            candidates[first..last]
+                .iter()
+                .filter(|other| {
+                    other.center_frame != candidate.center_frame
+                        && (other.delay_frames - candidate.delay_frames).abs()
+                            <= CALIBRATION_DELAY_TOLERANCE_FRAMES
+                })
+                .take(2)
+                .count()
+                >= 2
+        })
+        .collect()
 }
 
 fn mean_gain_ln(
-    system: &[f32],
+    active_frames: &[usize],
+    system_log: &[f32],
     system_start: usize,
-    mic: &[f32],
+    mic_log: &[f32],
     delay: i32,
-    activity_threshold: f32,
 ) -> Option<f32> {
-    let differences = system
-        .iter()
-        .enumerate()
-        .filter_map(|(local_index, &system_value)| {
-            if system_value < activity_threshold {
-                return None;
-            }
-            let system_index = i64::try_from(system_start + local_index).ok()?;
-            let mic_index = usize::try_from(system_index + i64::from(delay)).ok()?;
-            let mic_value = *mic.get(mic_index)?;
-            Some((mic_value + 1e-6).ln() - (system_value + 1e-6).ln())
-        })
-        .collect::<Vec<_>>();
-    (!differences.is_empty()).then(|| differences.iter().sum::<f32>() / differences.len() as f32)
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    let (system_range, mic_start) = calibration_aligned_range(system_start, mic_log.len(), delay)?;
+    let first = active_frames.partition_point(|&index| index < system_range.start);
+    let last = active_frames.partition_point(|&index| index < system_range.end);
+    for &system_index in &active_frames[first..last] {
+        let mic_index = mic_start + system_index - system_range.start;
+        sum += mic_log[mic_index] - system_log[system_index];
+        count += 1;
+    }
+    (count > 0).then_some(sum / count as f32)
+}
+
+fn calibration_correlation(
+    active_frames: &[usize],
+    system_log: &[f32],
+    system_start: usize,
+    mic_log: &[f32],
+    delay: i32,
+) -> Option<f32> {
+    let mut count = 0usize;
+    let mut system_sum = 0.0f32;
+    let mut mic_sum = 0.0f32;
+    let mut system_square_sum = 0.0f32;
+    let mut mic_square_sum = 0.0f32;
+    let mut product_sum = 0.0f32;
+    let (system_range, mic_start) = calibration_aligned_range(system_start, mic_log.len(), delay)?;
+    let first = active_frames.partition_point(|&index| index < system_range.start);
+    let last = active_frames.partition_point(|&index| index < system_range.end);
+    for &system_index in &active_frames[first..last] {
+        let mic_index = mic_start + system_index - system_range.start;
+        let system_value = system_log[system_index];
+        let mic_value = mic_log[mic_index];
+        count += 1;
+        system_sum += system_value;
+        mic_sum += mic_value;
+        system_square_sum += system_value * system_value;
+        mic_square_sum += mic_value * mic_value;
+        product_sum += system_value * mic_value;
+    }
+    if count < 20 {
+        return None;
+    }
+    let count = count as f32;
+    let covariance = product_sum - system_sum * mic_sum / count;
+    let system_variance = system_square_sum - system_sum * system_sum / count;
+    let mic_variance = mic_square_sum - mic_sum * mic_sum / count;
+    let denominator = (system_variance * mic_variance).sqrt();
+    (denominator > 1e-6).then_some((covariance / denominator).clamp(-1.0, 1.0))
+}
+
+fn calibration_aligned_range(
+    system_start: usize,
+    mic_len: usize,
+    delay: i32,
+) -> Option<(std::ops::Range<usize>, usize)> {
+    let system_end = system_start.saturating_add(CALIBRATION_WINDOW_FRAMES);
+    if delay >= 0 {
+        let delay = delay as usize;
+        let end = system_end.min(mic_len.saturating_sub(delay));
+        (system_start < end).then_some((system_start..end, system_start + delay))
+    } else {
+        let delay = delay.unsigned_abs() as usize;
+        let start = system_start.max(delay);
+        let end = system_end.min(mic_len.saturating_add(delay));
+        (start < end).then_some((start..end, start - delay))
+    }
 }
 
 fn median_f32(values: &mut [f32]) -> Option<f32> {
@@ -815,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_clear_text_duplicate_without_audio() {
+    fn detects_clear_text_duplicate_without_audio() {
         let mut input = words(
             &["We", "should", "release", "Friday."],
             AudioSource::System,
@@ -826,15 +954,12 @@ mod tests {
             AudioSource::Mic,
             1_120,
         ));
-        let result = suppress_leaked_mic_words(&input, None);
-        assert_eq!(result.words.len(), 4);
-        assert!(
-            result
-                .words
-                .iter()
-                .all(|word| word.source == AudioSource::System)
+        let result = detect_leaked_mic_words(&input, None);
+        assert_eq!(
+            result.echo,
+            [false, false, false, false, true, true, true, true]
         );
-        assert_eq!(result.suppressions[0].evidence, "text");
+        assert_eq!(result.detections[0].evidence, "text");
     }
 
     #[test]
@@ -849,14 +974,11 @@ mod tests {
             AudioSource::Mic,
             770,
         ));
-        let result = suppress_leaked_mic_words(&input, None);
-        let mic = result
-            .words
-            .iter()
-            .filter(|word| word.source == AudioSource::Mic)
-            .map(|word| word.text.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(mic, ["yes"]);
+        let result = detect_leaked_mic_words(&input, None);
+        assert_eq!(
+            result.echo,
+            [false, false, false, false, false, true, true, true, true]
+        );
     }
 
     #[test]
@@ -871,28 +993,33 @@ mod tests {
             AudioSource::Mic,
             1_050,
         ));
-        let result = suppress_leaked_mic_words(&input, None);
-        assert_eq!(result.words.len(), input.len());
-        assert!(result.suppressions.is_empty());
+        let result = detect_leaked_mic_words(&input, None);
+        assert!(result.echo.iter().all(|echo| !echo));
+        assert!(result.detections.is_empty());
     }
 
     #[test]
     fn short_duplicate_needs_audio_evidence() {
         let mut input = words(&["thank", "you"], AudioSource::System, 1_000);
         input.extend(words(&["Thank", "you!"], AudioSource::Mic, 1_120));
-        assert_eq!(suppress_leaked_mic_words(&input, None).words.len(), 4);
+        assert!(
+            detect_leaked_mic_words(&input, None)
+                .echo
+                .iter()
+                .all(|echo| !echo)
+        );
 
         let (system, mic) = correlated_audio(4_000, 120);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        let result = suppress_leaked_mic_words(&input, Some(&audio));
-        assert_eq!(result.words.len(), 2);
-        assert_eq!(result.suppressions[0].evidence, "text_audio");
-        assert!(result.suppressions[0].audio_similarity.unwrap() > 0.9);
-        assert!((result.suppressions[0].audio_delay_ms.unwrap() - 120).abs() <= 10);
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+        assert_eq!(result.echo, [false, false, true, true]);
+        assert_eq!(result.detections[0].evidence, "text_audio");
+        assert!(result.detections[0].audio_similarity.unwrap() > 0.9);
+        assert!((result.detections[0].audio_delay_ms.unwrap() - 120).abs() <= 10);
     }
 
     #[test]
-    fn audio_suppresses_garbled_leak_without_text_matches() {
+    fn audio_detects_garbled_leak_without_text_matches() {
         let mut input = words(
             &["we", "should", "release", "Friday"],
             AudioSource::System,
@@ -906,14 +1033,17 @@ mod tests {
         let (system, mic) = calibrated_audio(8_000, 120);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
 
-        let result = suppress_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio));
 
-        assert_eq!(result.words.len(), 4);
-        assert_eq!(result.suppressions.len(), 1);
-        assert_eq!(result.suppressions[0].evidence, "audio");
-        assert_eq!(result.suppressions[0].suppressed_words, 4);
-        assert_eq!(result.suppressions[0].text_similarity, None);
-        let serialized = serde_json::to_value(&result.suppressions[0]).expect("serialize");
+        assert_eq!(
+            result.echo,
+            [false, false, false, false, true, true, true, true]
+        );
+        assert_eq!(result.detections.len(), 1);
+        assert_eq!(result.detections[0].evidence, "audio");
+        assert_eq!(result.detections[0].words, 4);
+        assert_eq!(result.detections[0].text_similarity, None);
+        let serialized = serde_json::to_value(&result.detections[0]).expect("serialize");
         assert!(serialized.get("text_similarity").is_none());
     }
 
@@ -924,21 +1054,21 @@ mod tests {
         clear_audio_range(&mut mic, 6_620, 8_000);
         add_local_signal(&mut mic, 7_120, 7_770, 1.0);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        assert!(audio.calibration.is_some());
+        assert!(!audio.reference_points.is_empty());
         let input = words(&["local", "speech"], AudioSource::Mic, 7_120);
 
-        let result = suppress_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio));
 
-        assert_eq!(result.words, input);
-        assert!(result.suppressions.is_empty());
+        assert!(result.echo.iter().all(|echo| !echo));
+        assert!(result.detections.is_empty());
     }
 
     #[test]
-    fn audio_keeps_double_talk_and_suppresses_leak_only_words() {
+    fn audio_keeps_double_talk_and_detects_leak_only_words() {
         let (system, mut mic) = calibrated_audio(8_000, 120);
         add_local_signal(&mut mic, 5_120, 5_770, 1.5);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        assert!(audio.calibration.is_some());
+        assert!(!audio.reference_points.is_empty());
         let mut input = words(
             &["remote", "audio", "leak", "only"],
             AudioSource::System,
@@ -951,18 +1081,17 @@ mod tests {
         ));
         input.extend(words(&["my", "question"], AudioSource::Mic, 5_120));
 
-        let result = suppress_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio));
 
-        let remaining_mic = result
-            .words
-            .iter()
-            .filter(|word| word.source == AudioSource::Mic)
-            .map(|word| word.text.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(remaining_mic, ["my", "question"]);
-        assert_eq!(result.suppressions.len(), 1);
-        assert_eq!(result.suppressions[0].evidence, "audio");
-        assert_eq!(result.suppressions[0].suppressed_words, 4);
+        assert_eq!(
+            result.echo,
+            [
+                false, false, false, false, true, true, true, true, false, false
+            ]
+        );
+        assert_eq!(result.detections.len(), 1);
+        assert_eq!(result.detections[0].evidence, "audio");
+        assert_eq!(result.detections[0].words, 4);
     }
 
     #[test]
@@ -977,18 +1106,18 @@ mod tests {
             }
         });
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        assert!(audio.calibration.is_none());
-        let result = suppress_leaked_mic_words(&input, Some(&audio));
-        assert_eq!(result.words.len(), input.len());
-        assert!(result.suppressions.is_empty());
+        assert!(audio.reference_points.is_empty());
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+        assert!(result.echo.iter().all(|echo| !echo));
+        assert!(result.detections.is_empty());
     }
 
     #[test]
     fn preserves_a_later_repetition_without_audio() {
         let input = duplicate_words(1_000, 2_200);
-        let result = suppress_leaked_mic_words(&input, None);
-        assert_eq!(result.words.len(), input.len());
-        assert!(result.suppressions.is_empty());
+        let result = detect_leaked_mic_words(&input, None);
+        assert!(result.echo.iter().all(|echo| !echo));
+        assert!(result.detections.is_empty());
     }
 
     #[test]
@@ -996,13 +1125,13 @@ mod tests {
         let input = duplicate_words(1_000, 2_200);
         let (system, mic) = correlated_audio(4_000, 120);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        let result = suppress_leaked_mic_words(&input, Some(&audio));
-        assert_eq!(result.words.len(), input.len());
-        assert!(result.suppressions.is_empty());
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+        assert!(result.echo.iter().all(|echo| !echo));
+        assert!(result.detections.is_empty());
     }
 
     #[test]
-    fn one_timing_outlier_prevents_suppression() {
+    fn one_timing_outlier_prevents_detection() {
         let mut input = words(&["one", "two", "three", "four"], AudioSource::System, 1_000);
         input.extend(words(&["one", "two", "three"], AudioSource::Mic, 1_120));
         for (start, text) in [
@@ -1015,9 +1144,89 @@ mod tests {
             input.push(word(AudioSource::Mic, start, text));
         }
         input.push(word(AudioSource::Mic, 5_050, "four"));
-        let result = suppress_leaked_mic_words(&input, None);
-        assert_eq!(result.words.len(), input.len());
-        assert!(result.suppressions.is_empty());
+        let result = detect_leaked_mic_words(&input, None);
+        assert!(result.echo.iter().all(|echo| !echo));
+        assert!(result.detections.is_empty());
+    }
+
+    #[test]
+    fn follows_gain_changes_in_both_directions() {
+        for (before_gain, after_gain) in [(0.2, 0.6), (0.6, 0.2)] {
+            let (system, mut mic) = variable_gain_audio(24_000, 120, |frame| {
+                if frame < 1_200 {
+                    before_gain
+                } else {
+                    after_gain
+                }
+            });
+            add_local_signal(&mut mic, 7_120, 7_770, 1.5);
+            add_local_signal(&mut mic, 19_120, 19_770, 1.5);
+            let audio = AudioEnvelopes::from_samples(&mic, &system);
+            let input = [
+                word(AudioSource::Mic, 5_120, "early leak"),
+                word(AudioSource::Mic, 7_120, "early local"),
+                word(AudioSource::Mic, 17_120, "late leak"),
+                word(AudioSource::Mic, 19_120, "late local"),
+            ];
+
+            let result = detect_leaked_mic_words(&input, Some(&audio));
+
+            assert_eq!(result.echo, [true, false, true, false]);
+        }
+    }
+
+    #[test]
+    fn leak_stopping_halfway_does_not_mark_later_microphone_words() {
+        let (system, mut mic) = calibrated_audio(24_000, 120);
+        clear_audio_range(&mut mic, 12_120, 24_000);
+        add_local_signal(&mut mic, 17_120, 17_770, 1.0);
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+        let input = [
+            word(AudioSource::Mic, 5_120, "first-half leak"),
+            word(AudioSource::Mic, 17_120, "headphones local"),
+        ];
+
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+
+        assert_eq!(result.echo, [true, false]);
+    }
+
+    #[test]
+    fn isolated_disagreeing_candidate_is_not_a_reference_point() {
+        let (system, mut mic) = calibrated_audio(14_000, 120);
+        clear_audio_range(&mut mic, 6_600, 8_600);
+        copy_leak_range(&system, &mut mic, 6_000, 8_000, 600, 0.2);
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+        let threshold = audio.activity_threshold.expect("active system audio");
+        let system_log = audio
+            .system
+            .iter()
+            .map(|level| (level + 1e-6).ln())
+            .collect::<Vec<_>>();
+        let mic_log = audio
+            .mic
+            .iter()
+            .map(|level| (level + 1e-6).ln())
+            .collect::<Vec<_>>();
+        let active_frames = (600..800)
+            .filter(|&index| audio.system[index] >= threshold)
+            .collect::<Vec<_>>();
+        let (_, delay) = (MIN_DELAY_FRAMES..=MAX_DELAY_FRAMES)
+            .filter_map(|delay| {
+                calibration_correlation(&active_frames, &system_log, 600, &mic_log, delay)
+                    .map(|correlation| (correlation, delay))
+            })
+            .max_by(|left, right| left.0.total_cmp(&right.0))
+            .expect("isolated candidate");
+
+        assert!((delay - 60).abs() <= CALIBRATION_DELAY_TOLERANCE_FRAMES);
+        assert!(
+            !audio
+                .reference_points
+                .iter()
+                .any(|point| point.center_frame == 700)
+        );
+        assert!(audio.reference_points.len() >= 3);
     }
 
     #[test]
@@ -1039,9 +1248,9 @@ mod tests {
         let audio = AudioEnvelopes::read(&mic_path, &system_path).expect("open audio");
         let mut input = words(&["thank", "you"], AudioSource::System, 1_000);
         input.extend(words(&["thank", "you"], AudioSource::Mic, 1_120));
-        let result = suppress_leaked_mic_words(&input, Some(&audio));
-        assert_eq!(result.words.len(), 2);
-        assert!((result.suppressions[0].audio_delay_ms.unwrap() - 120).abs() <= 10);
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+        assert_eq!(result.echo, [false, false, true, true]);
+        assert!((result.detections[0].audio_delay_ms.unwrap() - 120).abs() <= 10);
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -1084,6 +1293,40 @@ mod tests {
             }
         }
         (system, mic)
+    }
+
+    fn variable_gain_audio(
+        duration_ms: usize,
+        delay_ms: usize,
+        gain: impl Fn(usize) -> f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let (system, _) = calibrated_audio(duration_ms, delay_ms);
+        let delay = delay_ms * SAMPLE_RATE as usize / 1_000;
+        let mut mic = vec![0.0; system.len()];
+        for (index, sample) in system.iter().copied().enumerate() {
+            if index + delay < mic.len() {
+                mic[index + delay] = sample * gain(index / AUDIO_FRAME_SAMPLES);
+            }
+        }
+        (system, mic)
+    }
+
+    fn copy_leak_range(
+        system: &[f32],
+        mic: &mut [f32],
+        start_ms: usize,
+        end_ms: usize,
+        delay_ms: usize,
+        gain: f32,
+    ) {
+        let start = start_ms * SAMPLE_RATE as usize / 1_000;
+        let end = (end_ms * SAMPLE_RATE as usize / 1_000).min(system.len());
+        let delay = delay_ms * SAMPLE_RATE as usize / 1_000;
+        for index in start..end {
+            if index + delay < mic.len() {
+                mic[index + delay] = system[index] * gain;
+            }
+        }
     }
 
     fn clear_audio_range(audio: &mut [f32], start_ms: usize, end_ms: usize) {

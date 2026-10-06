@@ -40,14 +40,6 @@ impl MeetingDetails {
     pub fn remote_count(&self) -> u32 {
         attendee_count(&self.remote)
     }
-
-    pub fn is_remote_attendee(&self, name: &str) -> bool {
-        self.remote.known.iter().any(|known| known == name)
-    }
-
-    pub fn is_local_attendee(&self, name: &str) -> bool {
-        self.local.known.iter().any(|known| known == name)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

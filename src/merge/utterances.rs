@@ -1,8 +1,5 @@
-use crate::meeting::MeetingDetails;
-use crate::types::{
-    AudioSource, EchoEvidence, SpeakerCorrection, SpeakerSegment, TimedWord, Utterance,
-};
-use std::collections::{HashMap, HashSet};
+use crate::types::{AudioSource, SpeakerCorrection, SpeakerSegment, TimedWord, Utterance};
+use std::collections::HashMap;
 
 pub const DEFAULT_NEAREST_TOLERANCE_MS: u64 = 500;
 
@@ -45,14 +42,15 @@ pub fn assign_cluster(
 #[allow(clippy::too_many_arguments)]
 pub fn build_utterances(
     words: &[TimedWord],
+    echo: &[bool],
     segments: &[SpeakerSegment],
     recognized: &HashMap<(AudioSource, u32), String>,
     corrections: &[SpeakerCorrection],
     local_speaker: &str,
     diarize_mic: bool,
     tolerance_ms: u64,
-    meeting: Option<&MeetingDetails>,
 ) -> Vec<Utterance> {
+    assert_eq!(words.len(), echo.len(), "echo flags must match words");
     let mut anonymous = HashMap::new();
     let mut next_anonymous = 0usize;
     let mut ordered_segments = segments.iter().collect::<Vec<_>>();
@@ -78,11 +76,13 @@ pub fn build_utterances(
     for source in [AudioSource::Mic, AudioSource::System] {
         let mut source_words = words
             .iter()
-            .filter(|word| word.source == source)
+            .enumerate()
+            .filter(|(_, word)| word.source == source)
             .collect::<Vec<_>>();
-        source_words.sort_by_key(|word| (word.start_ms, word.end_ms));
+        source_words.sort_by_key(|(_, word)| (word.start_ms, word.end_ms));
         let mut current: Option<Utterance> = None;
-        for word in source_words {
+        for (index, word) in source_words {
+            let word_echo = source == AudioSource::Mic && echo[index];
             let (speaker_id, speaker, locked) = word_speaker(
                 word,
                 segments,
@@ -97,6 +97,7 @@ pub fn build_utterances(
                 utterance.speaker_id != speaker_id
                     || utterance.speaker != speaker
                     || utterance.locked != locked
+                    || utterance.echo != word_echo
                     || word.start_ms.saturating_sub(utterance.end_ms) > 1_000
                     || (utterance.end_ms.saturating_sub(utterance.start_ms) >= 15_000
                         && ends_sentence(&utterance.text))
@@ -116,7 +117,7 @@ pub fn build_utterances(
                     speaker,
                     text: clean_text(&word.text),
                     locked,
-                    echo: None,
+                    echo: word_echo,
                 });
             }
         }
@@ -126,73 +127,7 @@ pub fn build_utterances(
     }
     output.retain(|utterance| !utterance.text.is_empty());
     output.sort_by_key(|utterance| (utterance.start_ms, source_order(utterance.source)));
-    mark_echoes(&mut output, recognized, corrections, diarize_mic, meeting);
     output
-}
-
-fn mark_echoes(
-    utterances: &mut [Utterance],
-    recognized: &HashMap<(AudioSource, u32), String>,
-    corrections: &[SpeakerCorrection],
-    diarize_mic: bool,
-    meeting: Option<&MeetingDetails>,
-) {
-    if let Some(meeting) = meeting.filter(|_| diarize_mic) {
-        let resolved_microphone_speakers = recognized
-            .iter()
-            .filter(|((source, _), _)| *source == AudioSource::Mic)
-            .map(|(_, speaker)| speaker.as_str())
-            .chain(
-                corrections
-                    .iter()
-                    .filter(|correction| correction.source == AudioSource::Mic)
-                    .map(|correction| correction.speaker.as_str()),
-            )
-            .filter(|name| meeting.is_local_attendee(name))
-            .collect::<HashSet<_>>();
-        let complete_local_roster = meeting.local.unknown == 0
-            && !meeting.local.known.is_empty()
-            && meeting
-                .local
-                .known
-                .iter()
-                .all(|name| resolved_microphone_speakers.contains(name.as_str()));
-        for utterance in utterances
-            .iter_mut()
-            .filter(|utterance| utterance.source == AudioSource::Mic)
-        {
-            if meeting.is_remote_attendee(&utterance.speaker) {
-                utterance.echo = Some(EchoEvidence::RemoteAttendee);
-            } else if complete_local_roster && is_anonymous(&utterance.speaker) {
-                utterance.echo = Some(EchoEvidence::LocalRoster);
-            }
-        }
-    }
-
-    let system_speakers = recognized
-        .iter()
-        .filter(|((source, _), _)| *source == AudioSource::System)
-        .map(|(_, speaker)| speaker.as_str())
-        .chain(
-            corrections
-                .iter()
-                .filter(|correction| correction.source == AudioSource::System)
-                .map(|correction| correction.speaker.as_str()),
-        )
-        .collect::<HashSet<_>>();
-    for utterance in utterances.iter_mut().filter(|utterance| {
-        utterance.source == AudioSource::Mic
-            && utterance.echo.is_none()
-            && (utterance.speaker_id != "local" || utterance.locked)
-    }) {
-        if system_speakers.contains(utterance.speaker.as_str()) {
-            utterance.echo = Some(EchoEvidence::SystemTrackSpeaker);
-        }
-    }
-}
-
-fn is_anonymous(speaker: &str) -> bool {
-    speaker.starts_with("SPEAKER_") || speaker == "unknown"
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -329,13 +264,13 @@ mod tests {
         let segments = [segment(AudioSource::System, 0, 500, 0)];
         let utterances = build_utterances(
             &words,
+            &vec![false; words.len()],
             &segments,
             &HashMap::new(),
             &[],
             "Me",
             false,
             500,
-            None,
         );
         assert_eq!(utterances.len(), 1);
         assert_eq!(utterances[0].text, "Hello, world!");
@@ -351,13 +286,13 @@ mod tests {
         let segments = vec![segment(AudioSource::System, 0, 20_000, 0)];
         let utterances = build_utterances(
             &words,
+            &vec![false; words.len()],
             &segments,
             &HashMap::new(),
             &[],
             "Me",
             false,
             500,
-            None,
         );
         assert_eq!(utterances.len(), 3);
         words[2].start_ms = 15_400;
@@ -369,13 +304,13 @@ mod tests {
         assert_eq!(
             build_utterances(
                 &words,
+                &vec![false; words.len()],
                 &segments,
                 &HashMap::new(),
                 &[],
                 "Me",
                 false,
                 0,
-                None,
             )
             .len(),
             3
@@ -391,13 +326,13 @@ mod tests {
         let segments = [segment(AudioSource::System, 0, 1_000, 0)];
         let utterances = build_utterances(
             &words,
+            &vec![false; words.len()],
             &segments,
             &HashMap::new(),
             &[],
             "Me",
             false,
             500,
-            None,
         );
         assert_eq!(utterances.len(), 2);
         assert!(utterances[0].end_ms > utterances[1].start_ms);
@@ -414,8 +349,16 @@ mod tests {
             segment(AudioSource::System, 200, 300, 9),
         ];
         let recognized = HashMap::from([((AudioSource::System, 4), "Alice".to_string())]);
-        let utterances =
-            build_utterances(&words, &segments, &recognized, &[], "Me", false, 0, None);
+        let utterances = build_utterances(
+            &words,
+            &vec![false; words.len()],
+            &segments,
+            &recognized,
+            &[],
+            "Me",
+            false,
+            0,
+        );
         assert_eq!(utterances[0].speaker, "Alice");
         assert_eq!(utterances[1].speaker, "SPEAKER_00");
     }
@@ -446,13 +389,13 @@ mod tests {
 
         let utterances = build_utterances(
             &words,
+            &vec![false; words.len()],
             &segments,
             &HashMap::new(),
             &corrections,
             "Me",
             false,
             0,
-            None,
         );
 
         assert_eq!(utterances.len(), 2);
@@ -482,13 +425,13 @@ mod tests {
 
         let utterances = build_utterances(
             &words,
+            &vec![false; words.len()],
             &segments,
             &HashMap::new(),
             &corrections,
             "Me",
             false,
             0,
-            None,
         );
 
         assert_eq!(utterances.len(), 2);
@@ -515,13 +458,13 @@ mod tests {
 
         let utterances = build_utterances(
             &words,
+            &vec![false; words.len()],
             &segments,
             &HashMap::new(),
             &corrections,
             "Me",
             false,
             0,
-            None,
         );
 
         assert_eq!(utterances.len(), 2);
@@ -531,167 +474,37 @@ mod tests {
         assert!(utterances[1].locked);
     }
 
-    fn details(local: (&[&str], u32), remote: (&[&str], u32)) -> MeetingDetails {
-        MeetingDetails::new(
-            String::new(),
-            crate::meeting::Attendees {
-                known: local.0.iter().map(|name| (*name).to_owned()).collect(),
-                unknown: local.1,
-            },
-            crate::meeting::Attendees {
-                known: remote.0.iter().map(|name| (*name).to_owned()).collect(),
-                unknown: remote.1,
-            },
-        )
-    }
-
-    fn one_utterance_echo(
-        source: AudioSource,
-        cluster: u32,
-        recognized: HashMap<(AudioSource, u32), String>,
-        meeting: &MeetingDetails,
-    ) -> Option<EchoEvidence> {
-        build_utterances(
-            &[word(source, 0, 100, "hello")],
-            &[segment(source, 0, 100, cluster)],
-            &recognized,
+    #[test]
+    fn echo_words_split_microphone_phrase_and_never_mark_system_words() {
+        let words = [
+            word(AudioSource::Mic, 0, 100, "local"),
+            word(AudioSource::Mic, 100, 200, "leak"),
+            word(AudioSource::Mic, 200, 300, "again"),
+            word(AudioSource::System, 100, 200, "remote"),
+        ];
+        let utterances = build_utterances(
+            &words,
+            &[false, true, false, true],
+            &[],
+            &HashMap::new(),
             &[],
             "Me",
-            true,
+            false,
             0,
-            Some(meeting),
-        )[0]
-        .echo
-    }
-
-    #[test]
-    fn remote_attendee_on_microphone_is_echo() {
-        let meeting = details((&["Laura"], 0), (&["Andrew"], 0));
-        let recognized = HashMap::from([((AudioSource::Mic, 1), "Andrew".into())]);
-        assert_eq!(
-            one_utterance_echo(AudioSource::Mic, 1, recognized, &meeting),
-            Some(EchoEvidence::RemoteAttendee)
         );
-    }
-
-    #[test]
-    fn complete_local_roster_marks_anonymous_microphone_echo() {
-        let meeting = details((&["Laura"], 0), (&[], 0));
-        let recognized = HashMap::from([((AudioSource::Mic, 1), "Laura".into())]);
-        assert_eq!(
-            one_utterance_echo(AudioSource::Mic, 2, recognized, &meeting),
-            Some(EchoEvidence::LocalRoster)
-        );
-    }
-
-    #[test]
-    fn complete_local_roster_counts_microphone_corrections() {
-        let meeting = details((&["Laura", "Pat"], 0), (&[], 0));
-        let words = [
-            word(AudioSource::Mic, 0, 100, "Laura"),
-            word(AudioSource::Mic, 200, 300, "Pat"),
-            word(AudioSource::Mic, 400, 500, "anonymous"),
-        ];
-        let segments = [
-            segment(AudioSource::Mic, 0, 100, 1),
-            segment(AudioSource::Mic, 200, 300, 2),
-            segment(AudioSource::Mic, 400, 500, 3),
-        ];
-        let recognized = HashMap::from([((AudioSource::Mic, 1), "Laura".into())]);
-        let corrections = [SpeakerCorrection {
-            source: AudioSource::Mic,
-            start_ms: 200,
-            end_ms: 300,
-            speaker: "Pat".into(),
-            inferred: false,
-        }];
-
-        let utterances = build_utterances(
-            &words,
-            &segments,
-            &recognized,
-            &corrections,
-            "Me",
-            true,
-            0,
-            Some(&meeting),
-        );
-
-        assert_eq!(utterances[2].speaker, "SPEAKER_01");
-        assert_eq!(utterances[2].echo, Some(EchoEvidence::LocalRoster));
-    }
-
-    #[test]
-    fn incomplete_or_unidentified_local_roster_does_not_mark_echo() {
-        let unknown_local = details((&["Laura"], 1), (&[], 0));
-        let recognized = HashMap::from([((AudioSource::Mic, 1), "Laura".into())]);
-        assert_eq!(
-            one_utterance_echo(AudioSource::Mic, 2, recognized, &unknown_local),
-            None
-        );
-
-        let missing_local = details((&["Laura", "Pat"], 0), (&[], 0));
-        let recognized = HashMap::from([((AudioSource::Mic, 1), "Laura".into())]);
-        assert_eq!(
-            one_utterance_echo(AudioSource::Mic, 2, recognized, &missing_local),
-            None
-        );
-    }
-
-    #[test]
-    fn system_utterances_are_never_echoes() {
-        let meeting = details((&["Laura"], 0), (&["Andrew"], 0));
-        let recognized = HashMap::from([((AudioSource::System, 1), "Andrew".into())]);
-        assert_eq!(
-            one_utterance_echo(AudioSource::System, 1, recognized, &meeting),
-            None
-        );
-    }
-
-    #[test]
-    fn system_track_name_marks_microphone_echo_after_resolution() {
-        let words = [word(AudioSource::Mic, 0, 100, "hello")];
-        let segments = [segment(AudioSource::Mic, 0, 100, 1)];
-        let corrections = [SpeakerCorrection {
-            source: AudioSource::System,
-            start_ms: 500,
-            end_ms: 600,
-            speaker: "Alice".into(),
-            inferred: false,
-        }];
-        let recognized = HashMap::from([((AudioSource::Mic, 1), "Alice".into())]);
-        let utterances = build_utterances(
-            &words,
-            &segments,
-            &recognized,
-            &corrections,
-            "Me",
-            true,
-            0,
-            None,
-        );
-        assert_eq!(utterances[0].echo, Some(EchoEvidence::SystemTrackSpeaker));
-    }
-
-    #[test]
-    fn manifest_local_name_is_not_a_system_track_echo_without_a_lock() {
-        let words = [word(AudioSource::Mic, 0, 100, "hello")];
-        let recognized = HashMap::from([((AudioSource::System, 2), "Alice".into())]);
-        let utterances = build_utterances(&words, &[], &recognized, &[], "Alice", false, 0, None);
-        assert_eq!(utterances[0].speaker_id, "local");
-        assert_eq!(utterances[0].echo, None);
-    }
-
-    #[test]
-    fn existing_echo_evidence_takes_precedence_over_system_track_match() {
-        let meeting = details((&[], 0), (&["Andrew"], 0));
-        let recognized = HashMap::from([
-            ((AudioSource::Mic, 1), "Andrew".into()),
-            ((AudioSource::System, 2), "Andrew".into()),
-        ]);
-        assert_eq!(
-            one_utterance_echo(AudioSource::Mic, 1, recognized, &meeting),
-            Some(EchoEvidence::RemoteAttendee)
+        let mic = utterances
+            .iter()
+            .filter(|utterance| utterance.source == AudioSource::Mic)
+            .collect::<Vec<_>>();
+        assert_eq!(mic.len(), 3);
+        assert!(!mic[0].echo);
+        assert!(mic[1].echo);
+        assert!(!mic[2].echo);
+        assert!(
+            utterances
+                .iter()
+                .filter(|utterance| utterance.source == AudioSource::System)
+                .all(|utterance| !utterance.echo)
         );
     }
 }

@@ -62,7 +62,7 @@ preserving the recorded audio and confirmed names.
   preferring Level Zero and retrying through OpenCL before using CPU.
 - Recognizes learned voices while leaving uncertain matches anonymous.
 - Uses per-meeting attendee details to guide speaker counts and recognition,
-  and marks likely microphone echo without deleting it.
+  while audio matching marks loudspeaker sound picked up by the microphone.
 - Hides either audio source from a session's transcript without deleting it.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback, editable
@@ -254,14 +254,10 @@ The per-session file used by processing is:
 
 Remote attendee count fixes system-audio clustering unless
 `--num-speakers` was supplied. Known names narrow voice-recognition candidates
-when that end has no unnamed attendees; microphone recognition also includes
-known remote names so echo can be detected. A recognized remote voice on the
-microphone is marked as echo. When every named local attendee has been found
-and there are no unnamed local people, remaining anonymous microphone voices
-are also marked as echo. A microphone line resolved to the same name as a
-system-track speaker is marked with `system_track_speaker`. Echo lines stay in
-both transcript formats, carry metadata in `transcript.jsonl`, and can be
-hidden temporarily in the app.
+when that end has no unnamed attendees; microphone recognition uses only known
+local names. Audio matching follows changes in loudspeaker delay and level
+through the meeting, keeps picked-up words in both transcript formats, and
+marks their lines as echo in `transcript.jsonl` and the app.
 
 For command-line processing, `--meeting FILE` validates and copies a
 `meeting.json`-shaped file into the session. The context file is not used on

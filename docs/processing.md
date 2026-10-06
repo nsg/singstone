@@ -256,10 +256,10 @@ For every distinct `(source, cluster)` pair, recognition then:
    clusters but raises the chance of a false match. The default is `0.72`.
 
 For system clusters, known remote attendees are the allowed candidates. For
-microphone clusters, known local and remote attendees are allowed (remote names
-are needed for echo detection). A source remains unrestricted when its attendee
-list is empty or its corresponding end has unnamed people. This is a filtered
-view of the speaker database; the database on disk is unchanged.
+microphone clusters, only known local attendees are allowed. A source remains
+unrestricted when its attendee list is empty or its corresponding end has
+unnamed people. This is a filtered view of the speaker database; the database
+on disk is unchanged.
 
 The version 2 speaker database stores only a model identity and unit-length
 vectors ("dots") for each name. Dot count is the weight; dots have no dates,
@@ -367,9 +367,8 @@ again. With a configured model, learning preparation must succeed before the
 lock is saved; a rendering failure restores the previous corrections. The
 database is updated only after rendering succeeds.
 Without the model, the line is still locked and rendered, but learning and
-unlearning are skipped.
-A microphone correction that matches a system-track name is still stored and
-learned; rendering then marks its utterance as echo.
+unlearning are skipped. Microphone corrections are stored and learned in the
+same way as system-track corrections.
 
 The app marks a locked line as learned when one of its chunks is stored under
 the line's name in the database (cosine similarity at least `0.999`). This is
@@ -400,8 +399,8 @@ their current name.
 singstone render SESSION
 ```
 
-**Input:** `manifest.json`, optional `meeting.json`, `words.jsonl`,
-`diarization.jsonl`, their metadata sidecars when present, optionally
+**Input:** `manifest.json`, `words.jsonl`, `diarization.jsonl`, their metadata
+sidecars when present, optionally
 `speaker-assignments.json`, optionally `speaker-corrections.json`, optionally
 `hidden-sources.json`, and the audio tracks when both are available. Missing
 assignment, correction, and hidden-source data is allowed, but malformed or
@@ -409,20 +408,29 @@ unsupported assignment, correction, hidden-source, or diarization metadata is
 an error. This stage uses no ML model and is fast.
 
 When both audio tracks are available, `render` builds 10 ms RMS envelopes and
-estimates the session's speaker-to-microphone delay and gain from recurring
-correlated windows. It suppresses microphone words whose audio follows that
-leak path, including badly transcribed words, while a word whose microphone
-energy exceeds the predicted leak is kept as local speech or double talk. A
-comparison of the timed word sequences, confirmed by correlated audio energy,
-then runs over the remaining microphone words and removes only matching words.
-Without a calibration only that comparison runs; if an audio track cannot be
-read, it falls back to stricter long-sequence text matching. The raw
+examines every non-overlapping two-second system-audio window with enough
+activity. Correlated windows become delay-and-gain reference points only when
+at least two nearby candidates agree on the delay. Nearby means within 180
+seconds, so reference points can exist in one part of a meeting without a bad
+or changed section vetoing the whole session.
+
+For each microphone word, `render` separately estimates delay and gain from up
+to three nearest reference points before the word and up to three after it,
+within the same 180-second horizon. Passing the audio test with either estimate
+marks the word as echo, which lets volume, microphone gain, delay, or headphone
+changes take effect from whichever side already reflects the new path. A word
+whose microphone energy clearly exceeds the predicted leak stays unmarked as
+local speech or double talk. A comparison of timed word sequences then runs
+over words not marked by the audio pass and can mark a text match confirmed by
+correlated audio. If an audio track cannot be read, only the stricter
+long-sequence text fallback is available. No words are deleted, and the raw
 `words.jsonl` remains unchanged.
 
-Every decision is written to `leakage-suppressions.jsonl`, including the two
-spans, word count, evidence kind, and optional text similarity, audio similarity,
-and estimated delay. Audio-first decisions omit text similarity. An empty file
-means no microphone words were suppressed.
+Every detected run is written to `echo-detections.jsonl`, including the two
+spans, `words` count, evidence kind, and optional text similarity, audio
+similarity, and estimated delay. Audio-first detections omit text similarity.
+An empty file means no microphone words were detected as echo. Rendering also
+removes the obsolete `leakage-suppressions.jsonl` artifact when present.
 
 For each word, `render` considers only diarization segments from the same audio
 source. It chooses the cluster with the greatest timestamp overlap. When there
@@ -452,22 +460,15 @@ They override recognized and anonymous display names without replacing the
 cluster ID. Grouping starts a new utterance when the lock state changes, so a
 confirmed range cannot be merged into an unlocked row.
 
-After names and locks are resolved, microphone utterances can be marked as echo
-without deleting them. A microphone cluster assigned to a known remote
-attendee gets `"echo":"remote_attendee"`. If there are no unnamed local
-attendees and every known local attendee is named through microphone
-recognition or a microphone correction, remaining anonymous microphone utterances get
-`"echo":"local_roster"`. These meeting-roster rules still require microphone
-diarization. In addition, a microphone utterance whose resolved name matches a
-resolved system-track name gets `"echo":"system_track_speaker"`, including
-when either name came from a correction. An earlier echo reason takes
-precedence. This marker does not remove words or add a leakage-suppression
-record. System utterances are never marked. The text transcript adds `[echo]`
-after the speaker name.
+Audio-detected words form their own microphone utterances and carry
+`"echo":true` in `transcript.jsonl`. Surrounding local words form separate,
+unmarked utterances, and system utterances are never marked. Older transcripts
+that stored a string in `echo` still open: any old string value is read as
+`true`. The text transcript adds `[echo]` after the speaker name.
 
 Adjacent words are grouped into utterances. A new utterance starts when the
-speaker ID, display name, or lock state changes, the silence between words
-exceeds one second, or an utterance has reached 15 seconds and ends with
+speaker ID, display name, lock state, or echo flag changes, the silence between
+words exceeds one second, or an utterance has reached 15 seconds and ends with
 sentence punctuation. Whitespace and punctuation spacing are normalized, and
 utterances from both sources are sorted on the common meeting timeline.
 

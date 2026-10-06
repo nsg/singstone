@@ -11,9 +11,7 @@ use crate::model_setup;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
 use crate::transcription::{TranscriptionProgress, backend};
-use crate::types::{
-    AudioSource, EchoEvidence, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance,
-};
+use crate::types::{AudioSource, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
@@ -109,7 +107,6 @@ struct SessionDetail {
     meeting_button: gtk::Button,
     rename_button: gtk::Button,
     delete_button: gtk::Button,
-    hide_echo: gtk::ToggleButton,
     hide_mic: gtk::ToggleButton,
     hide_system: gtk::ToggleButton,
     loading_hidden_sources: Rc<Cell<bool>>,
@@ -760,9 +757,6 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     let transcript_toggles = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     transcript_toggles.set_layout_manager(Some(WrapLayout::new(8, 4)));
     transcript_header.append(&transcript_toggles);
-    let hide_echo = gtk::ToggleButton::with_label("Hide echo");
-    hide_echo.set_visible(false);
-    transcript_toggles.append(&hide_echo);
     let hide_mic = gtk::ToggleButton::with_label("Hide microphone");
     hide_mic.set_tooltip_text(Some(
         "Leave microphone lines out of transcript.jsonl and transcript.txt. Nothing is deleted.",
@@ -784,17 +778,6 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
             .build(),
     );
     paned.set_start_child(Some(&transcript_frame));
-    let transcript_for_toggle = transcript.clone();
-    hide_echo.connect_toggled(move |button| {
-        let mut child = transcript_for_toggle.first_child();
-        while let Some(row) = child {
-            if row.has_css_class("echo-row") {
-                row.set_visible(!button.is_active());
-            }
-            child = row.next_sibling();
-        }
-    });
-
     let side = gtk::Box::new(gtk::Orientation::Vertical, 14);
     side.set_margin_top(12);
     side.set_margin_bottom(12);
@@ -842,7 +825,6 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         meeting_button,
         rename_button,
         delete_button,
-        hide_echo,
         hide_mic,
         hide_system,
         loading_hidden_sources: Rc::new(Cell::new(false)),
@@ -3030,7 +3012,6 @@ impl SessionDetail {
             .set_visible(processed && manifest.state != SessionState::Recording);
         self.rename_button.set_visible(true);
         self.delete_button.set_visible(true);
-        self.hide_echo.set_active(false);
         let hidden = process::read_hidden_sources(&session).unwrap_or_default();
         let mic_hidden = hidden.contains(&AudioSource::Mic);
         let system_hidden = hidden.contains(&AudioSource::System);
@@ -3047,8 +3028,6 @@ impl SessionDetail {
         clear_box(&self.transcript);
         if processed {
             let utterances: Vec<Utterance> = jsonl::read_all(&session.transcript_path())?;
-            self.hide_echo
-                .set_visible(utterances.iter().any(|utterance| utterance.echo.is_some()));
             if utterances.is_empty() {
                 append_empty(
                     &self.transcript,
@@ -3070,7 +3049,6 @@ impl SessionDetail {
                 }
             }
         } else {
-            self.hide_echo.set_visible(false);
             append_empty(
                 &self.transcript,
                 "This recording has not been processed yet.",
@@ -3163,7 +3141,6 @@ impl SessionDetail {
             self.meeting_button.upcast_ref(),
             self.rename_button.upcast_ref(),
             self.delete_button.upcast_ref(),
-            self.hide_echo.upcast_ref(),
             self.hide_mic.upcast_ref(),
             self.hide_system.upcast_ref(),
         ] {
@@ -3280,7 +3257,7 @@ fn transcript_row(
 ) -> gtk::Box {
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     row.add_css_class("transcript-row");
-    if utterance.echo.is_some() {
+    if utterance.echo {
         row.add_css_class("echo-row");
     }
     let avatar = gtk::Image::from_icon_name("avatar-default-symbolic");
@@ -3345,14 +3322,10 @@ fn transcript_row(
     source_icon.add_css_class("dim-label");
     source_icon.set_valign(gtk::Align::Center);
     head.append(&source_icon);
-    if let Some(evidence) = utterance.echo {
+    if utterance.echo {
         let echo = status_pill("Echo", "idle");
         echo.add_css_class("caption");
-        echo.set_tooltip_text(Some(match evidence {
-            EchoEvidence::RemoteAttendee => "Remote attendee heard through the microphone",
-            EchoEvidence::LocalRoster => "Everyone in the room is already identified",
-            EchoEvidence::SystemTrackSpeaker => "This speaker is also resolved on the system track",
-        }));
+        echo.set_tooltip_text(Some("Loudspeaker sound picked up by the microphone"));
         head.append(&echo);
     }
     let play = gtk::Button::new();
@@ -3822,7 +3795,7 @@ fn start_assignment(
         reload_session(&detail);
         match result {
             Ok(outcome) => {
-                show_assignment_notice(&detail, outcome.learning_available, outcome.echo);
+                show_assignment_notice(&detail, outcome.learning_available);
             }
             Err(error) => show_error(&detail.window, "Could not assign speaker", &error),
         }
@@ -3898,26 +3871,14 @@ fn reload_session(detail: &SessionDetail) {
     }
 }
 
-fn show_assignment_notice(detail: &SessionDetail, learning_available: bool, echo: bool) {
-    if learning_available && !echo {
+fn show_assignment_notice(detail: &SessionDetail, learning_available: bool) {
+    if learning_available {
         return;
     }
-    let body = match (learning_available, echo) {
-        (false, true) => {
-            "The line is locked with this name, but its voice could not be learned. It was recognized as an echo of a remote participant and is shown as echo."
-        }
-        (false, false) => "The line is locked with this name, but its voice could not be learned.",
-        (true, true) => {
-            "This line was recognized as an echo of a remote participant and is shown as echo."
-        }
-        (true, false) => unreachable!(),
-    };
-    let heading = if echo {
-        "Speaker assigned as echo"
-    } else {
-        "Speaker assigned"
-    };
-    let notice = adw::AlertDialog::new(Some(heading), Some(body));
+    let notice = adw::AlertDialog::new(
+        Some("Speaker assigned"),
+        Some("The line is locked with this name, but its voice could not be learned."),
+    );
     notice.add_response("close", "Close");
     notice.present(Some(&detail.window));
 }
@@ -4117,7 +4078,7 @@ mod tests {
             speaker: speaker.into(),
             text: "text".into(),
             locked: false,
-            echo: None,
+            echo: false,
         }
     }
 

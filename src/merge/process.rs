@@ -464,7 +464,6 @@ pub struct CorrectionOutcome {
     pub learned: usize,
     pub forgotten: usize,
     pub learning_available: bool,
-    pub echo: bool,
     pub proposals: Vec<Proposal>,
 }
 
@@ -699,13 +698,11 @@ fn apply_corrections_inner(
             learning.database.save(&learning.database_path)?;
         }
     }
-    let echo = correction_is_system_echo(&requests, &recognized, &corrections.corrections);
     Ok((
         CorrectionOutcome {
             learned,
             forgotten,
             learning_available,
-            echo,
             proposals: Vec::new(),
         },
         requests,
@@ -883,27 +880,6 @@ fn cluster_for_request(
                 })
                 .map(|(_, _, cluster)| cluster)
         })
-}
-
-fn correction_is_system_echo(
-    requests: &[CorrectionRequest],
-    recognized: &HashMap<(AudioSource, u32), String>,
-    corrections: &[SpeakerCorrection],
-) -> bool {
-    let system_speakers = recognized
-        .iter()
-        .filter(|((source, _), _)| *source == AudioSource::System)
-        .map(|(_, speaker)| speaker.as_str())
-        .chain(
-            corrections
-                .iter()
-                .filter(|correction| correction.source == AudioSource::System)
-                .map(|correction| correction.speaker.as_str()),
-        )
-        .collect::<HashSet<_>>();
-    requests.iter().any(|request| {
-        request.source == AudioSource::Mic && system_speakers.contains(request.speaker.as_str())
-    })
 }
 
 fn build_proposals(
@@ -1586,15 +1562,7 @@ fn allowed_candidate_names(
                 && meeting.local.unknown == 0
                 && !meeting.local.known.is_empty() =>
         {
-            Some(
-                meeting
-                    .local
-                    .known
-                    .iter()
-                    .chain(&meeting.remote.known)
-                    .cloned()
-                    .collect(),
-            )
+            Some(meeting.local.known.iter().cloned().collect())
         }
         _ => None,
     }
@@ -1796,17 +1764,16 @@ fn render_artifacts_with_segments_and_hook(
             None
         }
     };
-    let leakage = leakage::suppress_leaked_mic_words(&words, audio.as_ref());
-    let meeting = meeting::read_details(&session.meeting_path())?;
+    let detection = leakage::detect_leaked_mic_words(&words, audio.as_ref());
     let all_utterances = utterances::build_utterances(
-        &leakage.words,
+        &words,
+        &detection.echo,
         &segments,
         &recognized,
         &corrections.corrections,
         &manifest.local_speaker,
         diarize_mic,
         DEFAULT_NEAREST_TOLERANCE_MS,
-        meeting.as_ref(),
     );
     let all_utterance_count = all_utterances.len();
     let utterances = all_utterances
@@ -1815,18 +1782,16 @@ fn render_artifacts_with_segments_and_hook(
         .collect::<Vec<_>>();
     let hidden_utterances = all_utterance_count - utterances.len();
     before_write();
-    jsonl::write_all_atomic(&session.leakage_suppressions_path(), &leakage.suppressions)?;
+    jsonl::write_all_atomic(&session.echo_detections_path(), &detection.detections)?;
+    match fs::remove_file(session.dir.join("leakage-suppressions.jsonl")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     jsonl::write_all_atomic(&session.transcript_path(), &utterances)?;
     write_transcript_text(&session.transcript_text_path(), &utterances)?;
-    let suppressed_words = leakage
-        .suppressions
-        .iter()
-        .map(|suppression| suppression.suppressed_words)
-        .sum::<usize>();
-    let echo_utterances = utterances
-        .iter()
-        .filter(|utterance| utterance.echo.is_some())
-        .count();
+    let echo_words = detection.echo.iter().filter(|&&echo| echo).count();
+    let echo_utterances = utterances.iter().filter(|utterance| utterance.echo).count();
     let hidden_summary = if hidden.is_empty() {
         String::new()
     } else {
@@ -1838,11 +1803,11 @@ fn render_artifacts_with_segments_and_hook(
         format!(", hid {hidden_utterances} utterance(s) of hidden sources ({sources})")
     };
     eprintln!(
-        "merge: {} utterance(s), {} echo utterance(s), suppressed {} leaked microphone word(s) in {} region(s), in {:.1} s{hidden_summary}",
+        "merge: {} utterance(s), {} echo utterance(s) from {} echo word(s) in {} region(s), in {:.1} s{hidden_summary}",
         utterances.len(),
         echo_utterances,
-        suppressed_words,
-        leakage.suppressions.len(),
+        echo_words,
+        detection.detections.len(),
         merge_started.elapsed().as_secs_f64()
     );
     Ok(())
@@ -2598,11 +2563,7 @@ fn write_transcript_text(path: &Path, utterances: &[Utterance]) -> io::Result<()
                 "[{}] {}{}: {}",
                 format_timestamp(utterance.start_ms),
                 utterance.speaker,
-                if utterance.echo.is_some() {
-                    " [echo]"
-                } else {
-                    ""
-                },
+                if utterance.echo { " [echo]" } else { "" },
                 utterance.text
             )?;
         }
@@ -2713,7 +2674,7 @@ mod tests {
             speaker: "SPEAKER_09".into(),
             text: "hello".into(),
             locked: false,
-            echo: None,
+            echo: false,
         }];
         let segments = [SpeakerSegment {
             source: AudioSource::System,
@@ -2756,42 +2717,6 @@ mod tests {
         };
 
         assert_eq!(validate_correction_request(&request).unwrap(), request);
-    }
-
-    #[test]
-    fn correction_echo_uses_recognized_system_names() {
-        let requests = [CorrectionRequest {
-            source: AudioSource::Mic,
-            start_ms: 0,
-            end_ms: 0,
-            speaker: "Laura".into(),
-        }];
-        let recognized = HashMap::from([((AudioSource::System, 2), "Laura".into())]);
-
-        assert!(correction_is_system_echo(&requests, &recognized, &[]));
-    }
-
-    #[test]
-    fn correction_echo_uses_hand_corrected_system_names() {
-        let requests = [CorrectionRequest {
-            source: AudioSource::Mic,
-            start_ms: 0,
-            end_ms: 0,
-            speaker: "Laura".into(),
-        }];
-        let corrections = [SpeakerCorrection {
-            source: AudioSource::System,
-            start_ms: 10,
-            end_ms: 20,
-            speaker: "Laura".into(),
-            inferred: false,
-        }];
-
-        assert!(correction_is_system_echo(
-            &requests,
-            &HashMap::new(),
-            &corrections
-        ));
     }
 
     #[test]
@@ -2877,7 +2802,7 @@ mod tests {
         );
         assert_eq!(
             allowed_candidate_names(&meeting, AudioSource::Mic),
-            Some(HashSet::from(["Bob".into(), "Laura".into()]))
+            Some(HashSet::from(["Laura".into()]))
         );
         let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
             name: "m".into(),
@@ -2951,7 +2876,7 @@ mod tests {
                 speaker: "SPEAKER_00".into(),
                 text: "hello".into(),
                 locked: false,
-                echo: None,
+                echo: false,
             }],
         );
         round_trip(
@@ -3963,7 +3888,7 @@ mod tests {
             speaker: "Bob".into(),
             text: "later".into(),
             locked: false,
-            echo: None,
+            echo: false,
         };
 
         let proposal =
@@ -4053,7 +3978,7 @@ mod tests {
             speaker: "Alice".into(),
             text: "line".into(),
             locked: true,
-            echo: None,
+            echo: false,
         };
 
         assert!(line_is_learned(&line, &chunks, &database));
@@ -4119,7 +4044,7 @@ mod tests {
     }
 
     #[test]
-    fn render_suppresses_leakage_without_changing_word_artifact() {
+    fn render_marks_leakage_without_changing_word_artifact() {
         let root = std::env::temp_dir().join(format!(
             "singstone-render-leakage-{}-{}",
             std::process::id(),
@@ -4168,6 +4093,8 @@ mod tests {
             }],
         )
         .expect("write diarization");
+        let legacy_detection = session.dir.join("leakage-suppressions.jsonl");
+        fs::write(&legacy_detection, b"old\n").expect("write legacy detection");
 
         run_render(RenderArgs {
             session: session.dir.clone(),
@@ -4181,13 +4108,16 @@ mod tests {
         let first_transcript = fs::read(session.transcript_path()).expect("read transcript");
         let transcript: Vec<Utterance> =
             jsonl::read_all(&session.transcript_path()).expect("parse transcript");
-        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript.len(), 3);
         assert_eq!(transcript[0].text, "yes");
-        assert_eq!(transcript[1].text, "we should release Friday");
-        let suppressions: Vec<serde_json::Value> =
-            jsonl::read_all(&session.leakage_suppressions_path()).expect("read suppressions");
-        assert_eq!(suppressions.len(), 1);
-        assert_eq!(suppressions[0]["suppressed_words"], 4);
+        assert!(!transcript[0].echo);
+        assert_eq!(transcript[2].text, "we should release Friday");
+        assert!(transcript[2].echo);
+        let detections: Vec<serde_json::Value> =
+            jsonl::read_all(&session.echo_detections_path()).expect("read detections");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0]["words"], 4);
+        assert!(!legacy_detection.exists());
 
         run_render(RenderArgs {
             session: session.dir.clone(),

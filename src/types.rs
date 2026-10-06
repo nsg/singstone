@@ -120,15 +120,6 @@ pub struct HiddenSources {
     pub hidden: Vec<AudioSource>,
 }
 
-/// One line of `transcript.jsonl`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EchoEvidence {
-    RemoteAttendee,
-    LocalRoster,
-    SystemTrackSpeaker,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Utterance {
     pub start_ms: u64,
@@ -139,12 +130,33 @@ pub struct Utterance {
     pub text: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub echo: Option<EchoEvidence>,
+    #[serde(
+        default,
+        skip_serializing_if = "is_false",
+        deserialize_with = "deserialize_echo"
+    )]
+    pub echo: bool,
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn deserialize_echo<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum EchoValue {
+        Bool(bool),
+        Legacy(String),
+    }
+
+    Ok(match EchoValue::deserialize(deserializer)? {
+        EchoValue::Bool(echo) => echo,
+        EchoValue::Legacy(_reason) => true,
+    })
 }
 
 /// One line of `screenshots.jsonl`.
@@ -230,4 +242,23 @@ pub struct Manifest {
     pub local_speaker: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot_dir: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_echo_reads_true_and_false_echo_is_omitted() {
+        let legacy = r#"{"start_ms":0,"end_ms":100,"source":"mic","speaker_id":"mic_0","speaker":"Alice","text":"hello","echo":"local_roster"}"#;
+        let utterance: Utterance = serde_json::from_str(legacy).expect("read legacy utterance");
+        assert!(utterance.echo);
+
+        let plain = Utterance {
+            echo: false,
+            ..utterance
+        };
+        let serialized = serde_json::to_value(plain).expect("serialize utterance");
+        assert!(serialized.get("echo").is_none());
+    }
 }

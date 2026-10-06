@@ -18,13 +18,17 @@ weights download on first use and remain in a persistent per-user cache.
 ## Application
 
 Browse processed meetings and review speaker-attributed transcripts from the
-session view. Confirm individual names so they stay locked across reprocessing,
-use quick speaker shortcuts on anonymous lines, or change a named line.
+session view. Microphone lines sit to the left of a shared timeline and system
+audio lines to the right; speech that overlaps shares a row. Loudspeaker sound
+picked up by the microphone stays visible, dimmed and marked **Echo**, beside
+the remote line it repeats. Confirm individual names so they stay locked across
+reprocessing, use quick speaker shortcuts on anonymous lines, or change a named
+line.
 Use **Hide microphone** or **Hide system** to leave that source out of
 both transcript files without deleting anything. Hiding the microphone is
 useful when you only listened and it recorded nothing but leaked speaker audio.
 
-![Processed transcript with confirmed speaker names and quick assignment controls](docs/images/transcript.png)
+![Processed transcript with microphone lines left of a timeline, system audio lines right of it, and dimmed echo lines](docs/images/transcript.png)
 
 Type a speaker name to filter learned voices and names already used in the
 meeting, then choose a suggestion or assign a new name.
@@ -61,8 +65,9 @@ preserving the recorded audio and confirmed names.
 - Automatically accelerates Whisper with Intel SYCL on a compatible Intel GPU,
   preferring Level Zero and retrying through OpenCL before using CPU.
 - Recognizes learned voices while leaving uncertain matches anonymous.
-- Uses per-meeting attendee details to guide speaker counts and recognition,
-  while audio matching marks loudspeaker sound picked up by the microphone.
+- Uses per-meeting attendee details to guide speaker counts and recognition.
+- Marks loudspeaker sound picked up by the microphone as echo by comparing the
+  two recordings, without deleting it.
 - Hides either audio source from a session's transcript without deleting it.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback, editable

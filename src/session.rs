@@ -137,6 +137,9 @@ impl Session {
     pub fn speaker_corrections_path(&self) -> PathBuf {
         self.dir.join("speaker-corrections.json")
     }
+    pub fn hidden_sources_path(&self) -> PathBuf {
+        self.dir.join("hidden-sources.json")
+    }
     pub fn meeting_path(&self) -> PathBuf {
         self.dir.join("meeting.json")
     }

@@ -114,6 +114,12 @@ pub struct SpeakerCorrections {
     pub corrections: Vec<SpeakerCorrection>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HiddenSources {
+    pub format_version: u32,
+    pub hidden: Vec<AudioSource>,
+}
+
 /// One line of `transcript.jsonl`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

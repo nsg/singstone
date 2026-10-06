@@ -15,9 +15,9 @@ use crate::speaker::embedding::{self, ClusterCandidate, EmbeddingExtractor};
 use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
-    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, Manifest, SAMPLE_RATE, SessionState,
-    SpeakerAssignment, SpeakerAssignmentProvenance, SpeakerAssignments, SpeakerCorrection,
-    SpeakerCorrections, SpeakerSegment, TimedWord, Utterance,
+    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, HiddenSources, Manifest, SAMPLE_RATE,
+    SessionState, SpeakerAssignment, SpeakerAssignmentProvenance, SpeakerAssignments,
+    SpeakerCorrection, SpeakerCorrections, SpeakerSegment, TimedWord, Utterance,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -32,6 +32,7 @@ const SPEAKER_ASSIGNMENTS_FORMAT_VERSION: u32 = 1;
 const STAGE_METADATA_FORMAT_VERSION: u32 = 1;
 const EMBEDDINGS_FORMAT_VERSION: u32 = 1;
 const SPEAKER_CORRECTIONS_FORMAT_VERSION: u32 = 1;
+const HIDDEN_SOURCES_FORMAT_VERSION: u32 = 1;
 const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
 const PROPOSAL_MARGIN: f32 = 0.05;
@@ -748,6 +749,34 @@ fn read_speaker_corrections(session: &Session) -> io::Result<SpeakerCorrections>
         ));
     }
     Ok(artifact)
+}
+
+/// The sources left out of the transcript; none when the session has no file.
+pub fn read_hidden_sources(session: &Session) -> io::Result<Vec<AudioSource>> {
+    let path = session.hidden_sources_path();
+    let artifact: HiddenSources = match read_json(&path) {
+        Ok(artifact) => artifact,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if artifact.format_version != HIDDEN_SOURCES_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported hidden sources format version {} in {}",
+                artifact.format_version,
+                path.display()
+            ),
+        ));
+    }
+    Ok(normalize_hidden_sources(&artifact.hidden))
+}
+
+fn normalize_hidden_sources(hidden: &[AudioSource]) -> Vec<AudioSource> {
+    [AudioSource::Mic, AudioSource::System]
+        .into_iter()
+        .filter(|source| hidden.contains(source))
+        .collect()
 }
 
 fn upsert_correction(
@@ -1727,6 +1756,7 @@ fn render_artifacts_with_segments_and_hook(
     warn_diarization_provenance(session, diarize_mic);
     let recognized = read_speaker_assignments(session)?;
     let corrections = read_speaker_corrections(session)?;
+    let hidden = read_hidden_sources(session)?;
     let audio = match AudioEnvelopes::read(
         &session.stored_audio_path(AudioSource::Mic),
         &session.stored_audio_path(AudioSource::System),
@@ -1741,7 +1771,7 @@ fn render_artifacts_with_segments_and_hook(
     };
     let leakage = leakage::suppress_leaked_mic_words(&words, audio.as_ref());
     let meeting = meeting::read_details(&session.meeting_path())?;
-    let utterances = utterances::build_utterances(
+    let all_utterances = utterances::build_utterances(
         &leakage.words,
         &segments,
         &recognized,
@@ -1751,6 +1781,12 @@ fn render_artifacts_with_segments_and_hook(
         DEFAULT_NEAREST_TOLERANCE_MS,
         meeting.as_ref(),
     );
+    let all_utterance_count = all_utterances.len();
+    let utterances = all_utterances
+        .into_iter()
+        .filter(|utterance| !hidden.contains(&utterance.source))
+        .collect::<Vec<_>>();
+    let hidden_utterances = all_utterance_count - utterances.len();
     before_write();
     jsonl::write_all_atomic(&session.leakage_suppressions_path(), &leakage.suppressions)?;
     jsonl::write_all_atomic(&session.transcript_path(), &utterances)?;
@@ -1764,8 +1800,18 @@ fn render_artifacts_with_segments_and_hook(
         .iter()
         .filter(|utterance| utterance.echo.is_some())
         .count();
+    let hidden_summary = if hidden.is_empty() {
+        String::new()
+    } else {
+        let sources = hidden
+            .iter()
+            .map(|source| source.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(", hid {hidden_utterances} utterance(s) of hidden sources ({sources})")
+    };
     eprintln!(
-        "merge: {} utterance(s), {} echo utterance(s), suppressed {} leaked microphone word(s) in {} region(s), in {:.1} s",
+        "merge: {} utterance(s), {} echo utterance(s), suppressed {} leaked microphone word(s) in {} region(s), in {:.1} s{hidden_summary}",
         utterances.len(),
         echo_utterances,
         suppressed_words,
@@ -2943,6 +2989,55 @@ mod tests {
         session
     }
 
+    fn hidden_sources_fixture(label: &str) -> (PathBuf, Session) {
+        let root = std::env::temp_dir().join(format!(
+            "singstone-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let session = empty_session(&root);
+        jsonl::write_all_atomic(
+            &session.words_path(),
+            &[
+                TimedWord {
+                    source: AudioSource::Mic,
+                    start_ms: 100,
+                    end_ms: 300,
+                    text: "microphone".into(),
+                },
+                TimedWord {
+                    source: AudioSource::System,
+                    start_ms: 1_000,
+                    end_ms: 1_300,
+                    text: "system".into(),
+                },
+            ],
+        )
+        .expect("write words");
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[
+                SpeakerSegment {
+                    source: AudioSource::Mic,
+                    start_ms: 0,
+                    end_ms: 500,
+                    cluster: 7,
+                },
+                SpeakerSegment {
+                    source: AudioSource::System,
+                    start_ms: 900,
+                    end_ms: 1_500,
+                    cluster: 3,
+                },
+            ],
+        )
+        .expect("write diarization");
+        (root, session)
+    }
+
     fn embedding_cache_fixture(
         label: &str,
     ) -> (
@@ -4075,6 +4170,73 @@ mod tests {
         assert_eq!(
             fs::read(session.transcript_path()).expect("reread transcript"),
             first_transcript
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn render_omits_hidden_mic_utterances_only_from_transcripts() {
+        let (root, session) = hidden_sources_fixture("render-hidden-mic");
+        let original_words = fs::read(session.words_path()).expect("read words");
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect("render all sources");
+        let all: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read full transcript");
+        let expected_system = all
+            .into_iter()
+            .filter(|utterance| utterance.source == AudioSource::System)
+            .collect::<Vec<_>>();
+        write_json_atomic(
+            &session.hidden_sources_path(),
+            &HiddenSources {
+                format_version: HIDDEN_SOURCES_FORMAT_VERSION,
+                hidden: vec![AudioSource::Mic],
+            },
+        )
+        .expect("write hidden sources");
+
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect("render hidden microphone");
+
+        let visible: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read filtered transcript");
+        assert_eq!(visible, expected_system);
+        let text =
+            fs::read_to_string(session.transcript_text_path()).expect("read transcript text");
+        assert!(text.contains("system"));
+        assert!(!text.contains("microphone"));
+        assert_eq!(
+            fs::read(session.words_path()).expect("reread words"),
+            original_words
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn unsupported_hidden_sources_version_fails_render_with_path() {
+        let (root, session) = hidden_sources_fixture("hidden-sources-version");
+        let path = session.hidden_sources_path();
+        fs::write(&path, br#"{"format_version":999,"hidden":[]}"#)
+            .expect("write unsupported hidden sources");
+
+        let error = run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect_err("unsupported version fails render");
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "unsupported hidden sources format version 999 in {}",
+                path.display()
+            )
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }

@@ -1,4 +1,5 @@
 mod config;
+mod queue;
 mod remote;
 mod timeline_layout;
 mod wrap_layout;
@@ -29,6 +30,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use self::config::GuiConfig;
+use self::queue::{
+    JobState, Outcome as QueueOutcome, ProcessingQueue, finished_banner_text, ordinal,
+};
 use self::timeline_layout::{TimelineLayout, TimelineRow, timeline_rows};
 use self::wrap_layout::WrapLayout;
 
@@ -45,6 +49,8 @@ const CSS: &str = r#"
 .pill-ok { color: @success_fg_color; background: @success_bg_color; }
 .pill-idle { color: @accent_fg_color; background: @accent_bg_color; }
 .pill-busy { color: @warning_fg_color; background: @warning_bg_color; }
+.pill-queued { color: @window_fg_color; background: alpha(currentColor, 0.15); }
+.pill-failed { color: @error_fg_color; background: @error_bg_color; }
 .pill-archived { color: white; background: @purple_3; }
 .recording-dot { color: #e01b24; }
 .record-button { border-radius: 999px; padding-left: 12px; padding-right: 12px; font-weight: 600; }
@@ -63,6 +69,12 @@ const CSS: &str = r#"
 .transcript-card .pill { padding-left: 3px; padding-right: 3px; }
 .echo-row { opacity: 0.55; }
 .speaker-shortcut { border: 1px solid alpha(@accent_color, 0.28); border-radius: 999px; padding: 1px 7px; color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
+.queue-panel { border-top: 1px solid @borders; background: alpha(currentColor, 0.035); padding: 8px 10px 10px; }
+.queue-card { border: 1px solid @borders; border-radius: 10px; background: @card_bg_color; padding: 8px; }
+.queue-progress-hint { border-radius: 10px; color: @accent_color; background: alpha(@accent_bg_color, 0.16); padding: 10px; }
+.queue-compact-progress { min-height: 3px; }
+.queue-entry-button { padding: 0; font-weight: normal; }
+.queue-entry-button.heading { font-weight: bold; }
 "#;
 
 #[derive(Clone)]
@@ -119,14 +131,453 @@ struct SessionDetail {
     hide_mic: gtk::ToggleButton,
     hide_system: gtk::ToggleButton,
     loading_hidden_sources: Rc<Cell<bool>>,
+    body_stack: gtk::Stack,
     transcript_panes: gtk::Box,
     transcript: gtk::Box,
+    empty_state: Rc<RefCell<Option<gtk::Label>>>,
     screenshots: gtk::FlowBox,
     metadata: gtk::Box,
     files: gtk::Box,
     selected: Rc<RefCell<Option<PathBuf>>>,
     playback: PlaybackController,
     window: adw::ApplicationWindow,
+    queue: Rc<RefCell<ProcessingQueue>>,
+    cancel_requested: Rc<Cell<bool>>,
+    busy: Rc<Cell<bool>>,
+    processing: ProcessingView,
+}
+
+#[derive(Clone)]
+struct ProcessingView {
+    root: gtk::Box,
+    label: gtk::Label,
+    progress: gtk::ProgressBar,
+    stages: Vec<gtk::Label>,
+    metrics: gtk::Box,
+    throughput: gtk::Label,
+    throughput_detail: gtk::Label,
+}
+
+#[derive(Clone)]
+enum QueuePanelAction {
+    Select(PathBuf),
+    Cancel,
+    Remove(PathBuf),
+    Retry(PathBuf),
+    Details(String),
+    Clear,
+}
+
+#[derive(Clone)]
+struct QueuePanelProgress {
+    stage: gtk::Label,
+    bar: gtk::ProgressBar,
+    step: gtk::Label,
+    percent: gtk::Label,
+    cancel: gtk::Button,
+    compact_bar: gtk::ProgressBar,
+    compact_status: gtk::Label,
+}
+
+type QueuePanelHandler = Rc<dyn Fn(QueuePanelAction)>;
+
+#[derive(Clone)]
+struct QueuePanel {
+    root: gtk::Box,
+    expanded: gtk::Box,
+    collapsed: gtk::Box,
+    is_collapsed: Rc<Cell<bool>>,
+    progress: Rc<RefCell<Option<QueuePanelProgress>>>,
+    handler: Rc<RefCell<Option<QueuePanelHandler>>>,
+}
+
+impl QueuePanel {
+    fn new() -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("queue-panel");
+        root.set_visible(false);
+        let expanded = gtk::Box::new(gtk::Orientation::Vertical, 7);
+        let collapsed = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        collapsed.set_visible(false);
+        root.append(&expanded);
+        root.append(&collapsed);
+        Self {
+            root,
+            expanded,
+            collapsed,
+            is_collapsed: Rc::new(Cell::new(false)),
+            progress: Rc::new(RefCell::new(None)),
+            handler: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn set_handler(&self, handler: QueuePanelHandler) {
+        *self.handler.borrow_mut() = Some(handler);
+    }
+
+    fn emit(&self, action: QueuePanelAction) {
+        if let Some(handler) = self.handler.borrow().as_ref() {
+            handler(action);
+        }
+    }
+
+    fn toggle(&self) {
+        self.is_collapsed.set(!self.is_collapsed.get());
+        self.expanded.set_visible(!self.is_collapsed.get());
+        self.collapsed.set_visible(self.is_collapsed.get());
+    }
+
+    fn render(&self, queue: &ProcessingQueue, recording_held: bool, cancelled: bool) {
+        clear_box(&self.expanded);
+        clear_box(&self.collapsed);
+        *self.progress.borrow_mut() = None;
+        let visible = !queue.is_idle() || !queue.failed().is_empty();
+        self.root.set_visible(visible);
+        if queue.is_idle() {
+            self.is_collapsed.set(false);
+        }
+        if !visible {
+            return;
+        }
+
+        if queue.is_idle() {
+            self.expanded.set_visible(true);
+            self.collapsed.set_visible(false);
+            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let titles = gtk::Box::new(gtk::Orientation::Vertical, 1);
+            titles.set_hexpand(true);
+            let title = gtk::Label::new(Some("Queue finished"));
+            title.set_xalign(0.0);
+            title.add_css_class("heading");
+            titles.append(&title);
+            let summary = gtk::Label::new(Some(&format!(
+                "{} processed · {} failed",
+                queue.processed_count(),
+                queue.failed().len()
+            )));
+            summary.set_xalign(0.0);
+            summary.add_css_class("dim-label");
+            summary.add_css_class("caption");
+            titles.append(&summary);
+            header.append(&titles);
+            let clear = gtk::Button::with_label("Clear");
+            clear.add_css_class("flat");
+            let panel = self.clone();
+            clear.connect_clicked(move |_| panel.emit(QueuePanelAction::Clear));
+            header.append(&clear);
+            self.expanded.append(&header);
+        } else {
+            let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let title = gtk::Label::new(Some("Processing queue"));
+            title.set_xalign(0.0);
+            title.set_hexpand(true);
+            title.add_css_class("heading");
+            header.append(&title);
+            if let Some((position, total)) = queue.batch_position_total() {
+                let count = gtk::Label::new(Some(&format!("{position} of {total}")));
+                count.add_css_class("dim-label");
+                count.add_css_class("caption");
+                header.append(&count);
+            }
+            let collapse = gtk::Button::from_icon_name("pan-down-symbolic");
+            collapse.add_css_class("flat");
+            collapse.set_tooltip_text(Some("Collapse processing queue"));
+            let panel = self.clone();
+            collapse.connect_clicked(move |_| panel.toggle());
+            header.append(&collapse);
+            self.expanded.append(&header);
+        }
+
+        let mut dynamic = None;
+        if let Some(path) = queue.running() {
+            let (title, _) = session_panel_info(path);
+            let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
+            card.add_css_class("queue-card");
+            let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let spinner = gtk::Spinner::new();
+            spinner.set_spinning(true);
+            top.append(&spinner);
+            let select = queue_entry_button(&title, true);
+            select.add_css_class("flat");
+            select.add_css_class("queue-entry-button");
+            select.add_css_class("heading");
+            select.set_hexpand(true);
+            select.set_halign(gtk::Align::Fill);
+            let panel = self.clone();
+            let select_path = path.to_owned();
+            select.connect_clicked(move |_| {
+                panel.emit(QueuePanelAction::Select(select_path.clone()))
+            });
+            top.append(&select);
+            let cancel = gtk::Button::from_icon_name("window-close-symbolic");
+            cancel.add_css_class("flat");
+            cancel.set_tooltip_text(Some("Cancel processing"));
+            cancel.set_sensitive(!cancelled);
+            let panel = self.clone();
+            cancel.connect_clicked(move |_| panel.emit(QueuePanelAction::Cancel));
+            top.append(&cancel);
+            card.append(&top);
+            let stage = gtk::Label::new(Some(if cancelled {
+                "Cancelling…"
+            } else {
+                ProcessingStage::Preparing.label()
+            }));
+            stage.set_xalign(0.0);
+            stage.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            card.append(&stage);
+            let bar = gtk::ProgressBar::new();
+            bar.set_pulse_step(0.04);
+            card.append(&bar);
+            let caption = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            let step = gtk::Label::new(Some("Step 1 of 7"));
+            step.set_xalign(0.0);
+            step.set_hexpand(true);
+            step.add_css_class("dim-label");
+            step.add_css_class("caption");
+            caption.append(&step);
+            let percent = gtk::Label::new(None);
+            percent.add_css_class("dim-label");
+            percent.add_css_class("caption");
+            caption.append(&percent);
+            card.append(&caption);
+            self.expanded.append(&card);
+
+            let compact_bar = gtk::ProgressBar::new();
+            compact_bar.add_css_class("queue-compact-progress");
+            compact_bar.add_css_class("osd");
+            compact_bar.set_pulse_step(0.04);
+            self.collapsed.append(&compact_bar);
+            let compact = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let spinner = gtk::Spinner::new();
+            spinner.set_spinning(true);
+            compact.append(&spinner);
+            let select = queue_entry_button(&title, true);
+            select.add_css_class("flat");
+            select.add_css_class("queue-entry-button");
+            select.add_css_class("heading");
+            select.set_hexpand(true);
+            let panel = self.clone();
+            let select_path = path.to_owned();
+            select.connect_clicked(move |_| {
+                panel.emit(QueuePanelAction::Select(select_path.clone()))
+            });
+            compact.append(&select);
+            let compact_status = gtk::Label::new(None);
+            compact_status.add_css_class("dim-label");
+            compact_status.add_css_class("caption");
+            compact.append(&compact_status);
+            let expand = gtk::Button::from_icon_name("pan-up-symbolic");
+            expand.add_css_class("flat");
+            expand.set_tooltip_text(Some("Expand processing queue"));
+            let panel = self.clone();
+            expand.connect_clicked(move |_| panel.toggle());
+            compact.append(&expand);
+            self.collapsed.append(&compact);
+            dynamic = Some(QueuePanelProgress {
+                stage,
+                bar,
+                step,
+                percent,
+                cancel,
+                compact_bar,
+                compact_status,
+            });
+        } else if recording_held && !queue.waiting().is_empty() {
+            let paused = gtk::Label::new(Some(
+                "Paused while recording. The next session starts when the recording stops.",
+            ));
+            paused.set_wrap(true);
+            paused.set_xalign(0.0);
+            paused.add_css_class("dim-label");
+            self.expanded.append(&paused);
+        }
+
+        if queue.running().is_none() && !queue.waiting().is_empty() {
+            let compact = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let status = gtk::Label::new(Some(if recording_held {
+                "Paused while recording"
+            } else {
+                "Starting next session…"
+            }));
+            status.set_xalign(0.0);
+            status.set_hexpand(true);
+            status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            status.add_css_class("heading");
+            compact.append(&status);
+            if let Some((position, total)) = queue.batch_position_total() {
+                let count = gtk::Label::new(Some(&format!("{position} of {total}")));
+                count.add_css_class("dim-label");
+                count.add_css_class("caption");
+                compact.append(&count);
+            }
+            let expand = gtk::Button::from_icon_name("pan-up-symbolic");
+            expand.add_css_class("flat");
+            expand.set_tooltip_text(Some("Expand processing queue"));
+            let panel = self.clone();
+            expand.connect_clicked(move |_| panel.toggle());
+            compact.append(&expand);
+            self.collapsed.append(&compact);
+        }
+
+        let entries = gtk::Box::new(gtk::Orientation::Vertical, 7);
+        let first_position = if queue.running().is_some() { 2 } else { 1 };
+        for (index, path) in queue.waiting().iter().enumerate() {
+            let (title, duration) = session_panel_info(path);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let position = gtk::Label::new(Some(&(first_position + index).to_string()));
+            position.add_css_class("dim-label");
+            position.add_css_class("caption");
+            row.append(&position);
+            let select = queue_entry_button(&title, false);
+            select.add_css_class("flat");
+            select.add_css_class("queue-entry-button");
+            select.set_hexpand(true);
+            select.set_halign(gtk::Align::Fill);
+            let panel = self.clone();
+            let select_path = path.clone();
+            select.connect_clicked(move |_| {
+                panel.emit(QueuePanelAction::Select(select_path.clone()))
+            });
+            row.append(&select);
+            let duration = gtk::Label::new(Some(&duration));
+            duration.add_css_class("dim-label");
+            duration.add_css_class("caption");
+            row.append(&duration);
+            let remove = gtk::Button::from_icon_name("window-close-symbolic");
+            remove.add_css_class("flat");
+            remove.set_tooltip_text(Some("Remove from queue"));
+            let panel = self.clone();
+            let remove_path = path.clone();
+            remove.connect_clicked(move |_| {
+                panel.emit(QueuePanelAction::Remove(remove_path.clone()))
+            });
+            row.append(&remove);
+            entries.append(&row);
+        }
+
+        for failed in queue.failed() {
+            let (title, _) = session_panel_info(&failed.path);
+            let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            card.add_css_class("queue-card");
+            let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            top.append(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
+            let select = queue_entry_button(&title, true);
+            select.add_css_class("flat");
+            select.add_css_class("queue-entry-button");
+            select.add_css_class("heading");
+            select.set_hexpand(true);
+            let panel = self.clone();
+            let select_path = failed.path.clone();
+            select.connect_clicked(move |_| {
+                panel.emit(QueuePanelAction::Select(select_path.clone()))
+            });
+            top.append(&select);
+            let retry = gtk::Button::with_label("Retry");
+            let panel = self.clone();
+            let retry_path = failed.path.clone();
+            retry.connect_clicked(move |_| panel.emit(QueuePanelAction::Retry(retry_path.clone())));
+            top.append(&retry);
+            card.append(&top);
+            let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            let message = gtk::Label::new(Some("Processing failed."));
+            message.add_css_class("dim-label");
+            message.set_hexpand(true);
+            message.set_xalign(0.0);
+            bottom.append(&message);
+            let details = gtk::Button::with_label("Details…");
+            details.add_css_class("flat");
+            details.add_css_class("link");
+            let panel = self.clone();
+            let error = failed.error.clone();
+            details.connect_clicked(move |_| panel.emit(QueuePanelAction::Details(error.clone())));
+            bottom.append(&details);
+            card.append(&bottom);
+            entries.append(&card);
+        }
+        if entries.first_child().is_some() {
+            // A long queue scrolls instead of growing the window.
+            let scroll = gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .propagate_natural_height(true)
+                .max_content_height(170)
+                .child(&entries)
+                .build();
+            self.expanded.append(&scroll);
+        }
+
+        *self.progress.borrow_mut() = dynamic;
+        self.expanded.set_visible(!self.is_collapsed.get());
+        self.collapsed
+            .set_visible(self.is_collapsed.get() && !queue.is_idle());
+    }
+
+    fn update_progress(
+        &self,
+        update: ProcessingProgress,
+        metrics: Option<TranscriptionProgress>,
+        cancelled: bool,
+        position_total: Option<(usize, usize)>,
+    ) {
+        let Some(widgets) = self.progress.borrow().as_ref().cloned() else {
+            return;
+        };
+        widgets.cancel.set_sensitive(!cancelled);
+        widgets.stage.set_label(if cancelled {
+            "Cancelling…"
+        } else {
+            update.stage.label()
+        });
+        let step = (update.stage.index() + 1).min(7);
+        let speed = metrics.map(|metrics| format!(" · {:.2}× realtime", metrics.realtime_speed()));
+        widgets.step.set_label(&format!(
+            "Step {step} of 7{}",
+            speed.as_deref().unwrap_or("")
+        ));
+        let fraction = metrics
+            .map(TranscriptionProgress::fraction)
+            .or(update.fraction);
+        if let Some(fraction) = fraction {
+            widgets.bar.set_fraction(fraction);
+            widgets.compact_bar.set_fraction(fraction);
+            widgets
+                .percent
+                .set_label(&format!("{:.0}%", fraction * 100.0));
+        } else {
+            widgets.bar.pulse();
+            widgets.compact_bar.pulse();
+            widgets.percent.set_label("");
+        }
+        let mut status = position_total
+            .map(|(position, total)| format!("{position} of {total}"))
+            .unwrap_or_default();
+        if let Some(fraction) = fraction {
+            status.push_str(&format!(" · {:.0}%", fraction * 100.0));
+        }
+        widgets.compact_status.set_label(&status);
+    }
+}
+
+fn session_panel_info(path: &Path) -> (String, String) {
+    let Ok(session) = Session::open(path) else {
+        return (session_title(path), String::new());
+    };
+    let title = session_display_title(&session, path);
+    let duration = session
+        .read_manifest()
+        .map(|manifest| format_duration(session_duration_ms(&session, &manifest)))
+        .unwrap_or_default();
+    (title, duration)
+}
+
+fn queue_entry_button(title: &str, heading: bool) -> gtk::Button {
+    let label = gtk::Label::new(Some(title));
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    if heading {
+        label.add_css_class("heading");
+    }
+    gtk::Button::builder().child(&label).build()
 }
 
 pub fn run() -> ExitCode {
@@ -219,6 +670,9 @@ fn build_window(app: &adw::Application) {
     toolbar.add_top_bar(&banner);
 
     let session_paths = Rc::new(RefCell::new(Vec::<PathBuf>::new()));
+    let processing_queue = Rc::new(RefCell::new(ProcessingQueue::default()));
+    let cancel_requested = Rc::new(Cell::new(false));
+    let foreground_busy = Rc::new(Cell::new(false));
     let session_list = gtk::ListBox::new();
     session_list.add_css_class("navigation-sidebar");
     session_list.set_selection_mode(gtk::SelectionMode::Single);
@@ -229,9 +683,15 @@ fn build_window(app: &adw::Application) {
         .margin_start(10)
         .margin_end(10)
         .build();
-    let sidebar = build_sidebar(&search, &session_list);
+    let queue_panel = QueuePanel::new();
+    let sidebar = build_sidebar(&search, &session_list, &queue_panel);
 
-    let detail = build_session_detail(&window);
+    let detail = build_session_detail(
+        &window,
+        &processing_queue,
+        &cancel_requested,
+        &foreground_busy,
+    );
     let recording_page = build_recording_page(&config.borrow());
     let speakers_page = build_speakers_page(&window);
     let settings_page = build_settings_page(&config.borrow());
@@ -292,6 +752,7 @@ fn build_window(app: &adw::Application) {
         &session_paths,
         &detail,
         &stack,
+        &processing_queue,
     );
     let recorder_connection = app.dbus_connection();
     let recorder_handlers = wire_recording(
@@ -309,8 +770,10 @@ fn build_window(app: &adw::Application) {
         &stack,
         &close_when_recording_stops,
         recorder_connection.clone(),
+        &processing_queue,
     );
-    wire_processing(
+    let queue_controller = wire_processing(
+        app,
         &window,
         &detail,
         &banner,
@@ -318,6 +781,11 @@ fn build_window(app: &adw::Application) {
         &session_list,
         &session_paths,
         &search,
+        &processing_queue,
+        &queue_panel,
+        &stack,
+        &recording_page.job,
+        &foreground_busy,
     );
     wire_session_actions(
         &window,
@@ -327,6 +795,8 @@ fn build_window(app: &adw::Application) {
         &session_paths,
         &search,
         &recording_page.job,
+        &processing_queue,
+        &queue_controller,
     );
     wire_settings(
         &window,
@@ -336,6 +806,7 @@ fn build_window(app: &adw::Application) {
         &session_list,
         &session_paths,
         &search,
+        &processing_queue,
     );
 
     let window_for_about = window.clone();
@@ -391,7 +862,50 @@ fn build_window(app: &adw::Application) {
     let playback_on_close = detail.playback.clone();
     let stop_on_close = recording_page.job.clone();
     let close_after_stop = close_when_recording_stops.clone();
+    let quitting_confirmed = Rc::new(Cell::new(false));
+    let quitting_confirmed_for_close = quitting_confirmed.clone();
+    let quit_dialog_open = Rc::new(Cell::new(false));
+    let quit_dialog_open_for_close = quit_dialog_open.clone();
+    let controller_on_close = queue_controller.clone();
+    let window_on_close = window.clone();
     window.connect_close_request(move |_| {
+        let outstanding = controller_on_close.queue.borrow().outstanding_count();
+        if outstanding > 0 && !quitting_confirmed_for_close.get() {
+            if quit_dialog_open_for_close.get() {
+                return glib::Propagation::Stop;
+            }
+            quit_dialog_open_for_close.set(true);
+            let verb = if outstanding == 1 { "is" } else { "are" };
+            let noun = if outstanding == 1 {
+                "session"
+            } else {
+                "sessions"
+            };
+            let dialog = adw::AlertDialog::new(
+                Some("Quit while processing?"),
+                Some(&format!(
+                    "{outstanding} {noun} {verb} still in the processing queue. Quitting stops the one in progress. Recorded audio is kept, and unfinished sessions can be processed again later."
+                )),
+            );
+            dialog.add_responses(&[("keep", "Keep running"), ("quit", "Quit")]);
+            dialog.set_default_response(Some("keep"));
+            dialog.set_close_response("keep");
+            dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
+            let quitting_confirmed = quitting_confirmed_for_close.clone();
+            let quit_dialog_open = quit_dialog_open_for_close.clone();
+            let controller = controller_on_close.clone();
+            let window = window_on_close.clone();
+            dialog.connect_response(None, move |_, response| {
+                quit_dialog_open.set(false);
+                if response == "quit" {
+                    quitting_confirmed.set(true);
+                    controller.stop_for_quit();
+                    window.close();
+                }
+            });
+            dialog.present(Some(&window_on_close));
+            return glib::Propagation::Stop;
+        }
         playback_on_close.stop();
         if let Some(job) = stop_on_close.borrow().as_ref() {
             job.stop.store(true, Ordering::Release);
@@ -440,7 +954,11 @@ fn install_css() {
     }
 }
 
-fn build_sidebar(search: &gtk::SearchEntry, list: &gtk::ListBox) -> gtk::Box {
+fn build_sidebar(
+    search: &gtk::SearchEntry,
+    list: &gtk::ListBox,
+    queue_panel: &QueuePanel,
+) -> gtk::Box {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let title = gtk::Label::new(Some("Sessions"));
     title.add_css_class("title-4");
@@ -453,6 +971,7 @@ fn build_sidebar(search: &gtk::SearchEntry, list: &gtk::ListBox) -> gtk::Box {
         .child(list)
         .build();
     root.append(&scroll);
+    root.append(&queue_panel.root);
     root
 }
 
@@ -699,7 +1218,12 @@ fn meter_group(name: &str) -> gtk::Box {
     group
 }
 
-fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
+fn build_session_detail(
+    window: &adw::ApplicationWindow,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+    cancel_requested: &Rc<Cell<bool>>,
+    busy: &Rc<Cell<bool>>,
+) -> SessionDetail {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let heading = gtk::Box::new(gtk::Orientation::Vertical, 4);
     heading.set_margin_top(18);
@@ -785,13 +1309,22 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
     transcript_panes.set_visible(false);
     transcript_frame.append(&transcript_panes);
     let transcript = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    transcript_frame.append(
-        &gtk::ScrolledWindow::builder()
-            .vexpand(true)
-            .child(&transcript)
-            .build(),
-    );
-    paned.set_start_child(Some(&transcript_frame));
+    let transcript_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .child(&transcript)
+        .build();
+    transcript_frame.append(&transcript_scroll);
+    let processing = processing_view(&backend::current());
+    let processing_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&processing.root)
+        .build();
+    let body_stack = gtk::Stack::new();
+    body_stack.set_vhomogeneous(false);
+    body_stack.add_named(&transcript_frame, Some("transcript"));
+    body_stack.add_named(&processing_scroll, Some("processing"));
+    body_stack.set_visible_child_name("transcript");
+    paned.set_start_child(Some(&body_stack));
     let side = gtk::Box::new(gtk::Orientation::Vertical, 14);
     side.set_margin_top(12);
     side.set_margin_bottom(12);
@@ -842,14 +1375,20 @@ fn build_session_detail(window: &adw::ApplicationWindow) -> SessionDetail {
         hide_mic,
         hide_system,
         loading_hidden_sources: Rc::new(Cell::new(false)),
+        body_stack,
         transcript_panes,
         transcript,
+        empty_state: Rc::new(RefCell::new(None)),
         screenshots,
         metadata,
         files,
         selected: Rc::new(RefCell::new(None)),
         playback: PlaybackController::default(),
         window: window.clone(),
+        queue: queue.clone(),
+        cancel_requested: cancel_requested.clone(),
+        busy: busy.clone(),
+        processing,
     };
     for button in [&detail.hide_mic, &detail.hide_system] {
         let detail_for_toggle = detail.clone();
@@ -1147,6 +1686,7 @@ fn wire_settings(
     sessions: &gtk::ListBox,
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     search: &gtk::SearchEntry,
+    queue: &Rc<RefCell<ProcessingQueue>>,
 ) {
     let parent = window.clone();
     let config_for_meetings = config.clone();
@@ -1155,6 +1695,7 @@ fn wire_settings(
     let sessions_for_meetings = sessions.clone();
     let paths_for_meetings = paths.clone();
     let search_for_meetings = search.clone();
+    let queue_for_meetings = queue.clone();
     page.meetings_change.connect_clicked(move |_| {
         let chooser = gtk::FileDialog::builder()
             .title("Choose meetings folder")
@@ -1168,6 +1709,7 @@ fn wire_settings(
         let sessions = sessions_for_meetings.clone();
         let paths = paths_for_meetings.clone();
         let search = search_for_meetings.clone();
+        let queue = queue_for_meetings.clone();
         let parent_for_result = parent.clone();
         chooser.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
             let Ok(folder) = result else { return };
@@ -1188,7 +1730,7 @@ fn wire_settings(
             *config.borrow_mut() = updated;
             row.set_subtitle(&path.display().to_string());
             hint.set_label(&format!("Creates a new session in {}", path.display()));
-            populate_sessions(&sessions, &paths, &path, &search.text());
+            populate_sessions(&sessions, &paths, &path, &search.text(), &queue);
             if let Some(first) = sessions.row_at_index(0) {
                 sessions.select_row(Some(&first));
             }
@@ -1313,6 +1855,7 @@ fn wire_settings(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire_session_browser(
     window: &adw::ApplicationWindow,
     config: &Rc<RefCell<GuiConfig>>,
@@ -1321,17 +1864,20 @@ fn wire_session_browser(
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     detail: &SessionDetail,
     stack: &adw::ViewStack,
+    queue: &Rc<RefCell<ProcessingQueue>>,
 ) {
-    populate_sessions(list, paths, &config.borrow().meetings_dir, "");
+    populate_sessions(list, paths, &config.borrow().meetings_dir, "", queue);
     let list_for_search = list.clone();
     let paths_for_search = paths.clone();
     let config_for_search = config.clone();
+    let queue_for_search = queue.clone();
     search.connect_search_changed(move |entry| {
         populate_sessions(
             &list_for_search,
             &paths_for_search,
             &config_for_search.borrow().meetings_dir,
             &entry.text(),
+            &queue_for_search,
         );
     });
 
@@ -1368,6 +1914,46 @@ fn select_session_row(list: &gtk::ListBox, index: usize) {
     }
 }
 
+fn session_row_labels(row: &gtk::ListBoxRow) -> Option<(gtk::Label, gtk::Label)> {
+    let body = row.child()?.downcast::<gtk::Box>().ok()?;
+    let top = body.first_child()?.downcast::<gtk::Box>().ok()?;
+    let title = top.first_child()?.downcast::<gtk::Label>().ok()?;
+    let status = top.last_child()?.downcast::<gtk::Label>().ok()?;
+    Some((title, status))
+}
+
+fn update_session_row(
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    path: &Path,
+    queue: &ProcessingQueue,
+) {
+    let Some(index) = paths
+        .borrow()
+        .iter()
+        .position(|candidate| candidate == path)
+    else {
+        return;
+    };
+    let Some(row) = i32::try_from(index)
+        .ok()
+        .and_then(|index| list.row_at_index(index))
+    else {
+        return;
+    };
+    let Some((title, status)) = session_row_labels(&row) else {
+        return;
+    };
+    let (text, class) = session_path_status(path, queue);
+    set_status(&status, text, class);
+    if let Ok(session) = Session::open(path)
+        && session.read_manifest().is_ok()
+    {
+        title.set_label(&session_display_title(&session, path));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn wire_session_actions(
     window: &adw::ApplicationWindow,
     detail: &SessionDetail,
@@ -1376,6 +1962,8 @@ fn wire_session_actions(
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     search: &gtk::SearchEntry,
     job: &Rc<RefCell<Option<RecordingJob>>>,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+    controller: &Rc<QueueController>,
 ) {
     let parent = window.clone();
     let detail_for_rename = detail.clone();
@@ -1383,6 +1971,8 @@ fn wire_session_actions(
     let list_for_rename = list.clone();
     let paths_for_rename = paths.clone();
     let search_for_rename = search.clone();
+    let queue_for_rename = queue.clone();
+    let controller_for_rename = controller.clone();
     detail.rename_button.connect_clicked(move |_| {
         let Some(session_path) = detail_for_rename.selected.borrow().clone() else {
             return;
@@ -1417,6 +2007,8 @@ fn wire_session_actions(
         let list = list_for_rename.clone();
         let paths = paths_for_rename.clone();
         let search = search_for_rename.clone();
+        let queue = queue_for_rename.clone();
+        let controller = controller_for_rename.clone();
         dialog.connect_response(Some("rename"), move |_, _| {
             if let Err(error) = Session::open(&session_path)
                 .and_then(|session| meeting::set_title(&session.meeting_path(), &entry.text()))
@@ -1428,7 +2020,13 @@ fn wire_session_actions(
                 );
                 return;
             }
-            populate_sessions(&list, &paths, &config.borrow().meetings_dir, &search.text());
+            populate_sessions(
+                &list,
+                &paths,
+                &config.borrow().meetings_dir,
+                &search.text(),
+                &queue,
+            );
             let index = paths.borrow().iter().position(|path| *path == session_path);
             match index {
                 Some(index) => select_session_row(&list, index),
@@ -1437,6 +2035,7 @@ fn wire_session_actions(
                     let _ = detail.load(&session_path);
                 }
             }
+            controller.render_panel_if_visible();
         });
         dialog.present(Some(&parent));
     });
@@ -1448,6 +2047,7 @@ fn wire_session_actions(
     let paths_for_delete = paths.clone();
     let search_for_delete = search.clone();
     let job = job.clone();
+    let queue_for_delete = queue.clone();
     detail.delete_button.connect_clicked(move |_| {
         let Some(session_path) = detail_for_delete.selected.borrow().clone() else {
             return;
@@ -1481,6 +2081,7 @@ fn wire_session_actions(
         let list = list_for_delete.clone();
         let paths = paths_for_delete.clone();
         let search = search_for_delete.clone();
+        let queue = queue_for_delete.clone();
         dialog.connect_response(Some("delete"), move |_, _| {
             detail.playback.stop();
             let index = paths.borrow().iter().position(|path| *path == session_path);
@@ -1492,7 +2093,13 @@ fn wire_session_actions(
                 );
                 return;
             }
-            populate_sessions(&list, &paths, &config.borrow().meetings_dir, &search.text());
+            populate_sessions(
+                &list,
+                &paths,
+                &config.borrow().meetings_dir,
+                &search.text(),
+                &queue,
+            );
             let remaining = paths.borrow().len();
             if remaining == 0 {
                 detail.clear();
@@ -1520,6 +2127,7 @@ fn wire_recording(
     stack: &adw::ViewStack,
     close_when_stopped: &Rc<Cell<bool>>,
     recorder_connection: Option<gio::DBusConnection>,
+    queue: &Rc<RefCell<ProcessingQueue>>,
 ) -> remote::RecorderHandlers {
     let job_for_stop = page.job.clone();
     let button_for_stop = page.button.clone();
@@ -1677,6 +2285,7 @@ fn wire_recording(
     let stack_for_poll = stack.clone();
     let close_when_stopped = close_when_stopped.clone();
     let connection_for_poll = recorder_connection.clone();
+    let queue_for_poll = queue.clone();
     glib::timeout_add_local(Duration::from_millis(200), move || {
         let (completed, status) = {
             let jobs = job_for_poll.borrow();
@@ -1711,7 +2320,9 @@ fn wire_recording(
         }
         if close_when_stopped.replace(false) {
             window_for_poll.close();
-            return glib::ControlFlow::Break;
+            if !window_for_poll.is_visible() {
+                return glib::ControlFlow::Break;
+            }
         }
         button_for_poll.set_label("Start recording");
         button_for_poll.remove_css_class("destructive-action");
@@ -1736,6 +2347,7 @@ fn wire_recording(
             &paths_for_poll,
             &config_for_poll.borrow().meetings_dir,
             &search_for_poll.text(),
+            &queue_for_poll,
         );
         match result {
             Ok(path) => {
@@ -2055,106 +2667,255 @@ fn meeting_prefill(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn wire_processing(
-    window: &adw::ApplicationWindow,
-    detail: &SessionDetail,
-    banner: &adw::Banner,
-    config: &Rc<RefCell<GuiConfig>>,
-    list: &gtk::ListBox,
-    paths: &Rc<RefCell<Vec<PathBuf>>>,
-    search: &gtk::SearchEntry,
-) {
-    let busy = Rc::new(Cell::new(false));
-    wire_archiving(window, detail, banner, config, list, paths, search, &busy);
-    let confirmed_reprocess = Rc::new(Cell::new(false));
-    let confirmed_details = Rc::new(Cell::new(false));
-    let selected = detail.selected.clone();
-    let parent = window.clone();
-    let detail_for_done = detail.clone();
-    let banner_for_done = banner.clone();
-    let config_for_done = config.clone();
-    let list_for_done = list.clone();
-    let paths_for_done = paths.clone();
-    let search_for_done = search.clone();
-    let busy_for_process = busy.clone();
-    detail.process_button.connect_clicked(move |button| {
-        if busy_for_process.get() {
+struct RunningProcessing {
+    path: PathBuf,
+    progress: Arc<Mutex<ProcessingProgress>>,
+    transcription_metrics: Arc<Mutex<Option<TranscriptionProgress>>>,
+    cancelled: Arc<AtomicBool>,
+    result: Arc<Mutex<Option<ProcessingOutcome>>>,
+}
+
+struct ProgressSnapshot {
+    path: PathBuf,
+    update: ProcessingProgress,
+    metrics: Option<TranscriptionProgress>,
+    cancelled: bool,
+}
+
+struct QueueController {
+    app: gtk::Application,
+    window: adw::ApplicationWindow,
+    queue: Rc<RefCell<ProcessingQueue>>,
+    running: RefCell<Option<RunningProcessing>>,
+    timer_running: Cell<bool>,
+    recording_held: Cell<bool>,
+    inhibit_cookie: Cell<Option<u32>>,
+    panel: QueuePanel,
+    detail: SessionDetail,
+    banner: adw::Banner,
+    config: Rc<RefCell<GuiConfig>>,
+    list: gtk::ListBox,
+    paths: Rc<RefCell<Vec<PathBuf>>>,
+    stack: adw::ViewStack,
+    recording_job: Rc<RefCell<Option<RecordingJob>>>,
+    busy: Rc<Cell<bool>>,
+}
+
+impl QueueController {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        app: &adw::Application,
+        window: &adw::ApplicationWindow,
+        queue: &Rc<RefCell<ProcessingQueue>>,
+        panel: &QueuePanel,
+        detail: &SessionDetail,
+        banner: &adw::Banner,
+        config: &Rc<RefCell<GuiConfig>>,
+        list: &gtk::ListBox,
+        paths: &Rc<RefCell<Vec<PathBuf>>>,
+        stack: &adw::ViewStack,
+        recording_job: &Rc<RefCell<Option<RecordingJob>>>,
+        busy: &Rc<Cell<bool>>,
+    ) -> Rc<Self> {
+        let controller = Rc::new(Self {
+            app: app.clone().upcast(),
+            window: window.clone(),
+            queue: queue.clone(),
+            running: RefCell::new(None),
+            timer_running: Cell::new(false),
+            recording_held: Cell::new(false),
+            inhibit_cookie: Cell::new(None),
+            panel: panel.clone(),
+            detail: detail.clone(),
+            banner: banner.clone(),
+            config: config.clone(),
+            list: list.clone(),
+            paths: paths.clone(),
+            stack: stack.clone(),
+            recording_job: recording_job.clone(),
+            busy: busy.clone(),
+        });
+        let weak = Rc::downgrade(&controller);
+        panel.set_handler(Rc::new(move |action| {
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match action {
+                QueuePanelAction::Select(path) => controller.select(&path),
+                QueuePanelAction::Cancel => controller.cancel(),
+                QueuePanelAction::Remove(path) => controller.remove(&path),
+                QueuePanelAction::Retry(path) => {
+                    controller.enqueue(path);
+                }
+                QueuePanelAction::Details(error) => {
+                    show_error(&controller.window, "Processing failed", &error)
+                }
+                QueuePanelAction::Clear => {
+                    let failed = controller
+                        .queue
+                        .borrow()
+                        .failed()
+                        .iter()
+                        .map(|job| job.path.clone())
+                        .collect::<Vec<_>>();
+                    controller.queue.borrow_mut().clear_failed();
+                    for path in failed {
+                        controller.update_row(&path);
+                    }
+                    controller.detail.refresh_queue_state();
+                    controller.render_panel();
+                }
+            }
+        }));
+        controller.render_panel();
+        controller
+    }
+
+    fn enqueue(self: &Rc<Self>, path: PathBuf) -> bool {
+        if !self.queue.borrow_mut().enqueue(path.clone()) {
+            return false;
+        }
+        self.ensure_inhibited();
+        self.update_row(&path);
+        self.detail.refresh_queue_state();
+        self.render_panel();
+        self.start_timer();
+        true
+    }
+
+    fn remove(&self, path: &Path) {
+        if !self.queue.borrow_mut().remove(path) {
             return;
         }
-        let Some(session_path) = selected.borrow().clone() else {
+        self.update_row(path);
+        self.detail.refresh_queue_state();
+        self.render_panel();
+        if self.queue.borrow().is_idle() {
+            self.release_inhibit();
+        }
+    }
+
+    fn cancel(&self) {
+        {
+            let running = self.running.borrow();
+            let Some(running) = running.as_ref() else {
+                return;
+            };
+            running.cancelled.store(true, Ordering::Release);
+        }
+        self.detail.cancel_requested.set(true);
+        self.detail.refresh_queue_state();
+        self.render_panel();
+    }
+
+    fn select(&self, path: &Path) {
+        if let Some(index) = self
+            .paths
+            .borrow()
+            .iter()
+            .position(|candidate| candidate == path)
+        {
+            select_session_row(&self.list, index);
+        } else {
+            self.list.unselect_all();
+            if self.detail.load(path).is_ok() {
+                self.stack.set_visible_child_name("session");
+            } else if self.queue.borrow_mut().remove_failed(path) {
+                self.detail.clear();
+                self.render_panel();
+            }
+        }
+    }
+
+    fn ensure_inhibited(&self) {
+        if self.inhibit_cookie.get().is_none() {
+            let cookie = self.app.inhibit(
+                Some(&self.window),
+                gtk::ApplicationInhibitFlags::SUSPEND,
+                Some("Processing recordings"),
+            );
+            if cookie != 0 {
+                self.inhibit_cookie.set(Some(cookie));
+            }
+        }
+    }
+
+    fn release_inhibit(&self) {
+        if let Some(cookie) = self.inhibit_cookie.take() {
+            self.app.uninhibit(cookie);
+        }
+    }
+
+    fn start_timer(self: &Rc<Self>) {
+        if self.timer_running.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(150), move || {
+            let Some(controller) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let flow = controller.tick();
+            if flow == glib::ControlFlow::Break {
+                controller.timer_running.set(false);
+            }
+            flow
+        });
+    }
+
+    fn tick(self: &Rc<Self>) -> glib::ControlFlow {
+        self.apply_progress_snapshot();
+        let completed = {
+            let running = self.running.borrow();
+            running.as_ref().and_then(|running| {
+                running
+                    .result
+                    .lock()
+                    .expect("processing result mutex")
+                    .take()
+            })
+        };
+        if let Some(outcome) = completed {
+            self.complete(outcome);
+            return glib::ControlFlow::Continue;
+        }
+
+        if self.running.borrow().is_none() && !self.queue.borrow().waiting().is_empty() {
+            if self.recording_job.borrow().is_some() {
+                if !self.recording_held.replace(true) {
+                    self.render_panel();
+                }
+                return glib::ControlFlow::Continue;
+            }
+            if self.recording_held.replace(false) {
+                self.render_panel();
+            }
+            let dialog_holds_selected = {
+                let queue = self.queue.borrow();
+                let selected = self.detail.selected.borrow();
+                queue.waiting().front().is_some_and(|path| {
+                    selected.as_deref() == Some(path.as_path())
+                        && self.window.visible_dialog().is_some()
+                })
+            };
+            if !self.busy.get() && !dialog_holds_selected {
+                self.start_next();
+            }
+        }
+
+        if self.queue.borrow().is_idle() {
+            self.release_inhibit();
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    }
+
+    fn start_next(&self) {
+        let Some(path) = self.queue.borrow_mut().start_next() else {
             return;
         };
-        if session_path.join("transcript.jsonl").is_file()
-            && !confirmed_reprocess.get()
-        {
-            let dialog = adw::AlertDialog::new(
-                Some("Reprocess this recording?"),
-                Some(
-                    "This replaces the transcript, intermediate processing files, and automatic speaker matches. Recorded audio is unchanged, and speaker names you confirmed in this version are kept. Names assigned with an older version are replaced.",
-                ),
-            );
-            dialog.add_responses(&[("cancel", "Cancel"), ("reprocess", "Reprocess")]);
-            dialog.set_default_response(Some("reprocess"));
-            dialog.set_close_response("cancel");
-            dialog.set_response_appearance("reprocess", adw::ResponseAppearance::Suggested);
-            let button = button.clone();
-            let confirmed_reprocess = confirmed_reprocess.clone();
-            dialog.connect_response(Some("reprocess"), move |_, _| {
-                confirmed_reprocess.set(true);
-                button.emit_clicked();
-            });
-            dialog.present(Some(&parent));
-            return;
-        }
-        if !confirmed_details.get() {
-            let prefill = match meeting_prefill(
-                &session_path,
-                &config_for_done.borrow(),
-            ) {
-                Ok(prefill) => prefill,
-                Err(error) => {
-                    show_error(&parent, "Could not read meeting details", &error.to_string());
-                    return;
-                }
-            };
-            let meeting_dialog = Rc::new(meeting_details_dialog(&prefill, "Process"));
-            let confirmed_reprocess_for_close = confirmed_reprocess.clone();
-            let confirmed_details_for_close = confirmed_details.clone();
-            meeting_dialog.dialog.connect_closed(move |_| {
-                if !confirmed_details_for_close.get() {
-                    confirmed_reprocess_for_close.set(false);
-                }
-            });
-            let session_path_for_save = session_path.clone();
-            let button = button.clone();
-            let confirmed_details = confirmed_details.clone();
-            let dialog_for_save = meeting_dialog.clone();
-            let parent_for_save = parent.clone();
-            meeting_dialog.primary.connect_clicked(move |_| {
-                let details = dialog_for_save.details();
-                match Session::open(&session_path_for_save).and_then(|session| {
-                    meeting::write_details_atomic(&session.meeting_path(), &details)
-                }) {
-                    Ok(()) => {
-                        confirmed_details.set(true);
-                        dialog_for_save.dialog.force_close();
-                        button.emit_clicked();
-                    }
-                    Err(error) => show_error(
-                        &parent_for_save,
-                        "Could not save meeting details",
-                        &error.to_string(),
-                    ),
-                }
-            });
-            meeting_dialog.dialog.present(Some(&parent));
-            return;
-        }
-        confirmed_reprocess.set(false);
-        confirmed_details.set(false);
-        busy_for_process.set(true);
-        let dialog = processing_dialog(&backend::current());
+        self.detail.cancel_requested.set(false);
         let progress = Arc::new(Mutex::new(ProcessingProgress {
             stage: ProcessingStage::Preparing,
             fraction: None,
@@ -2162,14 +2923,22 @@ fn wire_processing(
         let transcription_metrics = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
         let result = Arc::new(Mutex::new(None));
-        let thread_progress = progress.clone();
-        let thread_transcription_metrics = transcription_metrics.clone();
-        let thread_result = result.clone();
-        let thread_cancelled = cancelled.clone();
-        let swedish_transcription = config_for_done.borrow().swedish_transcription;
+        *self.running.borrow_mut() = Some(RunningProcessing {
+            path: path.clone(),
+            progress: progress.clone(),
+            transcription_metrics: transcription_metrics.clone(),
+            cancelled: cancelled.clone(),
+            result: result.clone(),
+        });
+        reset_processing_view(&self.detail.processing);
+        self.update_row(&path);
+        self.detail.refresh_queue_state();
+        self.render_panel();
+
+        let swedish_transcription = self.config.borrow().swedish_transcription;
         std::thread::spawn(move || {
             let prepared = (|| -> Result<ProcessArgs, String> {
-                let mut args = ProcessArgs::for_session(session_path);
+                let mut args = ProcessArgs::for_session(path);
                 args.diarize_mic = Session::open(&args.session)
                     .and_then(|session| session.read_manifest())
                     .map_err(|error| error.to_string())?
@@ -2196,11 +2965,11 @@ fn wire_processing(
                 Ok(args) => match process::run_with_control_and_metrics(
                     args,
                     move |update| {
-                        *thread_progress.lock().expect("processing progress mutex") = update;
+                        *progress.lock().expect("processing progress mutex") = update;
                     },
-                    thread_cancelled,
+                    cancelled,
                     Arc::new(move |metrics| {
-                        *thread_transcription_metrics
+                        *transcription_metrics
                             .lock()
                             .expect("transcription metrics mutex") = Some(metrics);
                     }),
@@ -2208,152 +2977,360 @@ fn wire_processing(
                     Ok(()) => ProcessingOutcome::Finished,
                     Err(error)
                         if error
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted) =>
+                            .downcast_ref::<io::Error>()
+                            .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted) =>
                     {
                         ProcessingOutcome::Cancelled
                     }
                     Err(error) => ProcessingOutcome::Failed(error.to_string()),
                 },
             };
-            *thread_result.lock().expect("processing result mutex") = Some(outcome);
+            *result.lock().expect("processing result mutex") = Some(outcome);
         });
+    }
 
-        let label = dialog.label.clone();
-        let bar = dialog.progress.clone();
-        let stages = dialog.stages.clone();
-        let metrics_box = dialog.metrics.clone();
-        let throughput = dialog.throughput.clone();
-        let throughput_detail = dialog.throughput_detail.clone();
-        let cancel_button = dialog.cancel.clone();
-        let cancelled_for_click = cancelled.clone();
-        let label_for_cancel = dialog.label.clone();
-        dialog.cancel.connect_clicked(move |button| {
-            cancelled_for_click.store(true, Ordering::Release);
-            button.set_sensitive(false);
-            button.set_label("Cancelling…");
-            label_for_cancel.set_label("Cancelling after the current stage…");
-        });
-        let processing_dialog = dialog.dialog.clone();
-        let busy_for_poll = busy_for_process.clone();
-        let parent_for_poll = parent.clone();
-        let detail_for_poll = detail_for_done.clone();
-        let banner_for_poll = banner_for_done.clone();
-        let config_for_poll = config_for_done.clone();
-        let list_for_poll = list_for_done.clone();
-        let paths_for_poll = paths_for_done.clone();
-        let search_for_poll = search_for_done.clone();
-        let selected_for_poll = selected.clone();
-        glib::timeout_add_local(Duration::from_millis(150), move || {
-            let update = *progress.lock().expect("processing progress mutex");
-            let stage = update.stage;
-            if !cancelled.load(Ordering::Acquire) {
-                label.set_label(stage.label());
-            }
-            update_processing_stages(&stages, stage);
-            let metrics = *transcription_metrics
-                .lock()
-                .expect("transcription metrics mutex");
-            let current_metrics = metrics.filter(|metrics| {
-                matches!(
-                    (stage, metrics.source),
-                    (ProcessingStage::TranscribingMic, AudioSource::Mic)
-                        | (ProcessingStage::TranscribingSystem, AudioSource::System)
-                )
-            });
-            metrics_box.set_visible(current_metrics.is_some());
-            if let Some(metrics) = current_metrics {
-                update_transcription_metrics(&throughput, &throughput_detail, metrics);
-                update_transcription_progress(&bar, metrics);
-            } else if let Some(fraction) = update.fraction {
-                bar.set_fraction(fraction);
-                bar.set_text(Some(&format!("{:.0}%", fraction * 100.0)));
-            } else {
-                bar.pulse();
-                bar.set_text(Some("Working…"));
-            }
-            let completed = result.lock().expect("processing result mutex").take();
-            let Some(result) = completed else {
-                return glib::ControlFlow::Continue;
-            };
-            busy_for_poll.set(false);
-            cancel_button.set_sensitive(false);
-            processing_dialog.force_close();
-            match result {
-                ProcessingOutcome::Finished => {
-                    let selected_path = selected_for_poll.borrow().clone();
-                    if let Some(path) = selected_path {
-                        let _ = detail_for_poll.load(&path);
-                    }
-                    populate_sessions(
-                        &list_for_poll,
-                        &paths_for_poll,
-                        &config_for_poll.borrow().meetings_dir,
-                        &search_for_poll.text(),
-                    );
-                    banner_for_poll.set_title(
-                        "Processing finished — transcript.jsonl and transcript.txt are ready",
-                    );
-                    banner_for_poll.set_revealed(true);
-                }
-                ProcessingOutcome::Cancelled => {
-                    banner_for_poll.set_title(
-                        "Processing cancelled — recorded audio is unchanged; completed stages may have refreshed outputs",
-                    );
-                    banner_for_poll.set_revealed(true);
-                }
-                ProcessingOutcome::Failed(error) => {
-                    show_error(&parent_for_poll, "Processing failed", &error)
-                }
-            }
-            glib::ControlFlow::Break
-        });
-        dialog.dialog.present(Some(&parent));
-    });
-
-    let selected = detail.selected.clone();
-    let parent = window.clone();
-    let detail_for_save = detail.clone();
-    let config_for_save = config.clone();
-    let banner_for_save = banner.clone();
-    let list_for_save = list.clone();
-    let paths_for_save = paths.clone();
-    let search_for_save = search.clone();
-    detail.meeting_button.connect_clicked(move |_| {
-        if busy.get() {
-            return;
-        }
-        let Some(session_path) = selected.borrow().clone() else {
+    fn complete(&self, outcome: ProcessingOutcome) {
+        let Some(running) = self.running.borrow_mut().take() else {
             return;
         };
-        let prefill = match meeting_prefill(&session_path, &config_for_save.borrow()) {
+        let path = running.path;
+        let model_outcome = match &outcome {
+            ProcessingOutcome::Finished => QueueOutcome::Finished,
+            ProcessingOutcome::Cancelled => QueueOutcome::Cancelled,
+            ProcessingOutcome::Failed(error) => QueueOutcome::Failed(error.clone()),
+        };
+        self.queue.borrow_mut().finish(model_outcome);
+        self.detail.cancel_requested.set(false);
+        self.update_row(&path);
+        if self.detail.selected.borrow().as_deref() == Some(path.as_path()) {
+            if self.detail.load(&path).is_err() {
+                self.detail.clear();
+            }
+        } else {
+            self.detail.refresh_queue_state();
+        }
+        self.render_panel();
+
+        let queue = self.queue.borrow();
+        let idle = queue.is_idle();
+        match outcome {
+            ProcessingOutcome::Finished if idle => {
+                if queue.completed_count() == 1
+                    && queue.processed_count() == 1
+                    && queue.failed_count() == 0
+                {
+                    self.banner.set_title(
+                        "Processing finished — transcript.jsonl and transcript.txt are ready",
+                    );
+                } else {
+                    self.banner.set_title(&finished_banner_text(
+                        queue.processed_count(),
+                        queue.failed_count(),
+                    ));
+                }
+                self.banner.set_revealed(true);
+            }
+            ProcessingOutcome::Cancelled => {
+                self.banner.set_title(
+                    "Processing cancelled — recorded audio is unchanged; completed stages may have refreshed outputs",
+                );
+                self.banner.set_revealed(true);
+            }
+            ProcessingOutcome::Failed(_) if idle && queue.processed_count() > 0 => {
+                self.banner.set_title(&finished_banner_text(
+                    queue.processed_count(),
+                    queue.failed_count(),
+                ));
+                self.banner.set_revealed(true);
+            }
+            _ => {}
+        }
+        drop(queue);
+        if idle {
+            self.release_inhibit();
+        }
+    }
+
+    fn update_row(&self, path: &Path) {
+        update_session_row(&self.list, &self.paths, path, &self.queue.borrow());
+    }
+
+    fn render_panel(&self) {
+        self.panel.render(
+            &self.queue.borrow(),
+            self.recording_job.borrow().is_some(),
+            self.detail.cancel_requested.get(),
+        );
+        self.apply_progress_snapshot();
+    }
+
+    fn render_panel_if_visible(&self) {
+        let queue = self.queue.borrow();
+        let visible = !queue.is_idle() || !queue.failed().is_empty();
+        drop(queue);
+        if visible {
+            self.render_panel();
+        }
+    }
+
+    fn progress_snapshot(&self) -> Option<ProgressSnapshot> {
+        self.running
+            .borrow()
+            .as_ref()
+            .map(|running| ProgressSnapshot {
+                path: running.path.clone(),
+                update: *running.progress.lock().expect("processing progress mutex"),
+                metrics: *running
+                    .transcription_metrics
+                    .lock()
+                    .expect("transcription metrics mutex"),
+                cancelled: self.detail.cancel_requested.get(),
+            })
+    }
+
+    fn apply_progress_snapshot(&self) {
+        let Some(snapshot) = self.progress_snapshot() else {
+            return;
+        };
+        let current_metrics = snapshot.metrics.filter(|metrics| {
+            matches!(
+                (snapshot.update.stage, metrics.source),
+                (ProcessingStage::TranscribingMic, AudioSource::Mic)
+                    | (ProcessingStage::TranscribingSystem, AudioSource::System)
+            )
+        });
+        self.panel.update_progress(
+            snapshot.update,
+            current_metrics,
+            snapshot.cancelled,
+            self.queue.borrow().batch_position_total(),
+        );
+        if self.detail.selected.borrow().as_deref() == Some(snapshot.path.as_path()) {
+            update_processing_view(
+                &self.detail.processing,
+                snapshot.update,
+                current_metrics,
+                snapshot.cancelled,
+            );
+        }
+    }
+
+    fn will_wait(&self) -> bool {
+        !self.queue.borrow().is_idle() || self.recording_job.borrow().is_some()
+    }
+
+    fn stop_for_quit(&self) {
+        let waiting = self
+            .queue
+            .borrow()
+            .waiting()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.queue.borrow_mut().clear_waiting();
+        for path in waiting {
+            self.update_row(&path);
+        }
+        if let Some(running) = self.running.borrow().as_ref() {
+            running.cancelled.store(true, Ordering::Release);
+            self.detail.cancel_requested.set(true);
+        }
+        self.detail.refresh_queue_state();
+        self.render_panel();
+        self.release_inhibit();
+    }
+}
+
+fn update_processing_view(
+    view: &ProcessingView,
+    update: ProcessingProgress,
+    metrics: Option<TranscriptionProgress>,
+    cancelled: bool,
+) {
+    view.label.set_label(if cancelled {
+        "Cancelling…"
+    } else {
+        update.stage.label()
+    });
+    update_processing_stages(&view.stages, update.stage);
+    view.metrics.set_visible(metrics.is_some());
+    if let Some(metrics) = metrics {
+        update_transcription_metrics(&view.throughput, &view.throughput_detail, metrics);
+        update_transcription_progress(&view.progress, metrics);
+    } else if let Some(fraction) = update.fraction {
+        view.progress.set_fraction(fraction);
+        view.progress
+            .set_text(Some(&format!("{:.0}%", fraction * 100.0)));
+    } else {
+        view.progress.pulse();
+        view.progress.set_text(Some("Working…"));
+    }
+}
+
+fn reset_processing_view(view: &ProcessingView) {
+    view.label.set_label(ProcessingStage::Preparing.label());
+    update_processing_stages(&view.stages, ProcessingStage::Preparing);
+    view.metrics.set_visible(false);
+    view.progress.set_fraction(0.0);
+    view.progress.set_text(Some("Working…"));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_processing(
+    app: &adw::Application,
+    window: &adw::ApplicationWindow,
+    detail: &SessionDetail,
+    banner: &adw::Banner,
+    config: &Rc<RefCell<GuiConfig>>,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    search: &gtk::SearchEntry,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+    panel: &QueuePanel,
+    stack: &adw::ViewStack,
+    recording_job: &Rc<RefCell<Option<RecordingJob>>>,
+    busy: &Rc<Cell<bool>>,
+) -> Rc<QueueController> {
+    wire_archiving(
+        window, detail, banner, config, list, paths, search, busy, queue,
+    );
+    let controller = QueueController::new(
+        app,
+        window,
+        queue,
+        panel,
+        detail,
+        banner,
+        config,
+        list,
+        paths,
+        stack,
+        recording_job,
+        busy,
+    );
+
+    let controller_for_process = controller.clone();
+    detail.process_button.connect_clicked(move |_| {
+        if controller_for_process.busy.get() {
+            return;
+        }
+        let Some(path) = controller_for_process.detail.selected.borrow().clone() else {
+            return;
+        };
+        let state = controller_for_process.queue.borrow().state(&path);
+        match state {
+            Some(JobState::Running) => controller_for_process.cancel(),
+            Some(JobState::Waiting { .. }) => controller_for_process.remove(&path),
+            None => begin_process_flow(controller_for_process.clone(), path),
+        }
+    });
+
+    wire_meeting_details(&controller, search);
+    controller
+}
+
+fn begin_process_flow(controller: Rc<QueueController>, path: PathBuf) {
+    if path.join("transcript.jsonl").is_file() {
+        let dialog = adw::AlertDialog::new(
+            Some("Reprocess this recording?"),
+            Some(
+                "This replaces the transcript, intermediate processing files, and automatic speaker matches. Recorded audio is unchanged, and speaker names you confirmed in this version are kept. Names assigned with an older version are replaced.",
+            ),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("reprocess", "Reprocess")]);
+        dialog.set_default_response(Some("reprocess"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("reprocess", adw::ResponseAppearance::Suggested);
+        let controller_for_response = controller.clone();
+        dialog.connect_response(Some("reprocess"), move |_, _| {
+            show_process_details(controller_for_response.clone(), path.clone());
+        });
+        dialog.present(Some(&controller.window));
+    } else {
+        show_process_details(controller, path);
+    }
+}
+
+fn show_process_details(controller: Rc<QueueController>, path: PathBuf) {
+    let prefill = match meeting_prefill(&path, &controller.config.borrow()) {
+        Ok(prefill) => prefill,
+        Err(error) => {
+            show_error(
+                &controller.window,
+                "Could not read meeting details",
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    let primary = if controller.will_wait() {
+        "Add to queue"
+    } else {
+        "Process"
+    };
+    let dialog = Rc::new(meeting_details_dialog(&prefill, primary));
+    let dialog_for_save = dialog.clone();
+    let controller_for_save = controller.clone();
+    dialog.primary.connect_clicked(move |_| {
+        let details = dialog_for_save.details();
+        match Session::open(&path)
+            .and_then(|session| meeting::write_details_atomic(&session.meeting_path(), &details))
+        {
+            Ok(()) => {
+                dialog_for_save.dialog.force_close();
+                controller_for_save.enqueue(path.clone());
+            }
+            Err(error) => show_error(
+                &controller_for_save.window,
+                "Could not save meeting details",
+                &error.to_string(),
+            ),
+        }
+    });
+    dialog.dialog.present(Some(&controller.window));
+}
+
+fn wire_meeting_details(controller: &Rc<QueueController>, search: &gtk::SearchEntry) {
+    let controller = controller.clone();
+    let search = search.clone();
+    let detail = controller.detail.clone();
+    detail.meeting_button.connect_clicked(move |_| {
+        if controller.busy.get() {
+            return;
+        }
+        let Some(path) = controller.detail.selected.borrow().clone() else {
+            return;
+        };
+        let processed = path.join("transcript.jsonl").is_file();
+        let prefill = match meeting_prefill(&path, &controller.config.borrow()) {
             Ok(prefill) => prefill,
             Err(error) => {
                 show_error(
-                    &parent,
+                    &controller.window,
                     "Could not read meeting details",
                     &error.to_string(),
                 );
                 return;
             }
         };
-        let meeting_dialog = Rc::new(meeting_details_dialog(&prefill, "Save and re-render"));
-        let dialog_for_save = meeting_dialog.clone();
-        let parent_for_save = parent.clone();
-        let detail_for_done = detail_for_save.clone();
-        let config_for_done = config_for_save.clone();
-        let banner_for_done = banner_for_save.clone();
-        let list_for_done = list_for_save.clone();
-        let paths_for_done = paths_for_save.clone();
-        let search_for_done = search_for_save.clone();
-        let busy_for_save = busy.clone();
-        meeting_dialog.primary.connect_clicked(move |_| {
+        let dialog = Rc::new(meeting_details_dialog(
+            &prefill,
+            if processed {
+                "Save and re-render"
+            } else {
+                "Save"
+            },
+        ));
+        let dialog_for_save = dialog.clone();
+        let controller_for_save = controller.clone();
+        let search_for_save = search.clone();
+        dialog.primary.connect_clicked(move |_| {
             let details = dialog_for_save.details();
-            let session = match Session::open(&session_path) {
+            let session = match Session::open(&path) {
                 Ok(session) => session,
                 Err(error) => {
                     show_error(
-                        &parent_for_save,
+                        &controller_for_save.window,
                         "Could not open session",
                         &error.to_string(),
                     );
@@ -2362,79 +3339,69 @@ fn wire_processing(
             };
             if let Err(error) = meeting::write_details_atomic(&session.meeting_path(), &details) {
                 show_error(
-                    &parent_for_save,
+                    &controller_for_save.window,
                     "Could not save meeting details",
                     &error.to_string(),
                 );
                 return;
             }
             dialog_for_save.dialog.force_close();
-            busy_for_save.set(true);
-            let progress = gtk::Window::builder()
-                .title("Rendering transcript")
-                .transient_for(&parent_for_save)
-                .modal(true)
-                .deletable(false)
-                .default_width(360)
-                .build();
-            let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
-            body.set_margin_top(24);
-            body.set_margin_bottom(24);
-            body.set_margin_start(24);
-            body.set_margin_end(24);
-            let spinner = gtk::Spinner::new();
-            spinner.set_spinning(true);
-            body.append(&spinner);
-            body.append(&gtk::Label::new(Some(
-                "Saving meeting details and re-rendering the transcript…",
-            )));
-            progress.set_child(Some(&body));
-            progress.present();
+            controller_for_save.render_panel_if_visible();
+            if !processed {
+                let _ = controller_for_save.detail.load(&path);
+                controller_for_save.update_row(&path);
+                return;
+            }
 
+            controller_for_save.busy.set(true);
+            let progress = progress_window(
+                &controller_for_save.window,
+                "Rendering transcript",
+                "Saving meeting details and re-rendering the transcript…",
+            );
             let result = Arc::new(Mutex::new(None));
             let thread_result = result.clone();
-            let render_session = session_path.clone();
+            let render_path = path.clone();
             std::thread::spawn(move || {
                 let value = process::run_render(RenderArgs {
-                    session: render_session,
+                    session: render_path,
                     diarize_mic: None,
                 })
                 .map_err(|error| error.to_string());
                 *thread_result.lock().expect("render result mutex") = Some(value);
             });
-            let parent = parent_for_save.clone();
-            let detail = detail_for_done.clone();
-            let config = config_for_done.clone();
-            let banner = banner_for_done.clone();
-            let list = list_for_done.clone();
-            let paths = paths_for_done.clone();
-            let search = search_for_done.clone();
-            let busy = busy_for_save.clone();
-            let reload_session = session_path.clone();
+            let controller = controller_for_save.clone();
+            let reload_path = path.clone();
+            let search = search_for_save.clone();
             glib::timeout_add_local(Duration::from_millis(150), move || {
                 let Some(result) = result.lock().expect("render result mutex").take() else {
                     return glib::ControlFlow::Continue;
                 };
-                busy.set(false);
+                controller.busy.set(false);
                 progress.close();
                 match result {
                     Ok(()) => {
-                        let _ = detail.load(&reload_session);
+                        let _ = controller.detail.load(&reload_path);
                         populate_sessions(
-                            &list,
-                            &paths,
-                            &config.borrow().meetings_dir,
+                            &controller.list,
+                            &controller.paths,
+                            &controller.config.borrow().meetings_dir,
                             &search.text(),
+                            &controller.queue,
                         );
-                        banner.set_title("Meeting details saved and transcript re-rendered");
-                        banner.set_revealed(true);
+                        controller
+                            .banner
+                            .set_title("Meeting details saved and transcript re-rendered");
+                        controller.banner.set_revealed(true);
                     }
-                    Err(error) => show_error(&parent, "Could not re-render transcript", &error),
+                    Err(error) => {
+                        show_error(&controller.window, "Could not re-render transcript", &error)
+                    }
                 }
                 glib::ControlFlow::Break
             });
         });
-        meeting_dialog.dialog.present(Some(&parent));
+        dialog.dialog.present(Some(&controller.window));
     });
 }
 
@@ -2448,6 +3415,7 @@ fn wire_archiving(
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     search: &gtk::SearchEntry,
     busy: &Rc<Cell<bool>>,
+    queue: &Rc<RefCell<ProcessingQueue>>,
 ) {
     let parent = window.clone();
     let detail_for_archive = detail.clone();
@@ -2457,6 +3425,7 @@ fn wire_archiving(
     let paths = paths.clone();
     let search = search.clone();
     let busy = busy.clone();
+    let queue = queue.clone();
     detail.archive_button.connect_clicked(move |_| {
         if busy.get() {
             return;
@@ -2482,6 +3451,7 @@ fn wire_archiving(
         let paths = paths.clone();
         let search = search.clone();
         let busy = busy.clone();
+        let queue = queue.clone();
         dialog.connect_response(Some("archive"), move |_, _| {
             detail.playback.stop();
             busy.set(true);
@@ -2523,6 +3493,7 @@ fn wire_archiving(
             let paths = paths.clone();
             let search = search.clone();
             let busy = busy.clone();
+            let queue = queue.clone();
             let session_path = session_path.clone();
             glib::timeout_add_local(Duration::from_millis(150), move || {
                 let Some(result) = result.lock().expect("archive result mutex").take() else {
@@ -2530,7 +3501,13 @@ fn wire_archiving(
                 };
                 busy.set(false);
                 progress.close();
-                populate_sessions(&list, &paths, &config.borrow().meetings_dir, &search.text());
+                populate_sessions(
+                    &list,
+                    &paths,
+                    &config.borrow().meetings_dir,
+                    &search.text(),
+                    &queue,
+                );
                 let index = paths.borrow().iter().position(|path| *path == session_path);
                 match index {
                     Some(index) => select_session_row(&list, index),
@@ -2556,36 +3533,20 @@ fn wire_archiving(
     });
 }
 
-struct ProcessingDialog {
-    dialog: adw::Dialog,
-    label: gtk::Label,
-    progress: gtk::ProgressBar,
-    stages: Vec<gtk::Label>,
-    metrics: gtk::Box,
-    throughput: gtk::Label,
-    throughput_detail: gtk::Label,
-    cancel: gtk::Button,
-}
-
 enum ProcessingOutcome {
     Finished,
     Cancelled,
     Failed(String),
 }
 
-fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
-    let dialog = adw::Dialog::builder()
-        .title("Processing session")
-        .can_close(false)
-        .content_width(470)
-        .follows_content_size(true)
-        .presentation_mode(adw::DialogPresentationMode::Floating)
-        .build();
-    let body = gtk::Box::new(gtk::Orientation::Vertical, 16);
-    body.set_margin_top(28);
-    body.set_margin_bottom(28);
-    body.set_margin_start(28);
-    body.set_margin_end(28);
+fn processing_view(backend: &backend::WhisperBackend) -> ProcessingView {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.set_hexpand(true);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_top(16);
+    body.set_margin_bottom(16);
+    body.set_margin_start(16);
+    body.set_margin_end(16);
     let spinner = gtk::Spinner::new();
     spinner.set_spinning(true);
     spinner.set_size_request(38, 38);
@@ -2638,24 +3599,23 @@ fn processing_dialog(backend: &backend::WhisperBackend) -> ProcessingDialog {
     }
     body.append(&stages_box);
     let note = gtk::Label::new(Some(
-        "Audio stays on this device. Processing can take several minutes.",
+        "This runs in the background. You can open other sessions, review transcripts, or add more recordings to the queue.",
     ));
-    note.add_css_class("dim-label");
+    note.add_css_class("queue-progress-hint");
     note.set_wrap(true);
     body.append(&note);
-    let cancel = gtk::Button::with_label("Cancel");
-    cancel.set_halign(gtk::Align::Center);
-    body.append(&cancel);
-    dialog.set_child(Some(&body));
-    ProcessingDialog {
-        dialog,
+    let clamp = adw::Clamp::builder().maximum_size(470).child(&body).build();
+    clamp.set_valign(gtk::Align::Center);
+    clamp.set_vexpand(true);
+    root.append(&clamp);
+    ProcessingView {
+        root,
         label,
         progress,
         stages,
         metrics,
         throughput,
         throughput_detail,
-        cancel,
     }
 }
 
@@ -2993,13 +3953,8 @@ impl SessionDetail {
         self.playback.stop();
         let session = Session::open(path)?;
         let manifest = session.read_manifest()?;
-        let meeting = meeting::read_details(&session.meeting_path())?;
         *self.selected.borrow_mut() = Some(path.to_owned());
-        let title = meeting
-            .as_ref()
-            .map(|details| details.title.clone())
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| session_title(path));
+        let title = session_display_title(&session, path);
         self.title.set_label(&title);
         let duration = session_duration_ms(&session, &manifest);
         self.subtitle.set_label(&format!(
@@ -3008,25 +3963,8 @@ impl SessionDetail {
             format_duration(duration)
         ));
         let processed = session.transcript_path().is_file();
-        let (status, class) = session_status(&session, &manifest);
-        set_status(&self.status, status, class);
-        self.status.set_visible(true);
-        self.process_button
-            .set_label(if processed { "Reprocess" } else { "Process" });
-        self.process_button.set_tooltip_text(Some(if processed {
-            "Replace the transcript, intermediate files, and automatic speaker matches. Confirmed names are kept."
-        } else {
-            "Process this recording"
-        }));
-        self.process_button
-            .set_visible(manifest.state != SessionState::Recording);
-        self.archive_button.set_visible(
-            processed && manifest.state != SessionState::Recording && !session.is_archived(),
-        );
-        self.meeting_button
-            .set_visible(processed && manifest.state != SessionState::Recording);
-        self.rename_button.set_visible(true);
-        self.delete_button.set_visible(true);
+        let queue_state = self.queue.borrow().state(path);
+        self.apply_queue_state(&session, &manifest, processed, queue_state);
         let hidden = process::read_hidden_sources(&session).unwrap_or_default();
         let mic_hidden = hidden.contains(&AudioSource::Mic);
         let system_hidden = hidden.contains(&AudioSource::System);
@@ -3041,6 +3979,7 @@ impl SessionDetail {
             .set_visible(can_hide_sources && manifest.system.enabled);
 
         clear_box(&self.transcript);
+        *self.empty_state.borrow_mut() = None;
         clear_box(&self.transcript_panes);
         self.transcript_panes.set_visible(false);
         if processed {
@@ -3080,10 +4019,15 @@ impl SessionDetail {
                 }
             }
         } else {
-            append_empty(
+            let empty = append_empty(
                 &self.transcript,
-                "This recording has not been processed yet.",
+                if matches!(queue_state, Some(JobState::Waiting { .. })) {
+                    "Waiting in the processing queue."
+                } else {
+                    "This recording has not been processed yet."
+                },
             );
+            *self.empty_state.borrow_mut() = Some(empty);
         }
 
         clear_flow(&self.screenshots);
@@ -3158,6 +4102,106 @@ impl SessionDetail {
         Ok(())
     }
 
+    fn apply_queue_state(
+        &self,
+        session: &Session,
+        manifest: &Manifest,
+        processed: bool,
+        queue_state: Option<JobState>,
+    ) {
+        let recording = manifest.state == SessionState::Recording;
+        self.status.set_visible(true);
+        self.process_button.set_visible(!recording);
+        self.process_button.remove_css_class("suggested-action");
+        match queue_state {
+            Some(JobState::Running) => {
+                set_status(&self.status, "Processing", "busy");
+                self.process_button
+                    .set_label(if self.cancel_requested.get() {
+                        "Cancelling…"
+                    } else {
+                        "Cancel processing"
+                    });
+                self.process_button
+                    .set_sensitive(!self.cancel_requested.get());
+                self.process_button
+                    .set_tooltip_text(Some("Stop processing this recording"));
+                self.body_stack.set_visible_child_name("processing");
+            }
+            Some(JobState::Waiting { position }) => {
+                set_status(
+                    &self.status,
+                    &format!("Queued · {}", ordinal(position)),
+                    "queued",
+                );
+                self.process_button.set_label("Remove from queue");
+                self.process_button.set_sensitive(true);
+                self.process_button
+                    .set_tooltip_text(Some("Remove this session from the processing queue"));
+                self.body_stack.set_visible_child_name("transcript");
+            }
+            None => {
+                let (status, class) = session_path_status(&session.dir, &self.queue.borrow());
+                set_status(&self.status, status, class);
+                self.process_button
+                    .set_label(if processed { "Reprocess" } else { "Process" });
+                self.process_button.set_sensitive(true);
+                self.process_button.add_css_class("suggested-action");
+                self.process_button.set_tooltip_text(Some(if processed {
+                    "Replace the transcript, intermediate files, and automatic speaker matches. Confirmed names are kept."
+                } else {
+                    "Process this recording"
+                }));
+                self.body_stack.set_visible_child_name("transcript");
+            }
+        }
+
+        let running = matches!(queue_state, Some(JobState::Running));
+        let waiting = matches!(queue_state, Some(JobState::Waiting { .. }));
+        self.archive_button
+            .set_visible(processed && !recording && !session.is_archived());
+        self.archive_button.set_sensitive(!running);
+        self.meeting_button
+            .set_visible((processed || waiting || running) && !recording);
+        self.meeting_button.set_sensitive(!running);
+        self.rename_button.set_visible(true);
+        self.rename_button.set_sensitive(!running);
+        self.delete_button.set_visible(true);
+        self.delete_button.set_sensitive(!running && !waiting);
+        self.delete_button.set_tooltip_text(Some(if waiting {
+            "Remove the session from the queue before deleting it"
+        } else {
+            "Delete session"
+        }));
+        self.hide_mic.set_sensitive(!running);
+        self.hide_system.set_sensitive(!running);
+    }
+
+    fn refresh_queue_state(&self) {
+        let Some(path) = self.selected.borrow().clone() else {
+            return;
+        };
+        let (session, manifest) = match Session::open(&path)
+            .and_then(|session| session.read_manifest().map(|manifest| (session, manifest)))
+        {
+            Ok(value) => value,
+            Err(_) => {
+                self.clear();
+                return;
+            }
+        };
+        let processed = session.transcript_path().is_file();
+        let queue_state = self.queue.borrow().state(&path);
+        self.apply_queue_state(&session, &manifest, processed, queue_state);
+        if let Some(empty) = self.empty_state.borrow().as_ref() {
+            empty.set_label(if matches!(queue_state, Some(JobState::Waiting { .. })) {
+                "Waiting in the processing queue."
+            } else {
+                "This recording has not been processed yet."
+            });
+        }
+    }
+
     /// Back to the empty state shown before any session is selected.
     fn clear(&self) {
         self.playback.stop();
@@ -3165,6 +4209,7 @@ impl SessionDetail {
         self.title.set_label("Select a session");
         self.subtitle
             .set_label("Recorded meetings appear in the sidebar.");
+        self.body_stack.set_visible_child_name("transcript");
         for widget in [
             self.status.upcast_ref::<gtk::Widget>(),
             self.process_button.upcast_ref(),
@@ -3178,6 +4223,7 @@ impl SessionDetail {
             widget.set_visible(false);
         }
         clear_box(&self.transcript);
+        *self.empty_state.borrow_mut() = None;
         clear_box(&self.transcript_panes);
         self.transcript_panes.set_visible(false);
         clear_flow(&self.screenshots);
@@ -3191,12 +4237,13 @@ fn populate_sessions(
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     root: &Path,
     filter: &str,
+    queue: &Rc<RefCell<ProcessingQueue>>,
 ) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
     let needle = filter.to_lowercase();
-    let summaries = load_sessions(root)
+    let summaries = load_sessions(root, &queue.borrow())
         .into_iter()
         .filter(|item| item.title.to_lowercase().contains(&needle))
         .collect::<Vec<_>>();
@@ -3212,24 +4259,25 @@ fn populate_sessions(
     }
 }
 
-fn load_sessions(root: &Path) -> Vec<SessionSummary> {
+fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {
     let mut sessions = fs::read_dir(root)
         .into_iter()
         .flatten()
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let session = Session::open(entry.path()).ok()?;
-            let manifest = session.read_manifest().ok()?;
-            let (status, status_class) = session_status(&session, &manifest);
+            let manifest = session.read_manifest().ok();
+            let (status, status_class) = session_path_status(&entry.path(), queue);
             Some(SessionSummary {
-                title: meeting::read_details(&session.meeting_path())
-                    .ok()
-                    .flatten()
-                    .map(|details| details.title)
-                    .filter(|title| !title.is_empty())
+                title: session_display_title(&session, &entry.path()),
+                started: manifest
+                    .as_ref()
+                    .map(|manifest| manifest.started_wallclock.clone())
                     .unwrap_or_else(|| session_title(&entry.path())),
-                started: manifest.started_wallclock.clone(),
-                duration_ms: session_duration_ms(&session, &manifest),
+                duration_ms: manifest
+                    .as_ref()
+                    .map(|manifest| session_duration_ms(&session, manifest))
+                    .unwrap_or_default(),
                 path: entry.path(),
                 status,
                 status_class,
@@ -3238,6 +4286,15 @@ fn load_sessions(root: &Path) -> Vec<SessionSummary> {
         .collect::<Vec<_>>();
     sessions.sort_by(|a, b| b.started.cmp(&a.started));
     sessions
+}
+
+fn session_display_title(session: &Session, path: &Path) -> String {
+    meeting::read_details(&session.meeting_path())
+        .ok()
+        .flatten()
+        .map(|details| details.title)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| session_title(path))
 }
 
 fn session_status(session: &Session, manifest: &Manifest) -> (&'static str, &'static str) {
@@ -3249,6 +4306,21 @@ fn session_status(session: &Session, manifest: &Manifest) -> (&'static str, &'st
         ("Archived", "archived")
     } else {
         ("Processed", "ok")
+    }
+}
+
+fn session_path_status(path: &Path, queue: &ProcessingQueue) -> (&'static str, &'static str) {
+    match queue.state(path) {
+        Some(JobState::Running) => ("Processing", "busy"),
+        Some(JobState::Waiting { .. }) => ("Queued", "queued"),
+        None if queue.has_failed(path) => ("Failed", "failed"),
+        None => Session::open(path)
+            .and_then(|session| {
+                session
+                    .read_manifest()
+                    .map(|manifest| session_status(&session, &manifest))
+            })
+            .unwrap_or(("Unavailable", "queued")),
     }
 }
 
@@ -3933,9 +5005,13 @@ fn start_assignment(
     end_ms: u64,
     name: String,
 ) {
+    if detail.busy.get() {
+        return;
+    }
     let Some(session) = detail.selected.borrow().clone() else {
         return;
     };
+    detail.busy.set(true);
     let progress = progress_window(
         &detail.window,
         "Assigning speaker",
@@ -3968,6 +5044,7 @@ fn start_assignment(
         else {
             return glib::ControlFlow::Continue;
         };
+        detail.busy.set(false);
         progress.close();
         reload_session(&detail);
         match result {
@@ -4005,9 +5082,13 @@ fn progress_window(parent: &adw::ApplicationWindow, title: &str, text: &str) -> 
 }
 
 fn start_hidden_sources_update(detail: &SessionDetail) {
+    if detail.busy.get() {
+        return;
+    }
     let Some(session) = detail.selected.borrow().clone() else {
         return;
     };
+    detail.busy.set(true);
     let hidden = [
         (AudioSource::Mic, detail.hide_mic.is_active()),
         (AudioSource::System, detail.hide_system.is_active()),
@@ -4032,6 +5113,7 @@ fn start_hidden_sources_update(detail: &SessionDetail) {
         let Some(result) = result.lock().expect("hidden sources result mutex").take() else {
             return glib::ControlFlow::Continue;
         };
+        detail.busy.set(false);
         progress.close();
         reload_session(&detail);
         if let Err(error) = result {
@@ -4111,7 +5193,14 @@ fn header_action_button(icon_name: &str, label: &str) -> gtk::Button {
 
 fn set_status(label: &gtk::Label, text: &str, class: &str) {
     label.set_label(text);
-    for name in ["pill-ok", "pill-idle", "pill-busy", "pill-archived"] {
+    for name in [
+        "pill-ok",
+        "pill-idle",
+        "pill-busy",
+        "pill-queued",
+        "pill-failed",
+        "pill-archived",
+    ] {
         label.remove_css_class(name);
     }
     label.add_css_class(&format!("pill-{class}"));
@@ -4220,7 +5309,7 @@ fn clear_flow(container: &gtk::FlowBox) {
     }
 }
 
-fn append_empty(container: &gtk::Box, text: &str) {
+fn append_empty(container: &gtk::Box, text: &str) -> gtk::Label {
     let label = gtk::Label::new(Some(text));
     label.set_margin_top(28);
     label.set_margin_start(16);
@@ -4228,6 +5317,7 @@ fn append_empty(container: &gtk::Box, text: &str) {
     label.set_wrap(true);
     label.add_css_class("dim-label");
     container.append(&label);
+    label
 }
 
 fn open_path(path: &Path) {

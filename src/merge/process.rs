@@ -216,7 +216,7 @@ pub fn run_with_control_and_metrics(
             &mut words,
             false,
             Some(progress.clone()),
-            Some(&cancelled),
+            Some(cancelled.clone()),
             Some(transcription_progress),
         )?;
     }
@@ -1127,7 +1127,7 @@ fn transcribe_sources(
     words: &mut Vec<TimedWord>,
     strict_audio: bool,
     processing_progress: Option<ProcessingProgressReporter>,
-    cancelled: Option<&AtomicBool>,
+    cancelled: Option<Arc<AtomicBool>>,
     transcription_progress: Option<ProgressReporter>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let model = args.whisper_model.as_deref().ok_or_else(|| {
@@ -1169,12 +1169,13 @@ fn transcribe_sources(
         args.language.clone(),
         threads,
         combined_progress,
+        cancelled.clone(),
     )?;
     for (source, enabled) in [
         (AudioSource::Mic, manifest.mic.enabled),
         (AudioSource::System, manifest.system.enabled),
     ] {
-        if let Some(cancelled) = cancelled {
+        if let Some(cancelled) = cancelled.as_deref() {
             ensure_not_cancelled(cancelled)?;
         }
         let samples = read_enabled_audio(session, source, enabled, strict_audio)?;

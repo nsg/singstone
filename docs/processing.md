@@ -62,7 +62,7 @@ devices even when they can run its trivial test kernel, because larger ggml
 kernels are not supported there. It prefers Level Zero, retries with OpenCL
 when Level Zero fails, and falls back to the CPU build when no supported GPU
 runtime works. `SINGSTONE_DISABLE_GPU=1` forces that CPU path. The GUI header
-and processing dialog identify CPU or GPU use, while the Settings page and
+and processing view identify CPU or GPU use, while the Settings page and
 transcription log include the device and selected SYCL runtime.
 
 The probe runs with core dumps disabled and records its stages in

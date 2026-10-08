@@ -50,12 +50,19 @@ the remote end before re-rendering the transcript.
 
 ![Meeting details dialog with a title and local and remote attendees](docs/images/meeting-details.png)
 
-Run the local processing pipeline without leaving the meeting window. The
-dialog reports each stage and can be cancelled while work is in progress.
+Processing runs in the background, one recording at a time. Press **Process**
+on a recording and it starts at once; press it on the next ones and they wait
+in a queue at the bottom of the session list. The rest of the application
+stays usable, so a backlog can be queued up and left to finish. Select the
+session in progress to follow each stage, and cancel it or remove a waiting
+one at any time. A failed session does not stop the queue. While a recording
+is in progress, the queue finishes the session it is working on and starts
+the next one when the recording stops. Automatic suspend is held off until
+the queue is empty.
 Reprocessing replaces derived outputs and automatic speaker matches while
 preserving the recorded audio and confirmed names.
 
-![Processing dialog showing transcription progress and pipeline stages](docs/images/processing.png)
+![Session in progress showing its pipeline stages, with two more sessions waiting in the queue below the session list](docs/images/processing.png)
 
 ## Features
 
@@ -69,6 +76,8 @@ preserving the recorded audio and confirmed names.
 - Marks loudspeaker sound picked up by the microphone as echo by comparing the
   two recordings, without deleting it.
 - Hides either audio source from a session's transcript without deleting it.
+- Queues recordings for background processing, one after another, while the
+  rest of the application stays usable.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback, editable
   storage folders, and a one-click header Record button.
@@ -297,7 +306,7 @@ The `singstone` launcher opens a small SYCL queue in a separate probe process.
 An Intel FP16 GPU with a working Level Zero or OpenCL driver selects the FP16
 SYCL build. Level Zero is preferred for performance; OpenCL is the automatic
 GPU fallback. Probe errors, missing device access, and other GPU types select
-the CPU build. The header, Settings page, processing dialog, and transcription
+the CPU build. The header, Settings page, processing view, and transcription
 log identify the selected backend, runtime, and device name reported by oneAPI.
 
 Model weights are not bundled in the Snap. The setup service downloads the

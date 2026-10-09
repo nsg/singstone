@@ -64,6 +64,11 @@ preserving the recorded audio and confirmed names.
 
 ![Session in progress showing its pipeline stages, with two more sessions waiting in the queue below the session list](docs/images/processing.png)
 
+When a processed session's speakers are checked, press **Mark done** to label
+it **Done** in the session list. The label only marks the session as finished
+for your own overview: **Unmark done** reverts it, reprocessing clears it, and
+a session can be archived with or without it.
+
 ## Features
 
 - Records a microphone, a PipeWire sink monitor, or both as aligned 16 kHz audio.
@@ -85,6 +90,8 @@ preserving the recorded audio and confirmed names.
   in the meeting, and line-specific correction when a voice was matched to the
   wrong person. Confirmed lines remain locked across reprocessing.
 - Renames sessions and deletes them, after a confirmation, from the session view.
+- Flags a processed session as done, to tell reviewed sessions from those that
+  still need attention.
 - Archives a processed session's audio as 16-bit FLAC, about a fifth of the
   size, while keeping playback and reprocessing.
 - Optional GNOME Shell extension with a top-bar Record/Stop button and live

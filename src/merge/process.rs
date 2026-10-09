@@ -267,6 +267,7 @@ pub fn run_with_control_and_metrics(
     render_artifacts_with_hook(&session, &manifest, diarize_mic, || {
         progress(ProcessingProgress::indeterminate(ProcessingStage::Writing));
     })?;
+    session.set_done(false)?;
     progress(ProcessingProgress::determinate(
         ProcessingStage::Finished,
         1.0,
@@ -3242,6 +3243,7 @@ mod tests {
             .expect("write corrections");
         let correction_bytes =
             fs::read(session.speaker_corrections_path()).expect("read corrections");
+        session.set_done(true).expect("flag session as done");
 
         run(ProcessArgs {
             session: session.dir.clone(),
@@ -3287,6 +3289,7 @@ mod tests {
             fs::read(session.speaker_corrections_path()).expect("reread corrections"),
             correction_bytes
         );
+        assert!(!session.is_done());
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

@@ -51,6 +51,7 @@ const CSS: &str = r#"
 .pill-busy { color: @warning_fg_color; background: @warning_bg_color; }
 .pill-queued { color: @window_fg_color; background: alpha(currentColor, 0.15); }
 .pill-failed { color: @error_fg_color; background: @error_bg_color; }
+.pill-done { color: white; background: #1c7f91; }
 .pill-archived { color: white; background: @purple_3; }
 .recording-dot { color: #e01b24; }
 .record-button { border-radius: 999px; padding-left: 12px; padding-right: 12px; font-weight: 600; }
@@ -124,6 +125,7 @@ struct SessionDetail {
     subtitle: gtk::Label,
     status: gtk::Label,
     process_button: gtk::Button,
+    done_button: gtk::Button,
     archive_button: gtk::Button,
     meeting_button: gtk::Button,
     rename_button: gtk::Button,
@@ -1244,6 +1246,9 @@ fn build_session_detail(
     process_button.add_css_class("suggested-action");
     process_button.set_visible(false);
     top.append(&process_button);
+    let done_button = gtk::Button::with_label("Mark done");
+    done_button.set_visible(false);
+    top.append(&done_button);
     let archive_button = gtk::Button::with_label("Archive…");
     archive_button.set_tooltip_text(Some(
         "Convert the recorded audio to 16-bit FLAC to save disk space",
@@ -1368,6 +1373,7 @@ fn build_session_detail(
         subtitle,
         status,
         process_button,
+        done_button,
         archive_button,
         meeting_button,
         rename_button,
@@ -1965,6 +1971,28 @@ fn wire_session_actions(
     queue: &Rc<RefCell<ProcessingQueue>>,
     controller: &Rc<QueueController>,
 ) {
+    let parent = window.clone();
+    let detail_for_done = detail.clone();
+    let list_for_done = list.clone();
+    let paths_for_done = paths.clone();
+    let queue_for_done = queue.clone();
+    detail.done_button.connect_clicked(move |_| {
+        let Some(session_path) = detail_for_done.selected.borrow().clone() else {
+            return;
+        };
+        if let Err(error) =
+            Session::open(&session_path).and_then(|session| session.set_done(!session.is_done()))
+        {
+            show_error(&parent, "Could not update session", &error.to_string());
+        }
+        update_session_row(
+            &list_for_done,
+            &paths_for_done,
+            &session_path,
+            &queue_for_done.borrow(),
+        );
+        detail_for_done.refresh_queue_state();
+    });
     let parent = window.clone();
     let detail_for_rename = detail.clone();
     let config_for_rename = config.clone();
@@ -4158,8 +4186,24 @@ impl SessionDetail {
 
         let running = matches!(queue_state, Some(JobState::Running));
         let waiting = matches!(queue_state, Some(JobState::Waiting { .. }));
+        let archived = session.is_archived();
+        let done = session.is_done();
+        self.done_button.set_visible(
+            processed
+                && !recording
+                && !archived
+                && queue_state.is_none()
+                && !self.queue.borrow().has_failed(&session.dir),
+        );
+        self.done_button
+            .set_label(if done { "Unmark done" } else { "Mark done" });
+        self.done_button.set_tooltip_text(Some(if done {
+            "Move this session back to Processed"
+        } else {
+            "Flag this session as finished"
+        }));
         self.archive_button
-            .set_visible(processed && !recording && !session.is_archived());
+            .set_visible(processed && !recording && !archived);
         self.archive_button.set_sensitive(!running);
         self.meeting_button
             .set_visible((processed || waiting || running) && !recording);
@@ -4213,6 +4257,7 @@ impl SessionDetail {
         for widget in [
             self.status.upcast_ref::<gtk::Widget>(),
             self.process_button.upcast_ref(),
+            self.done_button.upcast_ref(),
             self.archive_button.upcast_ref(),
             self.meeting_button.upcast_ref(),
             self.rename_button.upcast_ref(),
@@ -4304,6 +4349,8 @@ fn session_status(session: &Session, manifest: &Manifest) -> (&'static str, &'st
         ("Recorded", "idle")
     } else if session.is_archived() {
         ("Archived", "archived")
+    } else if session.is_done() {
+        ("Done", "done")
     } else {
         ("Processed", "ok")
     }
@@ -5199,6 +5246,7 @@ fn set_status(label: &gtk::Label, text: &str, class: &str) {
         "pill-busy",
         "pill-queued",
         "pill-failed",
+        "pill-done",
         "pill-archived",
     ] {
         label.remove_css_class(name);

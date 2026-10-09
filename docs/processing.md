@@ -531,6 +531,9 @@ Every rerun recipe preserves `speaker-corrections.json` and
 `hidden-sources.json`; `process` and the individual `transcribe`, `diarize`,
 `recognize`, `render`, `correct`, and `archive` stages never edit or delete
 either file.
+A finished `process` run does remove the session's `done` marker, the empty
+file behind the app's **Done** label, because the new transcript has not been
+reviewed.
 The app's **Process again** flow therefore keeps confirmed lines. To discard
 every confirmed line, remove `speaker-corrections.json` manually.
 

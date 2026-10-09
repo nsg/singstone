@@ -102,6 +102,22 @@ impl Session {
                 .into_iter()
                 .any(|source| self.audio_path(source).is_file())
     }
+    pub fn done_path(&self) -> PathBuf {
+        self.dir.join("done")
+    }
+    /// True while the session is flagged as done.
+    pub fn is_done(&self) -> bool {
+        self.done_path().is_file()
+    }
+    pub fn set_done(&self, done: bool) -> io::Result<()> {
+        if done {
+            return create_private_file(&self.done_path()).map(drop);
+        }
+        match fs::remove_file(self.done_path()) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
     pub fn timeline_path(&self, source: crate::types::AudioSource) -> PathBuf {
         self.dir
             .join("audio")
@@ -403,6 +419,21 @@ mod tests {
                 & 0o777,
             0o700
         );
+        fs::remove_dir_all(root).expect("remove sessions");
+    }
+
+    #[test]
+    fn done_flag_round_trips() {
+        let root =
+            std::env::temp_dir().join(format!("singstone-session-done-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let session = Session::create(root.join("session")).expect("create session");
+        assert!(!session.is_done());
+        session.set_done(false).expect("clear unset flag");
+        session.set_done(true).expect("set flag");
+        assert!(session.is_done());
+        session.set_done(false).expect("clear flag");
+        assert!(!session.is_done());
         fs::remove_dir_all(root).expect("remove sessions");
     }
 

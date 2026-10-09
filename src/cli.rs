@@ -1,5 +1,6 @@
 use crate::types::{AudioSource, DEFAULT_SPEAKER_THRESHOLD};
 use clap::{ArgAction, Args, Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -70,7 +71,7 @@ pub struct RecordArgs {
     pub duration: Option<f64>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, PartialEq)]
 pub struct ProcessArgs {
     /// Session directory.
     pub session: PathBuf,
@@ -128,6 +129,9 @@ pub struct ProcessArgs {
     /// Fix the number of speakers instead of estimating it.
     #[arg(long)]
     pub num_speakers: Option<u32>,
+    /// Stream machine-readable processing events to stdout.
+    #[arg(long, hide = true)]
+    pub events: bool,
 }
 
 impl ProcessArgs {
@@ -152,7 +156,65 @@ impl ProcessArgs {
             speaker_threshold: DEFAULT_SPEAKER_THRESHOLD,
             cluster_threshold: 1.0,
             num_speakers: None,
+            events: false,
         }
+    }
+
+    pub fn command_args(&self) -> Vec<OsString> {
+        let mut args = vec![
+            OsString::from("process"),
+            self.session.as_os_str().to_owned(),
+        ];
+        push_path_option(&mut args, "--meeting", self.meeting.as_deref());
+        push_path_option(&mut args, "--whisper-model", self.whisper_model.as_deref());
+        push_path_option(
+            &mut args,
+            "--segmentation-model",
+            self.segmentation_model.as_deref(),
+        );
+        push_path_option(
+            &mut args,
+            "--embedding-model",
+            self.embedding_model.as_deref(),
+        );
+        push_path_option(&mut args, "--models-lock", self.models_lock.as_deref());
+        if self.allow_unverified_models {
+            args.push("--allow-unverified-models".into());
+        }
+        args.push(format!("--diarize-mic={}", self.diarize_mic).into());
+        if self.no_diarize {
+            args.push("--no-diarize".into());
+        }
+        if self.skip_transcription {
+            args.push("--skip-transcription".into());
+        }
+        args.extend([OsString::from("--language"), self.language.clone().into()]);
+        if let Some(threads) = self.threads {
+            args.extend([OsString::from("--threads"), threads.to_string().into()]);
+        }
+        push_path_option(&mut args, "--speakers-db", self.speakers_db.as_deref());
+        args.extend([
+            OsString::from("--speaker-threshold"),
+            self.speaker_threshold.to_string().into(),
+            OsString::from("--cluster-threshold"),
+            self.cluster_threshold.to_string().into(),
+        ]);
+        if let Some(num_speakers) = self.num_speakers {
+            args.extend([
+                OsString::from("--num-speakers"),
+                num_speakers.to_string().into(),
+            ]);
+        }
+        if self.events {
+            args.push("--events".into());
+        }
+        args
+    }
+}
+
+fn push_path_option(args: &mut Vec<OsString>, flag: &str, value: Option<&std::path::Path>) {
+    if let Some(value) = value {
+        args.extend([OsString::from(flag), value.as_os_str().to_owned()]);
     }
 }
 
@@ -443,6 +505,37 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn process_arguments_round_trip_to_command_line() {
+        let expected = ProcessArgs {
+            session: "session path".into(),
+            meeting: Some("meeting.json".into()),
+            whisper_model: Some("whisper.bin".into()),
+            segmentation_model: Some("segmentation.onnx".into()),
+            embedding_model: Some("embedding.onnx".into()),
+            models_lock: Some("models.lock".into()),
+            allow_unverified_models: true,
+            diarize_mic: false,
+            no_diarize: true,
+            skip_transcription: true,
+            language: "sv".into(),
+            threads: Some(3),
+            speakers_db: Some("speakers.json".into()),
+            speaker_threshold: 0.81,
+            cluster_threshold: 0.95,
+            num_speakers: Some(4),
+            events: true,
+        };
+        let mut command = vec![OsString::from("singstone")];
+        command.extend(expected.command_args());
+
+        let parsed = Cli::try_parse_from(command).expect("parse generated process arguments");
+        let Command::Process(actual) = parsed.command else {
+            panic!("expected process command");
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]

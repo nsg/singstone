@@ -25,7 +25,6 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 const SPEAKER_ASSIGNMENTS_FORMAT_VERSION: u32 = 1;
@@ -51,7 +50,7 @@ struct CorrectionLearningUpdate {
     vectors: Vec<Vec<f32>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProcessingStage {
     Preparing,
     TranscribingMic,
@@ -96,7 +95,7 @@ impl ProcessingStage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ProcessingProgress {
     pub stage: ProcessingStage,
     pub fraction: Option<f64>,
@@ -173,33 +172,18 @@ pub fn run_with_progress(
     args: ProcessArgs,
     progress: impl Fn(ProcessingStage) + Send + Sync + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_control(args, progress, Arc::new(AtomicBool::new(false)))
+    run_with_metrics(args, move |update| progress(update.stage), Arc::new(|_| {}))
 }
 
-pub fn run_with_control(
-    args: ProcessArgs,
-    progress: impl Fn(ProcessingStage) + Send + Sync + 'static,
-    cancelled: Arc<AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    run_with_control_and_metrics(
-        args,
-        move |update| progress(update.stage),
-        cancelled,
-        Arc::new(|_| {}),
-    )
-}
-
-pub fn run_with_control_and_metrics(
+pub fn run_with_metrics(
     args: ProcessArgs,
     progress: impl Fn(ProcessingProgress) + Send + Sync + 'static,
-    cancelled: Arc<AtomicBool>,
     transcription_progress: ProgressReporter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let progress: ProcessingProgressReporter = Arc::new(progress);
     progress(ProcessingProgress::indeterminate(
         ProcessingStage::Preparing,
     ));
-    ensure_not_cancelled(&cancelled)?;
     let (session, manifest) = open_session(&args.session)?;
     prepare_meeting(&args, &session)?;
     let threads = thread_count(args.threads);
@@ -216,12 +200,10 @@ pub fn run_with_control_and_metrics(
             &mut words,
             false,
             Some(progress.clone()),
-            Some(cancelled.clone()),
             Some(transcription_progress),
         )?;
     }
 
-    ensure_not_cancelled(&cancelled)?;
     progress(ProcessingProgress::indeterminate(
         ProcessingStage::Diarizing,
     ));
@@ -237,7 +219,6 @@ pub fn run_with_control_and_metrics(
         diarization_started.elapsed().as_secs_f64()
     );
 
-    ensure_not_cancelled(&cancelled)?;
     progress(ProcessingProgress::indeterminate(
         ProcessingStage::Recognizing,
     ));
@@ -262,7 +243,6 @@ pub fn run_with_control_and_metrics(
         recognition_started.elapsed().as_secs_f64()
     );
 
-    ensure_not_cancelled(&cancelled)?;
     progress(ProcessingProgress::indeterminate(ProcessingStage::Merging));
     render_artifacts_with_hook(&session, &manifest, diarize_mic, || {
         progress(ProcessingProgress::indeterminate(ProcessingStage::Writing));
@@ -273,17 +253,6 @@ pub fn run_with_control_and_metrics(
         1.0,
     ));
     Ok(())
-}
-
-fn ensure_not_cancelled(cancelled: &AtomicBool) -> io::Result<()> {
-    if cancelled.load(Ordering::Acquire) {
-        Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            "processing cancelled",
-        ))
-    } else {
-        Ok(())
-    }
 }
 
 pub fn run_transcribe(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -309,7 +278,6 @@ pub fn run_transcribe(args: TranscribeArgs) -> Result<(), Box<dyn std::error::Er
         thread_count(process.threads),
         &mut words,
         true,
-        None,
         None,
         None,
     )
@@ -1061,6 +1029,7 @@ fn stage_process_args(session: PathBuf) -> ProcessArgs {
         speaker_threshold: DEFAULT_SPEAKER_THRESHOLD,
         cluster_threshold: 1.0,
         num_speakers: None,
+        events: false,
     }
 }
 
@@ -1128,7 +1097,6 @@ fn transcribe_sources(
     words: &mut Vec<TimedWord>,
     strict_audio: bool,
     processing_progress: Option<ProcessingProgressReporter>,
-    cancelled: Option<Arc<AtomicBool>>,
     transcription_progress: Option<ProgressReporter>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let model = args.whisper_model.as_deref().ok_or_else(|| {
@@ -1170,15 +1138,11 @@ fn transcribe_sources(
         args.language.clone(),
         threads,
         combined_progress,
-        cancelled.clone(),
     )?;
     for (source, enabled) in [
         (AudioSource::Mic, manifest.mic.enabled),
         (AudioSource::System, manifest.system.enabled),
     ] {
-        if let Some(cancelled) = cancelled.as_deref() {
-            ensure_not_cancelled(cancelled)?;
-        }
         let samples = read_enabled_audio(session, source, enabled, strict_audio)?;
         if samples.is_empty() {
             continue;
@@ -3137,6 +3101,7 @@ mod tests {
             speaker_threshold: 0.6,
             cluster_threshold: 0.5,
             num_speakers: None,
+            events: false,
         };
         let segments =
             diarize_sources(&args, &session, &manifest, 1, true).expect("diarize fixture");
@@ -3167,6 +3132,7 @@ mod tests {
             speaker_threshold: 0.6,
             cluster_threshold: 1.0,
             num_speakers: None,
+            events: false,
         })
         .expect("process with skipped stages");
         run(ProcessArgs {
@@ -3186,6 +3152,7 @@ mod tests {
             speaker_threshold: 0.6,
             cluster_threshold: 1.0,
             num_speakers: None,
+            events: false,
         })
         .expect("fall back when diarization models cannot be verified");
         assert!(session.diarization_metadata_path().is_file());
@@ -3262,6 +3229,7 @@ mod tests {
             speaker_threshold: 0.6,
             cluster_threshold: 1.0,
             num_speakers: None,
+            events: false,
         })
         .expect("reprocess session");
 

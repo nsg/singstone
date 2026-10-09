@@ -5,9 +5,10 @@ pub mod vad;
 pub mod whisper;
 
 use crate::types::{AudioSource, TimedWord};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TranscriptionProgress {
     pub source: AudioSource,
     pub processed_seconds: f64,

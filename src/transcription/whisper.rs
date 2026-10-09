@@ -3,8 +3,6 @@ use super::vad::{self, SpeechRegion, VadConfig};
 use super::{ProgressReporter, Transcriber, TranscriptionProgress};
 use crate::types::{AudioSource, SAMPLE_RATE, TimedWord, samples_to_ms};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
@@ -18,7 +16,6 @@ pub struct WhisperTranscriber {
     threads: usize,
     vad: VadConfig,
     progress: Option<ProgressReporter>,
-    cancelled: Option<Arc<AtomicBool>>,
 }
 
 impl WhisperTranscriber {
@@ -28,7 +25,6 @@ impl WhisperTranscriber {
         language: String,
         threads: usize,
         progress: Option<ProgressReporter>,
-        cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         whisper_rs::install_logging_hooks();
         eprintln!(
@@ -45,7 +41,6 @@ impl WhisperTranscriber {
             threads,
             vad: VadConfig::default(),
             progress,
-            cancelled,
         })
     }
 
@@ -113,17 +108,6 @@ impl Transcriber for WhisperTranscriber {
                 .chunks(chunk_samples)
                 .enumerate()
             {
-                if self
-                    .cancelled
-                    .as_ref()
-                    .is_some_and(|cancelled| cancelled.load(Ordering::Acquire))
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "processing cancelled",
-                    )
-                    .into());
-                }
                 let chunk_sample_count = chunk.len();
                 let mut padded = Vec::new();
                 let audio = if chunk.len() < SAMPLE_RATE as usize {

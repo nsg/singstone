@@ -5,11 +5,11 @@ mod timeline_layout;
 mod wrap_layout;
 
 use crate::audio::{archive, devices, record};
-use crate::cli::{Command, ProcessArgs, RecordArgs, RenderArgs};
+use crate::cli::{ProcessArgs, RecordArgs, RenderArgs};
 use crate::format::jsonl;
 use crate::meeting::{self, Attendees, MeetingDetails};
+use crate::merge::events::{self, ProcessingEvent};
 use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
-use crate::model_setup;
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
 use crate::transcription::{TranscriptionProgress, backend};
@@ -21,13 +21,16 @@ use libadwaita as adw;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand, ExitCode, Stdio};
+use std::process::{Child, Command as ProcessCommand, ExitCode, ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use rustix::process::{Pid, Signal};
 
 use self::config::GuiConfig;
 use self::queue::{
@@ -152,6 +155,7 @@ struct SessionDetail {
 #[derive(Clone)]
 struct ProcessingView {
     root: gtk::Box,
+    spinner: gtk::Spinner,
     label: gtk::Label,
     progress: gtk::ProgressBar,
     stages: Vec<gtk::Label>,
@@ -172,6 +176,8 @@ enum QueuePanelAction {
 
 #[derive(Clone)]
 struct QueuePanelProgress {
+    spinner: gtk::Spinner,
+    compact_spinner: gtk::Spinner,
     stage: gtk::Label,
     bar: gtk::ProgressBar,
     step: gtk::Label,
@@ -350,9 +356,9 @@ impl QueuePanel {
             compact_bar.set_pulse_step(0.04);
             self.collapsed.append(&compact_bar);
             let compact = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-            let spinner = gtk::Spinner::new();
-            spinner.set_spinning(true);
-            compact.append(&spinner);
+            let compact_spinner = gtk::Spinner::new();
+            compact_spinner.set_spinning(true);
+            compact.append(&compact_spinner);
             let select = queue_entry_button(&title, true);
             select.add_css_class("flat");
             select.add_css_class("queue-entry-button");
@@ -376,6 +382,8 @@ impl QueuePanel {
             compact.append(&expand);
             self.collapsed.append(&compact);
             dynamic = Some(QueuePanelProgress {
+                spinner,
+                compact_spinner,
                 stage,
                 bar,
                 step,
@@ -518,14 +526,19 @@ impl QueuePanel {
         update: ProcessingProgress,
         metrics: Option<TranscriptionProgress>,
         cancelled: bool,
+        paused: bool,
         position_total: Option<(usize, usize)>,
     ) {
         let Some(widgets) = self.progress.borrow().as_ref().cloned() else {
             return;
         };
         widgets.cancel.set_sensitive(!cancelled);
+        widgets.spinner.set_spinning(!paused);
+        widgets.compact_spinner.set_spinning(!paused);
         widgets.stage.set_label(if cancelled {
             "Cancelling…"
+        } else if paused {
+            "Paused while recording"
         } else {
             update.stage.label()
         });
@@ -544,15 +557,19 @@ impl QueuePanel {
             widgets
                 .percent
                 .set_label(&format!("{:.0}%", fraction * 100.0));
-        } else {
+        } else if !paused {
             widgets.bar.pulse();
             widgets.compact_bar.pulse();
             widgets.percent.set_label("");
         }
-        let mut status = position_total
-            .map(|(position, total)| format!("{position} of {total}"))
-            .unwrap_or_default();
-        if let Some(fraction) = fraction {
+        let mut status = if paused && !cancelled {
+            "Paused while recording".into()
+        } else {
+            position_total
+                .map(|(position, total)| format!("{position} of {total}"))
+                .unwrap_or_default()
+        };
+        if !paused && let Some(fraction) = fraction {
             status.push_str(&format!(" · {:.0}%", fraction * 100.0));
         }
         widgets.compact_status.set_label(&status);
@@ -2699,7 +2716,14 @@ struct RunningProcessing {
     path: PathBuf,
     progress: Arc<Mutex<ProcessingProgress>>,
     transcription_metrics: Arc<Mutex<Option<TranscriptionProgress>>>,
-    cancelled: Arc<AtomicBool>,
+    cancellation_requested: Arc<AtomicBool>,
+    child: Arc<Mutex<Option<Child>>>,
+    paused: Cell<bool>,
+    paused_at: Cell<Option<Instant>>,
+    metrics_source: Cell<Option<AudioSource>>,
+    paused_for_source: Cell<Duration>,
+    last_worker_metrics: Cell<Option<TranscriptionProgress>>,
+    display_metrics: Cell<Option<TranscriptionProgress>>,
     result: Arc<Mutex<Option<ProcessingOutcome>>>,
 }
 
@@ -2708,6 +2732,7 @@ struct ProgressSnapshot {
     update: ProcessingProgress,
     metrics: Option<TranscriptionProgress>,
     cancelled: bool,
+    paused: bool,
 }
 
 struct QueueController {
@@ -2829,7 +2854,12 @@ impl QueueController {
             let Some(running) = running.as_ref() else {
                 return;
             };
-            running.cancelled.store(true, Ordering::Release);
+            running
+                .cancellation_requested
+                .store(true, Ordering::Release);
+            if let Err(error) = signal_child(&running.child, Signal::KILL) {
+                eprintln!("warning: cannot cancel processing child: {error}");
+            }
         }
         self.detail.cancel_requested.set(true);
         self.detail.refresh_queue_state();
@@ -2908,6 +2938,8 @@ impl QueueController {
             return glib::ControlFlow::Continue;
         }
 
+        self.update_pause_state();
+
         if self.running.borrow().is_none() && !self.queue.borrow().waiting().is_empty() {
             if self.recording_job.borrow().is_some() {
                 if !self.recording_held.replace(true) {
@@ -2939,6 +2971,55 @@ impl QueueController {
         }
     }
 
+    fn update_pause_state(&self) {
+        let recording = self.recording_job.borrow().is_some();
+        let rerender = {
+            let running = self.running.borrow();
+            let Some(running) = running.as_ref() else {
+                return;
+            };
+            if recording && !running.paused.get() {
+                match signal_child(&running.child, Signal::STOP) {
+                    Ok(true) => {
+                        running.paused.set(true);
+                        running.paused_at.set(Some(Instant::now()));
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(error) => {
+                        eprintln!("warning: cannot pause processing child: {error}");
+                        false
+                    }
+                }
+            } else if !recording && running.paused.get() {
+                match signal_child(&running.child, Signal::CONT) {
+                    Ok(true) => {
+                        if running.metrics_source.get().is_some()
+                            && let Some(started) = running.paused_at.get()
+                        {
+                            running
+                                .paused_for_source
+                                .set(running.paused_for_source.get() + started.elapsed());
+                        }
+                        running.paused.set(false);
+                        running.paused_at.set(None);
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(error) => {
+                        eprintln!("warning: cannot resume processing child: {error}");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        };
+        if rerender {
+            self.render_panel();
+        }
+    }
+
     fn start_next(&self) {
         let Some(path) = self.queue.borrow_mut().start_next() else {
             return;
@@ -2949,13 +3030,21 @@ impl QueueController {
             fraction: None,
         }));
         let transcription_metrics = Arc::new(Mutex::new(None));
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation_requested = Arc::new(AtomicBool::new(false));
+        let child = Arc::new(Mutex::new(None));
         let result = Arc::new(Mutex::new(None));
         *self.running.borrow_mut() = Some(RunningProcessing {
             path: path.clone(),
             progress: progress.clone(),
             transcription_metrics: transcription_metrics.clone(),
-            cancelled: cancelled.clone(),
+            cancellation_requested: cancellation_requested.clone(),
+            child: child.clone(),
+            paused: Cell::new(false),
+            paused_at: Cell::new(None),
+            metrics_source: Cell::new(None),
+            paused_for_source: Cell::new(Duration::ZERO),
+            last_worker_metrics: Cell::new(None),
+            display_metrics: Cell::new(None),
             result: result.clone(),
         });
         reset_processing_view(&self.detail.processing);
@@ -2981,37 +3070,70 @@ impl QueueController {
                     args.whisper_model = Some(PathBuf::from(model));
                 }
                 args.language = if swedish_transcription { "sv" } else { "auto" }.into();
-                let command = Command::Process(args);
-                model_setup::ensure_available(&command).map_err(|error| error.to_string())?;
-                let Command::Process(args) = command else {
-                    unreachable!()
-                };
+                args.events = true;
                 Ok(args)
             })();
             let outcome = match prepared {
+                Err(_) if cancellation_requested.load(Ordering::Acquire) => {
+                    ProcessingOutcome::Cancelled
+                }
                 Err(error) => ProcessingOutcome::Failed(error),
-                Ok(args) => match process::run_with_control_and_metrics(
-                    args,
-                    move |update| {
-                        *progress.lock().expect("processing progress mutex") = update;
-                    },
-                    cancelled,
-                    Arc::new(move |metrics| {
-                        *transcription_metrics
-                            .lock()
-                            .expect("transcription metrics mutex") = Some(metrics);
-                    }),
-                ) {
-                    Ok(()) => ProcessingOutcome::Finished,
-                    Err(error)
-                        if error
-                            .downcast_ref::<io::Error>()
-                            .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted) =>
-                    {
-                        ProcessingOutcome::Cancelled
+                Ok(_) if cancellation_requested.load(Ordering::Acquire) => {
+                    ProcessingOutcome::Cancelled
+                }
+                Ok(args) => {
+                    let spawned = std::env::current_exe()
+                        .map_err(|error| format!("cannot find the processing executable: {error}"))
+                        .and_then(|executable| {
+                            ProcessCommand::new(executable)
+                                .args(args.command_args())
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::piped())
+                                .stderr(Stdio::inherit())
+                                .spawn()
+                                .map_err(|error| format!("cannot start processing worker: {error}"))
+                        });
+                    match spawned {
+                        Err(_) if cancellation_requested.load(Ordering::Acquire) => {
+                            ProcessingOutcome::Cancelled
+                        }
+                        Err(error) => ProcessingOutcome::Failed(error),
+                        Ok(mut spawned) => {
+                            let stdout = spawned.stdout.take();
+                            *child.lock().expect("processing child mutex") = Some(spawned);
+                            if cancellation_requested.load(Ordering::Acquire) {
+                                let _ = signal_child(&child, Signal::KILL);
+                            }
+
+                            let failure = stdout.and_then(|stdout| {
+                                read_worker_events(stdout, &progress, &transcription_metrics)
+                            });
+
+                            let status = {
+                                let mut child = child.lock().expect("processing child mutex");
+                                let status = child
+                                    .as_mut()
+                                    .expect("processing child stored before event read")
+                                    .wait();
+                                *child = None;
+                                status
+                            };
+                            match status {
+                                Ok(status) => processing_outcome(
+                                    status,
+                                    failure,
+                                    cancellation_requested.load(Ordering::Acquire),
+                                ),
+                                Err(_) if cancellation_requested.load(Ordering::Acquire) => {
+                                    ProcessingOutcome::Cancelled
+                                }
+                                Err(error) => ProcessingOutcome::Failed(format!(
+                                    "cannot reap processing worker: {error}"
+                                )),
+                            }
+                        }
                     }
-                    Err(error) => ProcessingOutcome::Failed(error.to_string()),
-                },
+                }
             };
             *result.lock().expect("processing result mutex") = Some(outcome);
         });
@@ -3102,18 +3224,34 @@ impl QueueController {
     }
 
     fn progress_snapshot(&self) -> Option<ProgressSnapshot> {
-        self.running
-            .borrow()
-            .as_ref()
-            .map(|running| ProgressSnapshot {
+        self.running.borrow().as_ref().map(|running| {
+            let metrics = *running
+                .transcription_metrics
+                .lock()
+                .expect("transcription metrics mutex");
+            if metrics != running.last_worker_metrics.get() {
+                if let Some(metrics) = metrics {
+                    if running.metrics_source.get() != Some(metrics.source) {
+                        running.metrics_source.set(Some(metrics.source));
+                        running.paused_for_source.set(Duration::ZERO);
+                    }
+                    running.display_metrics.set(Some(compensate_paused_elapsed(
+                        metrics,
+                        running.paused_for_source.get(),
+                    )));
+                } else {
+                    running.display_metrics.set(None);
+                }
+                running.last_worker_metrics.set(metrics);
+            }
+            ProgressSnapshot {
                 path: running.path.clone(),
                 update: *running.progress.lock().expect("processing progress mutex"),
-                metrics: *running
-                    .transcription_metrics
-                    .lock()
-                    .expect("transcription metrics mutex"),
+                metrics: running.display_metrics.get(),
                 cancelled: self.detail.cancel_requested.get(),
-            })
+                paused: running.paused.get(),
+            }
+        })
     }
 
     fn apply_progress_snapshot(&self) {
@@ -3131,6 +3269,7 @@ impl QueueController {
             snapshot.update,
             current_metrics,
             snapshot.cancelled,
+            snapshot.paused,
             self.queue.borrow().batch_position_total(),
         );
         if self.detail.selected.borrow().as_deref() == Some(snapshot.path.as_path()) {
@@ -3139,6 +3278,7 @@ impl QueueController {
                 snapshot.update,
                 current_metrics,
                 snapshot.cancelled,
+                snapshot.paused,
             );
         }
     }
@@ -3160,7 +3300,12 @@ impl QueueController {
             self.update_row(&path);
         }
         if let Some(running) = self.running.borrow().as_ref() {
-            running.cancelled.store(true, Ordering::Release);
+            running
+                .cancellation_requested
+                .store(true, Ordering::Release);
+            if let Err(error) = signal_child(&running.child, Signal::KILL) {
+                eprintln!("warning: cannot stop processing child during quit: {error}");
+            }
             self.detail.cancel_requested.set(true);
         }
         self.detail.refresh_queue_state();
@@ -3174,12 +3319,16 @@ fn update_processing_view(
     update: ProcessingProgress,
     metrics: Option<TranscriptionProgress>,
     cancelled: bool,
+    paused: bool,
 ) {
     view.label.set_label(if cancelled {
         "Cancelling…"
+    } else if paused {
+        "Paused while recording"
     } else {
         update.stage.label()
     });
+    view.spinner.set_spinning(!paused);
     update_processing_stages(&view.stages, update.stage);
     view.metrics.set_visible(metrics.is_some());
     if let Some(metrics) = metrics {
@@ -3189,13 +3338,14 @@ fn update_processing_view(
         view.progress.set_fraction(fraction);
         view.progress
             .set_text(Some(&format!("{:.0}%", fraction * 100.0)));
-    } else {
+    } else if !paused {
         view.progress.pulse();
         view.progress.set_text(Some("Working…"));
     }
 }
 
 fn reset_processing_view(view: &ProcessingView) {
+    view.spinner.set_spinning(true);
     view.label.set_label(ProcessingStage::Preparing.label());
     update_processing_stages(&view.stages, ProcessingStage::Preparing);
     view.metrics.set_visible(false);
@@ -3561,10 +3711,95 @@ fn wire_archiving(
     });
 }
 
+#[derive(Debug, PartialEq)]
 enum ProcessingOutcome {
     Finished,
     Cancelled,
     Failed(String),
+}
+
+fn signal_child(child: &Mutex<Option<Child>>, signal: Signal) -> io::Result<bool> {
+    let child = child
+        .lock()
+        .map_err(|_| io::Error::other("processing child lock was poisoned"))?;
+    let Some(child) = child.as_ref() else {
+        return Ok(false);
+    };
+    let raw_pid = i32::try_from(child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::other("processing child has an invalid process id"))?;
+    rustix::process::kill_process(raw_pid, signal)?;
+    Ok(true)
+}
+
+/// Applies the worker's events until its stdout closes and returns the failure it reported.
+/// Lines that are not events come from native libraries and are passed on to stderr.
+fn read_worker_events(
+    stdout: impl Read,
+    progress: &Mutex<ProcessingProgress>,
+    transcription_metrics: &Mutex<Option<TranscriptionProgress>>,
+) -> Option<String> {
+    let mut failure = None;
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("warning: cannot read processing worker events: {error}");
+                break;
+            }
+        }
+        let text = String::from_utf8_lossy(&line);
+        match events::parse(text.trim_end()) {
+            Ok(ProcessingEvent::Progress { progress: update }) => {
+                *progress.lock().expect("processing progress mutex") = update;
+            }
+            Ok(ProcessingEvent::Transcription { progress: metrics }) => {
+                *transcription_metrics
+                    .lock()
+                    .expect("transcription metrics mutex") = Some(metrics);
+            }
+            Ok(ProcessingEvent::Failure { error }) => failure = Some(error),
+            Err(_) => eprintln!("{}", text.trim_end()),
+        }
+    }
+    failure
+}
+
+fn processing_outcome(
+    status: ExitStatus,
+    failure: Option<String>,
+    cancellation_requested: bool,
+) -> ProcessingOutcome {
+    if status.success() {
+        return ProcessingOutcome::Finished;
+    }
+    if cancellation_requested {
+        return ProcessingOutcome::Cancelled;
+    }
+    if let Some(error) = failure {
+        return ProcessingOutcome::Failed(error);
+    }
+    let detail = if let Some(signal) = status.signal() {
+        format!("signal {signal}")
+    } else if let Some(code) = status.code() {
+        format!("exit status {code}")
+    } else {
+        "an unknown status".into()
+    };
+    ProcessingOutcome::Failed(format!("processing stopped unexpectedly ({detail})"))
+}
+
+fn compensate_paused_elapsed(
+    mut metrics: TranscriptionProgress,
+    paused: Duration,
+) -> TranscriptionProgress {
+    metrics.elapsed_seconds = (metrics.elapsed_seconds - paused.as_secs_f64()).max(0.0);
+    metrics
 }
 
 fn processing_view(backend: &backend::WhisperBackend) -> ProcessingView {
@@ -3638,6 +3873,7 @@ fn processing_view(backend: &backend::WhisperBackend) -> ProcessingView {
     root.append(&clamp);
     ProcessingView {
         root,
+        spinner,
         label,
         progress,
         stages,
@@ -5492,6 +5728,71 @@ mod tests {
         assert_eq!(
             transcription_progress_text(progress),
             "1498 / 1986 s  ·  75%"
+        );
+    }
+
+    #[test]
+    fn worker_exit_maps_to_processing_outcome() {
+        let success = ExitStatus::from_raw(0);
+        assert_eq!(
+            processing_outcome(success, None, false),
+            ProcessingOutcome::Finished
+        );
+
+        let failure = ExitStatus::from_raw(7 << 8);
+        assert_eq!(
+            processing_outcome(failure, Some("model missing".into()), false),
+            ProcessingOutcome::Failed("model missing".into())
+        );
+        assert_eq!(
+            processing_outcome(failure, None, true),
+            ProcessingOutcome::Cancelled
+        );
+
+        let signalled = ExitStatus::from_raw(9);
+        assert_eq!(
+            processing_outcome(signalled, None, false),
+            ProcessingOutcome::Failed("processing stopped unexpectedly (signal 9)".into())
+        );
+    }
+
+    #[test]
+    fn worker_output_that_is_not_an_event_is_skipped() {
+        let progress = Mutex::new(ProcessingProgress {
+            stage: ProcessingStage::Preparing,
+            fraction: None,
+        });
+        let metrics = Mutex::new(None);
+        let output = concat!(
+            "native library banner\n",
+            "{\"event\":\"progress\",\"progress\":{\"stage\":\"Diarizing\",\"fraction\":null}}\n",
+            "\u{fffd}\n",
+            "{\"event\":\"failure\",\"error\":\"model missing\"}\n",
+        );
+
+        let failure = read_worker_events(output.as_bytes(), &progress, &metrics);
+
+        assert_eq!(failure.as_deref(), Some("model missing"));
+        assert_eq!(progress.lock().unwrap().stage, ProcessingStage::Diarizing);
+    }
+
+    #[test]
+    fn paused_time_is_removed_from_transcription_elapsed_time() {
+        let metrics = TranscriptionProgress {
+            source: AudioSource::System,
+            processed_seconds: 45.0,
+            total_seconds: 60.0,
+            audio_seconds: 45.0,
+            elapsed_seconds: 30.0,
+            decoded_tokens: 420,
+            tokens_per_second: Some(14.25),
+        };
+
+        let adjusted = compensate_paused_elapsed(metrics, Duration::from_millis(12_500));
+        assert_eq!(adjusted.elapsed_seconds, 17.5);
+        assert_eq!(
+            compensate_paused_elapsed(metrics, Duration::from_secs(40)).elapsed_seconds,
+            0.0
         );
     }
 

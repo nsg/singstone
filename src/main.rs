@@ -16,13 +16,22 @@ mod transcription;
 mod types;
 
 use clap::Parser;
+use rustix::process::{Pid, Signal};
+use std::io::{self, BufWriter};
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 fn main() -> ExitCode {
     if std::env::args_os().len() == 1 {
         return gui::run();
     }
     let cli = cli::Cli::parse();
+    if matches!(&cli.command, cli::Command::Process(args) if args.events) {
+        let cli::Command::Process(args) = cli.command else {
+            unreachable!()
+        };
+        return run_event_worker(args);
+    }
     if !matches!(
         cli.command,
         cli::Command::ModelSetup | cli::Command::ModelSetupCheck
@@ -53,4 +62,61 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn run_event_worker(args: cli::ProcessArgs) -> ExitCode {
+    let death_signal = rustix::process::set_parent_process_death_signal(Some(Signal::KILL));
+    let orphaned = rustix::process::getppid().is_none_or(|parent| parent == Pid::INIT);
+    let output = Arc::new(Mutex::new(BufWriter::new(io::stdout())));
+    let fail = |error: String| {
+        let _ = write_worker_event(&output, &merge::events::ProcessingEvent::Failure { error });
+        ExitCode::FAILURE
+    };
+
+    if let Err(error) = death_signal {
+        return fail(format!("cannot arm worker parent-death signal: {error}"));
+    }
+    if orphaned {
+        return fail("processing worker was orphaned before it started".into());
+    }
+
+    let command = cli::Command::Process(args);
+    if let Err(error) = model_setup::ensure_available(&command) {
+        return fail(error.to_string());
+    }
+    let cli::Command::Process(args) = command else {
+        unreachable!()
+    };
+
+    // Nobody reads the events once the parent is gone, so the work is abandoned with it.
+    let report = {
+        let output = output.clone();
+        move |event| {
+            if write_worker_event(&output, &event).is_err() {
+                std::process::exit(1);
+            }
+        }
+    };
+    let report_transcription = report.clone();
+    let result = merge::process::run_with_metrics(
+        args,
+        move |progress| report(merge::events::ProcessingEvent::Progress { progress }),
+        Arc::new(move |progress| {
+            report_transcription(merge::events::ProcessingEvent::Transcription { progress })
+        }),
+    );
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => fail(error.to_string()),
+    }
+}
+
+fn write_worker_event(
+    output: &Mutex<BufWriter<io::Stdout>>,
+    event: &merge::events::ProcessingEvent,
+) -> io::Result<()> {
+    let mut output = output
+        .lock()
+        .map_err(|_| io::Error::other("worker event output lock was poisoned"))?;
+    merge::events::write_line(&mut *output, event)
 }

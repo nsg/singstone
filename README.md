@@ -55,10 +55,11 @@ on a recording and it starts at once; press it on the next ones and they wait
 in a queue at the bottom of the session list. The rest of the application
 stays usable, so a backlog can be queued up and left to finish. Select the
 session in progress to follow each stage, and cancel it or remove a waiting
-one at any time. A failed session does not stop the queue. While a recording
-is in progress, the queue finishes the session it is working on and starts
-the next one when the recording stops. Automatic suspend is held off until
-the queue is empty.
+one at any time; cancelling takes effect at once. A failed session does not
+stop the queue. Processing pauses the moment a recording starts, so it does
+not compete with a call for the processor, and continues where it stopped
+when the recording ends. Automatic suspend is held off until the queue is
+empty.
 Reprocessing replaces derived outputs and automatic speaker matches while
 preserving the recorded audio and confirmed names.
 
@@ -81,8 +82,8 @@ a session can be archived with or without it.
 - Marks loudspeaker sound picked up by the microphone as echo by comparing the
   two recordings, without deleting it.
 - Hides either audio source from a session's transcript without deleting it.
-- Queues recordings for background processing, one after another, while the
-  rest of the application stays usable.
+- Queues recordings for background processing, one after another, and pauses
+  it for as long as a recording is in progress.
 - Provides a native GTK interface with live capture meters, screenshot counts,
   per-stage processing progress, transcript-side audio playback, editable
   storage folders, and a one-click header Record button.

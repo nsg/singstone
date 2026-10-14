@@ -2,6 +2,7 @@ mod config;
 mod queue;
 mod remote;
 mod timeline_layout;
+mod voice_map;
 mod wrap_layout;
 
 use crate::audio::{archive, devices, record};
@@ -37,6 +38,7 @@ use self::queue::{
     JobState, Outcome as QueueOutcome, ProcessingQueue, finished_banner_text, ordinal,
 };
 use self::timeline_layout::{TimelineLayout, TimelineRow, timeline_rows};
+use self::voice_map::VoiceMapView;
 use self::wrap_layout::WrapLayout;
 
 const APP_ID: &str = "io.github.nsg.Singstone";
@@ -56,6 +58,9 @@ const CSS: &str = r#"
 .pill-failed { color: @error_fg_color; background: @error_bg_color; }
 .pill-done { color: white; background: #1c7f91; }
 .pill-archived { color: white; background: @purple_3; }
+.voice-map-tools button { color: #eef0f5; background: alpha(#eef0f5, 0.08); }
+.voice-map-tools button:hover { background: alpha(#eef0f5, 0.16); }
+.voice-map-tools button:checked { color: #10131b; background: #ffb84d; }
 .recording-dot { color: #e01b24; }
 .record-button { border-radius: 999px; padding-left: 12px; padding-right: 12px; font-weight: 600; }
 .live-bar { background: alpha(#e01b24, 0.10); padding: 7px 12px; }
@@ -1430,6 +1435,8 @@ struct SpeakersPage {
     group: adw::PreferencesGroup,
     rows: Rc<RefCell<Vec<adw::ActionRow>>>,
     database_path: PathBuf,
+    views: adw::ViewStack,
+    map: VoiceMapView,
 }
 
 fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
@@ -1457,19 +1464,50 @@ fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
     body.append(&path);
     clamp.set_child(Some(&body));
     scroll.set_child(Some(&clamp));
-    root.append(&scroll);
+    let map = VoiceMapView::new();
+    let views = adw::ViewStack::new();
+    views.set_vexpand(true);
+    views.add_titled_with_icon(&scroll, Some("list"), "Voices", "system-users-symbolic");
+    views.add_titled_with_icon(
+        &map.root,
+        Some("map"),
+        "Voice map",
+        "find-location-symbolic",
+    );
+    let switcher = adw::ViewSwitcher::builder()
+        .stack(&views)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .halign(gtk::Align::Center)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    root.append(&switcher);
+    root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    root.append(&views);
     let page = SpeakersPage {
         root,
         group,
         rows: Rc::new(RefCell::new(Vec::new())),
         database_path: db_path,
+        views,
+        map,
     };
+    let page_for_switch = page.clone();
+    page.views
+        .connect_visible_child_name_notify(move |_| page_for_switch.refresh_map());
     page.refresh(window);
     page
 }
 
 impl SpeakersPage {
+    fn refresh_map(&self) {
+        if self.views.visible_child_name().as_deref() == Some("map") {
+            self.map.load(&self.database_path);
+        }
+    }
+
     fn refresh(&self, window: &adw::ApplicationWindow) {
+        self.refresh_map();
         for row in self.rows.borrow_mut().drain(..) {
             self.group.remove(&row);
         }

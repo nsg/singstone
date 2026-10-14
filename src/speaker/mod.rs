@@ -3,3 +3,4 @@
 pub mod database;
 pub mod embedding;
 pub mod speakers;
+pub mod voice_map;

@@ -45,6 +45,21 @@ samples stored for each person.
 
 ![Speakers page listing learned voices and voice sample counts](docs/images/speakers.png)
 
+Switch to **Voice map** to see every learned voice sample as a dot, one color
+per person. People whose voices sound alike sit close together, and their
+clouds overlap when the recognizer can barely tell them apart. A dashed line
+joins voices that are close or overlapping, labeled with the score one
+person's samples get against the other's. Rings mark single samples that sound
+more like someone else, often a line named after the wrong person, or that lie
+far from the rest of their voice, such as a noisy recording. Findings on the
+right list these problems; choose one, or a person under Voices, to zoom in on
+it. Hover a dot to see whose sample it is and how it scores. The map is a flat
+approximation of the distances between voices: the scale bar shows how far
+apart two centers sit when their voices are exactly at the match threshold,
+and the scores are exact where the picture is not.
+
+![Voice map showing learned voices as colored clouds of samples, with close voices joined by dashed lines and a findings list](docs/images/voice-map.png)
+
 Use Meeting details… to title the meeting and place attendees in the room or on
 the remote end before re-rendering the transcript.
 
@@ -99,6 +114,8 @@ a session can be archived with or without it.
   level meters.
 - Learns fixed-window voice embeddings when a transcript line is named or
   corrected, building a local speaker database from confirmed speech.
+- Maps learned voices on a plane to reveal look-alike voices, mislabeled
+  samples, and outliers in the speaker database.
 - Keeps recording and inference offline under Snap confinement.
 - Verifies every model's size, purpose, and SHA-256 before native code loads it.
 

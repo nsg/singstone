@@ -1,5 +1,6 @@
+use crate::speaker::classify::Flag as DotFlag;
 use crate::speaker::database::SpeakerDatabase;
-use crate::speaker::voice_map::{DotFlag, VoiceMap, assign_colors};
+use crate::speaker::voice_map::{VoiceMap, assign_colors};
 use crate::types::DEFAULT_SPEAKER_THRESHOLD;
 use adw::prelude::*;
 use gtk::{cairo, glib};

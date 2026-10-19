@@ -9,22 +9,16 @@
 //! sample distances first: in high dimensions every sample lies about equally
 //! far from its centroid, which would otherwise draw each cloud as a ring.
 
+use crate::speaker::classify::{self, Flag, distance, median, nearest};
 use crate::speaker::database::SpeakerDatabase;
-use crate::speaker::embedding::{cosine, mean_normalized};
+use crate::speaker::embedding::mean_normalized;
 
-/// People every sample is scored against, as the recognizer's centroid
-/// prefilter does for a cluster.
-const RIVAL_CENTERS: usize = 5;
-/// Extra people, nearest to the sample itself, that catch mislabeled samples.
-const SAMPLE_RIVALS: usize = 2;
 /// Above this many flagged samples, regrouping costs more than it shows.
 const MAX_REGROUP: usize = 1_000;
 const DOT_ANCHORS: usize = 6;
 /// Nearest samples a flagged sample is also placed against.
 const NEIGHBORS: usize = 5;
 const MIN_DISTANCE: f32 = 0.01;
-const OUTLIER_MIN_GAP: f32 = 0.15;
-const OUTLIER_MIN_SAMPLES: usize = 5;
 pub const CLOSE_MARGIN: f32 = 0.1;
 
 #[derive(Debug, Clone)]
@@ -48,15 +42,6 @@ pub struct Person {
     pub strays: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DotFlag {
-    None,
-    /// Unusually far from the rest of its person's samples.
-    Outlier,
-    /// Scores at least as high against another person as against its own.
-    Stray,
-}
-
 #[derive(Debug, Clone)]
 pub struct Dot {
     pub person: usize,
@@ -65,7 +50,7 @@ pub struct Dot {
     pub center_similarity: f32,
     pub own_score: Option<f32>,
     pub rival: Option<(usize, f32)>,
-    pub flag: DotFlag,
+    pub flag: Flag,
 }
 
 #[derive(Debug, Clone)]
@@ -106,66 +91,35 @@ impl VoiceMap {
         threshold: f32,
     ) -> Self {
         let count = names.len();
-        let center_distance = (0..count)
-            .map(|i| {
-                (0..count)
-                    .map(|j| distance(&centroids[i], &centroids[j]))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let review = classify::review(samples, centroids, threshold);
+        let center_distance = review.center_distance;
         let (centers, stress) = layout_centers(&center_distance);
 
         let mut dots = Vec::new();
         let mut flagged = Vec::new();
         let mut pair_scores = vec![vec![None::<f32>; count]; count];
         let mut people = Vec::with_capacity(count);
-        for person in 0..count {
+        for (person, verdicts) in review.people.into_iter().enumerate() {
             let own = samples[person];
-            let similarities = own
+            let similarities = verdicts
+                .samples
                 .iter()
-                .map(|vector| cosine(vector, &centroids[person]).unwrap_or(0.0))
+                .map(|sample| sample.center_similarity)
                 .collect::<Vec<_>>();
-            let outlier_floor = outlier_floor(&similarities);
             let shell = shell_offset(&similarities);
             let directions = principal_directions(own, &centroids[person]);
             let first_dot = dots.len();
-            let rivals = nearest(&center_distance[person], person, RIVAL_CENTERS);
             let mut cross = vec![Vec::new(); count];
-            for (sample, vector) in own.iter().enumerate() {
+            for (sample, (vector, verdict)) in own.iter().zip(verdicts.samples).enumerate() {
+                for &(other, score) in &verdict.scores {
+                    if verdicts.rivals.contains(&other) {
+                        cross[other].push(score);
+                    }
+                }
                 let to_centroids = centroids
                     .iter()
                     .map(|centroid| distance(vector, centroid))
                     .collect::<Vec<_>>();
-                let own_score = topk_mean_excluding(vector, own, Some(sample));
-                let mut candidates = rivals.clone();
-                for j in nearest(&to_centroids, person, SAMPLE_RIVALS) {
-                    if !candidates.contains(&j) {
-                        candidates.push(j);
-                    }
-                }
-                let mut rival: Option<(usize, f32)> = None;
-                for other in candidates {
-                    let Some(score) = topk_mean_excluding(vector, samples[other], None) else {
-                        continue;
-                    };
-                    if rivals.contains(&other) {
-                        cross[other].push(score);
-                    }
-                    if rival.is_none_or(|(_, best)| score > best) {
-                        rival = Some((other, score));
-                    }
-                }
-                let stray = rival.is_some_and(|(_, score)| match own_score {
-                    Some(own) => score >= own,
-                    None => score >= threshold,
-                });
-                let flag = if stray {
-                    DotFlag::Stray
-                } else if outlier_floor.is_some_and(|floor| similarities[sample] < floor) {
-                    DotFlag::Outlier
-                } else {
-                    DotFlag::None
-                };
                 let anchors =
                     center_anchors(&to_centroids, person, &centers, &center_distance, shell);
                 let own = (to_centroids[person] - shell).max(MIN_DISTANCE);
@@ -176,20 +130,20 @@ impl VoiceMap {
                 for _ in 0..30 {
                     position = majorize(position, &anchors);
                 }
-                if flag != DotFlag::None {
+                if verdict.flag != Flag::None {
                     flagged.push((dots.len(), anchors, shell));
                 }
                 dots.push(Dot {
                     person,
                     sample,
                     position,
-                    center_similarity: similarities[sample],
-                    own_score,
-                    rival,
-                    flag,
+                    center_similarity: verdict.center_similarity,
+                    own_score: verdict.own_score,
+                    rival: verdict.rival,
+                    flag: verdict.flag,
                 });
             }
-            for other in rivals {
+            for other in verdicts.rivals {
                 pair_scores[person][other] = median(&cross[other]);
             }
             let mine = &dots[first_dot..];
@@ -199,8 +153,8 @@ impl VoiceMap {
                 radius: 0.0,
                 samples: own.len(),
                 median_similarity: median(&similarities).unwrap_or(1.0),
-                outliers: mine.iter().filter(|d| d.flag == DotFlag::Outlier).count(),
-                strays: mine.iter().filter(|d| d.flag == DotFlag::Stray).count(),
+                outliers: mine.iter().filter(|d| d.flag == Flag::Outlier).count(),
+                strays: mine.iter().filter(|d| d.flag == Flag::Stray).count(),
             });
         }
         regroup(&mut dots, samples, &flagged);
@@ -238,71 +192,13 @@ impl VoiceMap {
     }
 }
 
-fn distance(left: &[f32], right: &[f32]) -> f32 {
-    (1.0 - cosine(left, right).unwrap_or(0.0)).max(0.0)
-}
-
 fn planar_distance(a: [f32; 2], b: [f32; 2]) -> f32 {
     (a[0] - b[0]).hypot(a[1] - b[1])
-}
-
-/// Averages the middle pair of an even count, as `speaker_score` does.
-fn median(values: &[f32]) -> Option<f32> {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f32::total_cmp);
-    let middle = sorted.len() / 2;
-    match sorted.len() {
-        0 => None,
-        n if n % 2 == 0 => Some((sorted[middle - 1] + sorted[middle]) / 2.0),
-        _ => Some(sorted[middle]),
-    }
 }
 
 fn quantile(sorted: &[f32], q: f32) -> Option<f32> {
     let last = sorted.len().checked_sub(1)?;
     Some(sorted[((last as f32) * q).round() as usize])
-}
-
-fn topk_mean_excluding(query: &[f32], enrolled: &[Vec<f32>], skip: Option<usize>) -> Option<f32> {
-    let mut best = [f32::NEG_INFINITY; 3];
-    let mut found = 0;
-    for (index, candidate) in enrolled.iter().enumerate() {
-        if Some(index) == skip {
-            continue;
-        }
-        let Some(score) = cosine(query, candidate) else {
-            continue;
-        };
-        found += 1;
-        if score > best[2] {
-            best[2] = score;
-            best.sort_by(|a, b| b.total_cmp(a));
-        }
-    }
-    let used = found.min(3);
-    (used > 0).then(|| best[..used].iter().sum::<f32>() / used as f32)
-}
-
-/// Indexes of the `take` smallest distances in `row`, other than `skip`.
-fn nearest(row: &[f32], skip: usize, take: usize) -> Vec<usize> {
-    let mut order = (0..row.len()).filter(|&j| j != skip).collect::<Vec<_>>();
-    order.sort_by(|&a, &b| row[a].total_cmp(&row[b]));
-    order.truncate(take);
-    order
-}
-
-/// Similarity below which a sample stands out from its person's other samples.
-fn outlier_floor(similarities: &[f32]) -> Option<f32> {
-    if similarities.len() < OUTLIER_MIN_SAMPLES {
-        return None;
-    }
-    let middle = median(similarities)?;
-    let deviations = similarities
-        .iter()
-        .map(|s| (s - middle).abs())
-        .collect::<Vec<_>>();
-    let spread = 1.4826 * median(&deviations)?;
-    Some(middle - (4.0 * spread).max(OUTLIER_MIN_GAP))
 }
 
 /// Distance every sample of a person shares, removed before placement.
@@ -722,7 +618,7 @@ mod tests {
             .iter()
             .find(|d| d.person == 0 && d.sample == 12)
             .unwrap();
-        assert_eq!(stray.flag, DotFlag::Stray);
+        assert_eq!(stray.flag, Flag::Stray);
         assert_eq!(stray.rival.map(|r| r.0), Some(1));
         let to_rival = planar_distance(stray.position, map.people[1].center);
         let to_own = planar_distance(stray.position, map.people[0].center);
@@ -744,7 +640,7 @@ mod tests {
         let flagged = map
             .dots
             .iter()
-            .filter(|d| d.flag == DotFlag::Outlier)
+            .filter(|d| d.flag == Flag::Outlier)
             .map(|d| (d.person, d.sample))
             .collect::<Vec<_>>();
         assert_eq!(flagged, vec![(0, 20)]);
@@ -772,7 +668,7 @@ mod tests {
                     center_similarity: 0.0,
                     own_score: None,
                     rival: None,
-                    flag: DotFlag::None,
+                    flag: Flag::None,
                 }
             })
             .collect::<Vec<_>>();
@@ -826,13 +722,6 @@ mod tests {
     }
 
     #[test]
-    fn median_matches_the_recognizer_for_even_counts() {
-        assert_eq!(median(&[0.2, 0.9]), Some(0.55));
-        assert_eq!(median(&[0.9, 0.2, 0.5]), Some(0.5));
-        assert_eq!(median(&[]), None);
-    }
-
-    #[test]
     fn scores_a_sample_against_a_person_whose_centroid_lies_far_away() {
         let mix = |a: usize, wa: f32, b: usize, wb: f32| {
             axis(16, a)
@@ -850,7 +739,7 @@ mod tests {
         second.extend(cloud(&axis(16, 4), 40, 0.02, 3));
         let map = build(vec![first, second]);
         let query = &map.dots[0];
-        assert_eq!(query.flag, DotFlag::Stray);
+        assert_eq!(query.flag, Flag::Stray);
         assert_eq!(query.rival.map(|r| r.0), Some(1));
         assert!(query.rival.unwrap().1 > 0.97);
     }
@@ -872,7 +761,7 @@ mod tests {
                 .all(|d| d.position.iter().all(|v| v.is_finite()))
         );
         assert!(pair.stress.is_finite());
-        assert_eq!(pair.dots[0].flag, DotFlag::Stray);
+        assert_eq!(pair.dots[0].flag, Flag::Stray);
         assert_eq!(assign_colors(&[[0.0, 0.0]], &[[0.7, 0.0, 0.0]]), vec![0]);
     }
 

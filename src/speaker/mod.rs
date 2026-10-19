@@ -1,5 +1,6 @@
 //! Speaker embeddings, learned-voice database and recognition.
 
+pub mod classify;
 pub mod database;
 pub mod embedding;
 pub mod speakers;

@@ -1,0 +1,204 @@
+//! Judges every learned sample against its own voice and its closest rivals.
+//!
+//! The voice map draws these verdicts and tidying acts on them, so both read
+//! them from here.
+
+use crate::speaker::embedding::cosine;
+
+/// People every sample is scored against, as the recognizer's centroid
+/// prefilter does for a cluster.
+pub const RIVAL_CENTERS: usize = 5;
+/// Extra people, nearest to the sample itself, that catch mislabeled samples.
+const SAMPLE_RIVALS: usize = 2;
+const OUTLIER_MIN_GAP: f32 = 0.15;
+const OUTLIER_MIN_SAMPLES: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Flag {
+    None,
+    /// Unusually far from the rest of its person's samples.
+    Outlier,
+    /// Scores at least as high against another person as against its own.
+    Stray,
+}
+
+#[derive(Debug, Clone)]
+pub struct SampleReview {
+    pub center_similarity: f32,
+    /// Recognizer score against the person's other samples.
+    pub own_score: Option<f32>,
+    /// The best scoring other person.
+    pub rival: Option<(usize, f32)>,
+    /// Recognizer scores against every person the sample was compared with.
+    pub scores: Vec<(usize, f32)>,
+    pub flag: Flag,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersonReview {
+    /// People with the nearest centroids.
+    pub rivals: Vec<usize>,
+    pub samples: Vec<SampleReview>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Review {
+    pub center_distance: Vec<Vec<f32>>,
+    pub people: Vec<PersonReview>,
+}
+
+pub fn review<V: AsRef<[f32]>>(samples: &[&[V]], centroids: &[Vec<f32>], threshold: f32) -> Review {
+    let count = samples.len();
+    let center_distance = (0..count)
+        .map(|i| {
+            (0..count)
+                .map(|j| distance(&centroids[i], &centroids[j]))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let people = (0..count)
+        .map(|person| {
+            let own = samples[person];
+            let similarities = own
+                .iter()
+                .map(|vector| cosine(vector.as_ref(), &centroids[person]).unwrap_or(0.0))
+                .collect::<Vec<_>>();
+            let outlier_floor = mad_floor(&similarities, OUTLIER_MIN_GAP, OUTLIER_MIN_SAMPLES);
+            let rivals = nearest(&center_distance[person], person, RIVAL_CENTERS);
+            let reviews = own
+                .iter()
+                .enumerate()
+                .map(|(sample, vector)| {
+                    let vector = vector.as_ref();
+                    let to_centroids = centroids
+                        .iter()
+                        .map(|centroid| distance(vector, centroid))
+                        .collect::<Vec<_>>();
+                    let own_score = topk_mean_excluding(vector, own, Some(sample));
+                    let mut candidates = rivals.clone();
+                    for j in nearest(&to_centroids, person, SAMPLE_RIVALS) {
+                        if !candidates.contains(&j) {
+                            candidates.push(j);
+                        }
+                    }
+                    let scores = candidates
+                        .into_iter()
+                        .filter_map(|other| {
+                            topk_mean_excluding(vector, samples[other], None)
+                                .map(|score| (other, score))
+                        })
+                        .collect::<Vec<_>>();
+                    let rival =
+                        scores
+                            .iter()
+                            .copied()
+                            .fold(None, |best, (other, score)| match best {
+                                Some((_, top)) if top >= score => best,
+                                _ => Some((other, score)),
+                            });
+                    let stray = rival.is_some_and(|(_, score)| match own_score {
+                        Some(own) => score >= own,
+                        None => score >= threshold,
+                    });
+                    let flag = if stray {
+                        Flag::Stray
+                    } else if outlier_floor.is_some_and(|floor| similarities[sample] < floor) {
+                        Flag::Outlier
+                    } else {
+                        Flag::None
+                    };
+                    SampleReview {
+                        center_similarity: similarities[sample],
+                        own_score,
+                        rival,
+                        scores,
+                        flag,
+                    }
+                })
+                .collect();
+            PersonReview {
+                rivals,
+                samples: reviews,
+            }
+        })
+        .collect();
+    Review {
+        center_distance,
+        people,
+    }
+}
+
+pub(crate) fn distance(left: &[f32], right: &[f32]) -> f32 {
+    (1.0 - cosine(left, right).unwrap_or(0.0)).max(0.0)
+}
+
+/// Averages the middle pair of an even count, as `speaker_score` does.
+pub(crate) fn median(values: &[f32]) -> Option<f32> {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let middle = sorted.len() / 2;
+    match sorted.len() {
+        0 => None,
+        n if n % 2 == 0 => Some((sorted[middle - 1] + sorted[middle]) / 2.0),
+        _ => Some(sorted[middle]),
+    }
+}
+
+/// Indexes of the `take` smallest distances in `row`, other than `skip`.
+pub(crate) fn nearest(row: &[f32], skip: usize, take: usize) -> Vec<usize> {
+    let mut order = (0..row.len()).filter(|&j| j != skip).collect::<Vec<_>>();
+    order.sort_by(|&a, &b| row[a].total_cmp(&row[b]));
+    order.truncate(take);
+    order
+}
+
+pub(crate) fn topk_mean_excluding<V: AsRef<[f32]>>(
+    query: &[f32],
+    enrolled: &[V],
+    skip: Option<usize>,
+) -> Option<f32> {
+    let mut best = [f32::NEG_INFINITY; 3];
+    let mut found = 0;
+    for (index, candidate) in enrolled.iter().enumerate() {
+        if Some(index) == skip {
+            continue;
+        }
+        let Some(score) = cosine(query, candidate.as_ref()) else {
+            continue;
+        };
+        found += 1;
+        if score > best[2] {
+            best[2] = score;
+            best.sort_by(|a, b| b.total_cmp(a));
+        }
+    }
+    let used = found.min(3);
+    (used > 0).then(|| best[..used].iter().sum::<f32>() / used as f32)
+}
+
+/// Value below which a sample stands out from its person's other samples:
+/// the median less four robust deviations, but at least `min_gap`.
+fn mad_floor(values: &[f32], min_gap: f32, min_samples: usize) -> Option<f32> {
+    if values.len() < min_samples {
+        return None;
+    }
+    let middle = median(values)?;
+    let deviations = values
+        .iter()
+        .map(|s| (s - middle).abs())
+        .collect::<Vec<_>>();
+    let spread = 1.4826 * median(&deviations)?;
+    Some(middle - (4.0 * spread).max(min_gap))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn median_matches_the_recognizer_for_even_counts() {
+        assert_eq!(median(&[0.2, 0.9]), Some(0.55));
+        assert_eq!(median(&[0.9, 0.2, 0.5]), Some(0.5));
+        assert_eq!(median(&[]), None);
+    }
+}

@@ -110,6 +110,7 @@ a session can be archived with or without it.
   still need attention.
 - Archives a processed session's audio as 16-bit FLAC, about a fifth of the
   size, while keeping playback and reprocessing.
+- Optionally deletes archived sessions after a chosen number of days.
 - Optional GNOME Shell extension with a top-bar Record/Stop button and live
   level meters.
 - Learns fixed-window voice embeddings when a transcript line is named or
@@ -319,6 +320,14 @@ sessions show an **Archived** label and still play, render and reprocess.
 
 The Snap bundles the `flac` program for this. Outside the Snap, install it
 from your distribution, or point `SINGSTONE_FLAC` at the executable.
+
+To reclaim the space for good, turn on **Delete old archives** in Settings and
+set **Keep archives for** to a number of days, 90 by default. The app then
+deletes the whole folder of each session archived longer ago than that: at
+start, every hour, and when either setting changes. The count starts when the
+session is archived, not when it was recorded. While sessions are processing,
+and for the session open on screen, deletion waits for a later pass. The
+setting is off by default and deletion cannot be undone.
 
 ## Snap behavior
 

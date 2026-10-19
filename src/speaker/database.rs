@@ -126,6 +126,40 @@ impl SpeakerRecord {
             .any(|sample| same_vector(&sample.embedding, vector))
     }
 
+    /// Moves the sample equal to `embedding` to the removed list.
+    pub fn set_aside(&mut self, embedding: &[f32], reason: PruneReason, now: u64) -> bool {
+        let Some(index) = self
+            .samples
+            .iter()
+            .position(|sample| sample.embedding == embedding)
+        else {
+            return false;
+        };
+        let sample = self.samples.remove(index);
+        self.pruned.push(PrunedSample {
+            reason,
+            pruned_at: now,
+            sample,
+        });
+        true
+    }
+
+    /// Puts the removed sample equal to `embedding` back, exempt from
+    /// tidying from then on.
+    pub fn restore(&mut self, embedding: &[f32]) -> bool {
+        let Some(index) = self
+            .pruned
+            .iter()
+            .position(|pruned| pruned.sample.embedding == embedding)
+        else {
+            return false;
+        };
+        let mut sample = self.pruned.remove(index).sample;
+        sample.kept_by_user = true;
+        self.samples.push(sample);
+        true
+    }
+
     /// Sessions that learned samples after `session`; `None` when unknown.
     pub fn sessions_since(&self, session: &str) -> Option<usize> {
         let position = self.sessions.iter().position(|s| s == session)?;

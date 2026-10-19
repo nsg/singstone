@@ -9,9 +9,7 @@
 //! they are deleted.
 
 use crate::speaker::classify::{self, Flag, Review};
-use crate::speaker::database::{
-    PruneReason, PrunedSample, SpeakerDatabase, SpeakerRecord, unix_now,
-};
+use crate::speaker::database::{PruneReason, SpeakerDatabase, SpeakerRecord, unix_now};
 use crate::speaker::embedding::{mean_normalized, topk_mean};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -365,21 +363,10 @@ pub fn apply(database: &mut SpeakerDatabase, plan: &Plan, now: u64) -> Summary {
             if finding.verdict != Verdict::Remove || allowed == 0 {
                 continue;
             }
-            let Some(index) = record
-                .samples
-                .iter()
-                .position(|sample| sample.embedding == finding.embedding)
-            else {
-                continue;
-            };
-            let sample = record.samples.remove(index);
-            record.pruned.push(PrunedSample {
-                reason: finding.reason.clone(),
-                pruned_at: now,
-                sample,
-            });
-            summary.count(&finding.reason);
-            allowed -= 1;
+            if record.set_aside(&finding.embedding, finding.reason.clone(), now) {
+                summary.count(&finding.reason);
+                allowed -= 1;
+            }
         }
     }
     for record in database.speakers.values_mut() {
@@ -420,7 +407,7 @@ pub fn run(path: &Path, threshold: f32) -> io::Result<(Plan, Summary)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::speaker::database::{EmbeddingModelIdentity, Sample};
+    use crate::speaker::database::{EmbeddingModelIdentity, PrunedSample, Sample};
     use crate::types::AudioSource;
 
     const DIMENSION: usize = 16;

@@ -1,6 +1,7 @@
 use crate::speaker::classify::Flag as DotFlag;
-use crate::speaker::database::SpeakerDatabase;
-use crate::speaker::voice_map::{VoiceMap, assign_colors};
+use crate::speaker::database::{PruneReason, SpeakerDatabase, unix_now};
+use crate::speaker::tidy::{RESTORE_PERIOD, Verdict};
+use crate::speaker::voice_map::{Dot, VoiceMap, assign_colors};
 use crate::types::DEFAULT_SPEAKER_THRESHOLD;
 use adw::prelude::*;
 use gtk::{cairo, glib};
@@ -33,7 +34,15 @@ const HUES: [f64; 8] = [145.0, 175.0, 200.0, 235.0, 265.0, 295.0, 325.0, 350.0];
 #[derive(Clone, Copy, PartialEq)]
 enum Hover {
     Dot(usize),
+    Removed(usize),
     Person(usize),
+}
+
+/// A change to one sample, offered in the popover of a clicked dot.
+#[derive(Clone)]
+enum SampleAction {
+    Remove { person: String, embedding: Vec<f32> },
+    Restore { person: String, embedding: Vec<f32> },
 }
 
 #[derive(Clone, PartialEq)]
@@ -45,6 +54,7 @@ struct SceneKey {
     pan: (f64, f64),
     focus: Vec<usize>,
     problems: bool,
+    show_removed: bool,
     generation: u64,
 }
 
@@ -62,10 +72,12 @@ struct State {
     /// People shown at full strength; everyone when empty.
     focus: Vec<usize>,
     problems: bool,
+    show_removed: bool,
     generation: u64,
     scene: Option<(SceneKey, cairo::ImageSurface)>,
     loaded: Option<(PathBuf, Option<SystemTime>)>,
     loading: bool,
+    action: Option<SampleAction>,
 }
 
 impl State {
@@ -141,14 +153,23 @@ impl State {
         if let Some((_, person)) = centers {
             return Some(Hover::Person(person));
         }
-        map.dots
+        let visible = |dot: &&Dot| self.focus.is_empty() || self.focus.contains(&dot.person);
+        let dots = map
+            .dots
             .iter()
             .enumerate()
-            .filter(|(_, dot)| self.focus.is_empty() || self.focus.contains(&dot.person))
-            .map(|(i, dot)| (distance(dot.position), i))
+            .filter(|(_, dot)| visible(dot))
+            .map(|(i, dot)| (distance(dot.position), Hover::Dot(i)));
+        let removed = map
+            .removed
+            .iter()
+            .enumerate()
+            .filter(|(_, dot)| self.show_removed && visible(dot))
+            .map(|(i, dot)| (distance(dot.position), Hover::Removed(i)));
+        dots.chain(removed)
             .filter(|(d, _)| *d <= HIT_RADIUS)
             .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, i)| Hover::Dot(i))
+            .map(|(_, hover)| hover)
     }
 }
 
@@ -165,6 +186,8 @@ fn bounds(points: &[[f32; 2]]) -> Option<([f64; 2], [f64; 2])> {
     Some((min, max))
 }
 
+type Callback = Box<dyn Fn()>;
+
 #[derive(Clone)]
 pub struct VoiceMapView {
     pub root: gtk::Box,
@@ -175,6 +198,9 @@ pub struct VoiceMapView {
     findings: gtk::ListBox,
     voices: gtk::ListBox,
     summary: gtk::Label,
+    popover: gtk::Popover,
+    action_button: gtk::Button,
+    changed: Rc<RefCell<Option<Callback>>>,
     state: Rc<RefCell<State>>,
 }
 
@@ -204,9 +230,14 @@ impl VoiceMapView {
             .tooltip_text("Mark outliers, stray samples and close voices")
             .active(true)
             .build();
+        let removed = gtk::ToggleButton::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Show removed samples")
+            .build();
         let fit = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
         fit.set_tooltip_text(Some("Show everyone"));
         tools.append(&problems);
+        tools.append(&removed);
         tools.append(&fit);
         overlay.add_overlay(&tools);
 
@@ -272,6 +303,14 @@ impl VoiceMapView {
         root.append(&canvas_stack);
         root.append(&side_panel);
 
+        let action_button = gtk::Button::new();
+        action_button.add_css_class("flat");
+        let popover = gtk::Popover::builder()
+            .child(&action_button)
+            .position(gtk::PositionType::Top)
+            .build();
+        popover.set_parent(&area);
+
         let view = Self {
             root,
             area,
@@ -281,13 +320,21 @@ impl VoiceMapView {
             findings,
             voices,
             summary,
+            popover,
+            action_button,
+            changed: Rc::new(RefCell::new(None)),
             state,
         };
-        view.wire(&problems, &fit);
+        view.wire(&problems, &removed, &fit);
         view
     }
 
-    fn wire(&self, problems: &gtk::ToggleButton, fit: &gtk::Button) {
+    /// Calls `callback` after a sample was removed or restored here.
+    pub fn connect_changed(&self, callback: impl Fn() + 'static) {
+        *self.changed.borrow_mut() = Some(Box::new(callback));
+    }
+
+    fn wire(&self, problems: &gtk::ToggleButton, removed: &gtk::ToggleButton, fit: &gtk::Button) {
         let state = self.state.clone();
         self.area.set_draw_func(move |area, cr, width, height| {
             let _ = draw(
@@ -373,9 +420,13 @@ impl VoiceMapView {
             let person = match (hit, view.state.borrow().map.as_ref()) {
                 (Some(Hover::Person(p)), _) => Some(p),
                 (Some(Hover::Dot(d)), Some(map)) => Some(map.dots[d].person),
+                (Some(Hover::Removed(d)), Some(map)) => Some(map.removed[d].person),
                 _ => None,
             };
             view.set_focus(person.into_iter().collect(), false);
+            if let Some(hit) = hit {
+                view.offer_action(hit, x, y);
+            }
         });
         self.area.add_controller(drag);
 
@@ -396,6 +447,19 @@ impl VoiceMapView {
             view.area.queue_draw();
         });
         let view = self.clone();
+        removed.connect_toggled(move |button| {
+            view.state.borrow_mut().show_removed = button.is_active();
+            view.area.queue_draw();
+        });
+        let view = self.clone();
+        self.action_button.connect_clicked(move |_| {
+            view.popover.popdown();
+            let action = view.state.borrow_mut().action.take();
+            if let Some(action) = action {
+                view.apply(action);
+            }
+        });
+        let view = self.clone();
         fit.connect_clicked(move |_| {
             let mut state = view.state.borrow_mut();
             state.zoom = 1.0;
@@ -404,6 +468,78 @@ impl VoiceMapView {
             drop(state);
             view.area.queue_draw();
         });
+    }
+
+    /// Pops up the remove or restore button for a clicked sample.
+    fn offer_action(&self, hit: Hover, x: f64, y: f64) {
+        let mut state = self.state.borrow_mut();
+        let Some(map) = &state.map else { return };
+        let (action, label) = match hit {
+            Hover::Dot(index) => {
+                let dot = &map.dots[index];
+                (
+                    SampleAction::Remove {
+                        person: map.people[dot.person].name.clone(),
+                        embedding: dot.embedding.clone(),
+                    },
+                    "Remove sample",
+                )
+            }
+            Hover::Removed(index) => {
+                let dot = &map.removed[index];
+                (
+                    SampleAction::Restore {
+                        person: map.people[dot.person].name.clone(),
+                        embedding: dot.embedding.clone(),
+                    },
+                    "Restore",
+                )
+            }
+            Hover::Person(_) => return,
+        };
+        state.action = Some(action);
+        drop(state);
+        self.action_button.set_label(label);
+        self.popover
+            .set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        self.popover.popup();
+    }
+
+    fn apply(&self, action: SampleAction) {
+        let Some(path) = self.state.borrow().loaded.as_ref().map(|(p, _)| p.clone()) else {
+            return;
+        };
+        let result = SpeakerDatabase::update(&path, |database| {
+            let changed = match &action {
+                SampleAction::Remove { person, embedding } => {
+                    database.speakers.get_mut(person).is_some_and(|record| {
+                        record.set_aside(embedding, PruneReason::User, unix_now())
+                    })
+                }
+                SampleAction::Restore { person, embedding } => database
+                    .speakers
+                    .get_mut(person)
+                    .is_some_and(|record| record.restore(embedding)),
+            };
+            database.refresh_centroids();
+            changed
+        });
+        match result {
+            Ok(_) => {
+                self.load(&path);
+                if let Some(changed) = self.changed.borrow().as_ref() {
+                    changed();
+                }
+            }
+            Err(error) => {
+                let dialog = adw::AlertDialog::new(
+                    Some("Could not change the sample"),
+                    Some(&error.to_string()),
+                );
+                dialog.add_response("close", "Close");
+                dialog.present(Some(&self.root));
+            }
+        }
     }
 
     fn size(&self) -> (f64, f64) {
@@ -452,7 +588,11 @@ impl VoiceMapView {
         let db_path = path.to_path_buf();
         std::thread::spawn(move || {
             let map = match SpeakerDatabase::load(&db_path) {
-                Ok(database) => Ok(Some(VoiceMap::build(&database, DEFAULT_SPEAKER_THRESHOLD))),
+                Ok(database) => Ok(Some(VoiceMap::build(
+                    &database,
+                    DEFAULT_SPEAKER_THRESHOLD,
+                    unix_now(),
+                ))),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error.to_string()),
             };
@@ -504,26 +644,37 @@ impl VoiceMapView {
             self.fill_side(None, &[]);
             return;
         };
-        let palette = palette();
-        let lab = palette.iter().map(|c| c.1).collect::<Vec<_>>();
-        let centers = map.people.iter().map(|p| p.center).collect::<Vec<_>>();
-        state.colors = assign_colors(&centers, &lab)
-            .into_iter()
-            .map(|slot| palette[slot].0)
-            .collect();
-        let points = map
-            .dots
-            .iter()
-            .map(|d| d.position)
-            .chain(centers)
-            .collect::<Vec<_>>();
-        if let Some((min, max)) = bounds(&points) {
-            state.world_center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
-            state.world_span = [(max[0] - min[0]).max(0.1), (max[1] - min[1]).max(0.1)];
+        // After a sample is removed or restored, keep the view where it was.
+        let same_people = state.map.as_ref().is_some_and(|shown| {
+            shown
+                .people
+                .iter()
+                .map(|p| &p.name)
+                .eq(map.people.iter().map(|p| &p.name))
+        });
+        if !same_people {
+            let palette = palette();
+            let lab = palette.iter().map(|c| c.1).collect::<Vec<_>>();
+            let centers = map.people.iter().map(|p| p.center).collect::<Vec<_>>();
+            state.colors = assign_colors(&centers, &lab)
+                .into_iter()
+                .map(|slot| palette[slot].0)
+                .collect();
+            let points = map
+                .dots
+                .iter()
+                .chain(&map.removed)
+                .map(|d| d.position)
+                .chain(centers)
+                .collect::<Vec<_>>();
+            if let Some((min, max)) = bounds(&points) {
+                state.world_center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
+                state.world_span = [(max[0] - min[0]).max(0.1), (max[1] - min[1]).max(0.1)];
+            }
+            state.zoom = 1.0;
+            state.pan = (0.0, 0.0);
+            state.focus.clear();
         }
-        state.zoom = 1.0;
-        state.pan = (0.0, 0.0);
-        state.focus.clear();
         state.hover = None;
         state.generation += 1;
         let colors = state.colors.clone();
@@ -613,6 +764,28 @@ impl VoiceMapView {
                         "{} like {names}",
                         plural(person.strays, "sample sounds", "samples sound")
                     ),
+                    vec![index],
+                ));
+            }
+            if person.due > 0 || person.settling > 0 {
+                let mut parts = Vec::new();
+                if person.due > 0 {
+                    parts.push(format!(
+                        "{} due for removal",
+                        plural(person.due, "sample", "samples")
+                    ));
+                }
+                if person.settling > 0 {
+                    parts.push(format!(
+                        "{} settling",
+                        plural(person.settling, "sample", "samples")
+                    ));
+                }
+                findings.push((
+                    (1, usize::MAX - person.due),
+                    "user-trash-symbolic",
+                    person.name.clone(),
+                    parts.join(", "),
                     vec![index],
                 ));
             }
@@ -782,6 +955,7 @@ fn draw(
         pan: state.pan,
         focus: state.focus.clone(),
         problems: state.problems,
+        show_removed: state.show_removed,
         generation: state.generation,
     };
     if state
@@ -880,6 +1054,20 @@ fn draw_scene(
         }
     }
 
+    if state.show_removed {
+        for dot in &map.removed {
+            let (x, y) = state.to_screen(dot.position, width, height);
+            let alpha = if dimmed(dot.person) { 0.08 } else { 0.32 };
+            rgba(cr, state.colors[dot.person], alpha);
+            cr.arc(x, y, point_radius, 0.0, TAU);
+            cr.fill()?;
+            rgba(cr, MUTED, alpha);
+            cr.set_line_width(1.0);
+            cr.arc(x, y, point_radius + 2.5, 0.0, TAU);
+            cr.stroke()?;
+        }
+    }
+
     for dot in &map.dots {
         let faded = dimmed(dot.person);
         let (x, y) = state.to_screen(dot.position, width, height);
@@ -891,6 +1079,24 @@ fn draw_scene(
         cr.arc(x, y, point_radius, 0.0, TAU);
         cr.fill()?;
         if !state.problems || faded {
+            continue;
+        }
+        if let Some((reason, _)) = &dot.tidy
+            && (dot.due() || dot.settling())
+        {
+            let color = reason_color(reason);
+            let ring = point_radius + 3.5;
+            rgba(cr, color, 0.95);
+            cr.set_line_width(1.6);
+            if dot.settling() {
+                cr.set_dash(&[2.5, 2.5], 0.0);
+            }
+            cr.arc(x, y, ring, 0.0, TAU);
+            cr.stroke()?;
+            cr.set_dash(&[], 0.0);
+            if dot.due() {
+                cross(cr, x, y, ring + 2.5)?;
+            }
             continue;
         }
         match dot.flag {
@@ -1161,21 +1367,54 @@ fn draw_scale(
     )
 }
 
+/// Sounding like someone else is marked red, being far from the rest amber.
+fn reason_color(reason: &PruneReason) -> [f64; 3] {
+    match reason {
+        PruneReason::SoundsLike { .. } => OVERLAP,
+        _ => CAUTION,
+    }
+}
+
+/// The "due for removal" mark across a dot's ring.
+fn cross(cr: &cairo::Context, x: f64, y: f64, reach: f64) -> Result<(), cairo::Error> {
+    let d = reach * std::f64::consts::FRAC_1_SQRT_2;
+    cr.set_line_width(1.6);
+    cr.move_to(x - d, y - d);
+    cr.line_to(x + d, y + d);
+    cr.move_to(x - d, y + d);
+    cr.line_to(x + d, y - d);
+    cr.stroke()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    Ring,
+    Settling,
+    Due,
+    Line,
+}
+
 fn draw_legend(state: &State, cr: &cairo::Context, height: f64) -> Result<(), cairo::Error> {
     if !state.problems {
         return Ok(());
     }
-    let entries: [(&str, [f64; 3], bool); 4] = [
-        ("Sample far from its voice", CAUTION, false),
-        ("Sample sounds like someone else", OVERLAP, false),
-        ("Close voices", CAUTION, true),
-        ("Overlapping voices", OVERLAP, true),
+    let entries: [(&str, [f64; 3], Mark); 6] = [
+        ("Sample far from its voice", CAUTION, Mark::Ring),
+        ("Sample sounds like someone else", OVERLAP, Mark::Ring),
+        (
+            "Settling: judged after more sessions",
+            MUTED,
+            Mark::Settling,
+        ),
+        ("Due for removal at the next tidy", MUTED, Mark::Due),
+        ("Close voices", CAUTION, Mark::Line),
+        ("Overlapping voices", OVERLAP, Mark::Line),
     ];
     let (x, mut y) = (22.0, height - 22.0 - 18.0 * (entries.len() - 1) as f64);
     set_font(cr, 11.0, false);
-    for (label, color, line) in entries {
+    for (label, color, mark) in entries {
         rgba(cr, color, 0.95);
-        if line {
+        if mark == Mark::Line {
             cr.set_line_width(1.6);
             cr.set_dash(&[5.0, 4.0], 0.0);
             cr.move_to(x - 6.0, y - 4.0);
@@ -1184,8 +1423,15 @@ fn draw_legend(state: &State, cr: &cairo::Context, height: f64) -> Result<(), ca
             cr.set_dash(&[], 0.0);
         } else {
             cr.set_line_width(1.5);
+            if mark == Mark::Settling {
+                cr.set_dash(&[2.5, 2.5], 0.0);
+            }
             cr.arc(x + 3.0, y - 4.0, 6.0, 0.0, TAU);
             cr.stroke()?;
+            cr.set_dash(&[], 0.0);
+            if mark == Mark::Due {
+                cross(cr, x + 3.0, y - 4.0, 8.5)?;
+            }
             rgba(cr, MUTED, 1.0);
             cr.arc(x + 3.0, y - 4.0, 2.5, 0.0, TAU);
             cr.fill()?;
@@ -1242,6 +1488,52 @@ fn draw_hover(
                 }
                 DotFlag::None => {}
             }
+            if let Some((reason, verdict)) = &dot.tidy {
+                let color = reason_color(reason);
+                lines.push(match verdict {
+                    Verdict::Remove => ("Due for removal at the next tidy".into(), color),
+                    Verdict::Deferred => ("Due for removal, after worse samples go".into(), color),
+                    Verdict::Settling(sessions) => (
+                        format!(
+                            "Settling: judged after {}",
+                            plural(*sessions, "more session", "more sessions")
+                        ),
+                        MUTED,
+                    ),
+                    Verdict::Recurring => ("Kept: recurs across sessions".into(), MUTED),
+                    Verdict::Kept => ("Kept: you restored it".into(), MUTED),
+                });
+            }
+            lines.push(("Click to remove this sample".into(), MUTED));
+            (dot.person, dot.position, lines)
+        }
+        Hover::Removed(index) => {
+            let dot = &map.removed[index];
+            let mut lines = vec![(
+                match dot.removed.as_ref().map(|r| &r.0) {
+                    Some(PruneReason::SoundsLike { rival }) => {
+                        format!("Removed: sounded like {rival}")
+                    }
+                    Some(PruneReason::Isolated) => "Removed: isolated".into(),
+                    _ => "Removed by you".into(),
+                },
+                CAUTION,
+            )];
+            if let Some(score) = dot.own_score {
+                lines.push((format!("Match score, own samples  {score:.2}"), INK));
+            }
+            if let Some((_, at)) = dot.removed {
+                let days = unix_now().saturating_sub(at) / 86_400;
+                let left = (RESTORE_PERIOD / 86_400).saturating_sub(days);
+                lines.push((
+                    format!(
+                        "Deleted for good in {}",
+                        plural(left as usize, "day", "days")
+                    ),
+                    MUTED,
+                ));
+            }
+            lines.push(("Click to restore".into(), MUTED));
             (dot.person, dot.position, lines)
         }
         Hover::Person(index) => {
@@ -1266,6 +1558,21 @@ fn draw_hover(
                 lines.push((
                     plural(person.strays, "stray sample", "stray samples"),
                     OVERLAP,
+                ));
+            }
+            if person.due > 0 {
+                lines.push((
+                    format!(
+                        "{} due for removal",
+                        plural(person.due, "sample", "samples")
+                    ),
+                    OVERLAP,
+                ));
+            }
+            if person.settling > 0 {
+                lines.push((
+                    format!("{} settling", plural(person.settling, "sample", "samples")),
+                    MUTED,
                 ));
             }
             for pair in map

@@ -14,8 +14,12 @@ use crate::merge::events::{self, ProcessingEvent};
 use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
+use crate::speaker::tidy;
 use crate::transcription::{self, TranscriptionProgress, backend};
-use crate::types::{AudioSource, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance};
+use crate::types::{
+    AudioSource, DEFAULT_SPEAKER_THRESHOLD, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState,
+    Utterance,
+};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
@@ -156,6 +160,7 @@ struct SessionDetail {
     cancel_requested: Rc<Cell<bool>>,
     busy: Rc<Cell<bool>>,
     processing: ProcessingView,
+    tidy_notice: adw::Banner,
 }
 
 #[derive(Clone)]
@@ -715,14 +720,17 @@ fn build_window(app: &adw::Application) {
     let queue_panel = QueuePanel::new();
     let sidebar = build_sidebar(&search, &session_list, &queue_panel);
 
+    let tidy_notice = tidy_notice();
     let detail = build_session_detail(
         &window,
         &processing_queue,
         &cancel_requested,
         &foreground_busy,
+        &tidy_notice,
     );
     let recording_page = build_recording_page(&config.borrow());
-    let speakers_page = build_speakers_page(&window);
+    let speakers_page = build_speakers_page(&window, &tidy_notice);
+    start_tidy(&speakers_page, &window);
     let settings_page = build_settings_page(&config.borrow());
     let close_when_recording_stops = Rc::new(Cell::new(false));
 
@@ -1279,6 +1287,7 @@ fn build_session_detail(
     queue: &Rc<RefCell<ProcessingQueue>>,
     cancel_requested: &Rc<Cell<bool>>,
     busy: &Rc<Cell<bool>>,
+    tidy_notice: &adw::Banner,
 ) -> SessionDetail {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let heading = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1449,6 +1458,7 @@ fn build_session_detail(
         cancel_requested: cancel_requested.clone(),
         busy: busy.clone(),
         processing,
+        tidy_notice: tidy_notice.clone(),
     };
     for button in [&detail.hide_mic, &detail.hide_system] {
         let detail_for_toggle = detail.clone();
@@ -1464,6 +1474,7 @@ fn build_session_detail(
 #[derive(Clone)]
 struct SpeakersPage {
     root: gtk::Box,
+    notice: adw::Banner,
     group: adw::PreferencesGroup,
     rows: Rc<RefCell<Vec<adw::ActionRow>>>,
     database_path: PathBuf,
@@ -1471,8 +1482,9 @@ struct SpeakersPage {
     map: VoiceMapView,
 }
 
-fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
+fn build_speakers_page(window: &adw::ApplicationWindow, notice: &adw::Banner) -> SpeakersPage {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(notice);
     let scroll = gtk::ScrolledWindow::builder().vexpand(true).build();
     let clamp = adw::Clamp::builder()
         .maximum_size(580)
@@ -1518,6 +1530,7 @@ fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
     root.append(&views);
     let page = SpeakersPage {
         root,
+        notice: notice.clone(),
         group,
         rows: Rc::new(RefCell::new(Vec::new())),
         database_path: db_path,
@@ -1527,8 +1540,55 @@ fn build_speakers_page(window: &adw::ApplicationWindow) -> SpeakersPage {
     let page_for_switch = page.clone();
     page.views
         .connect_visible_child_name_notify(move |_| page_for_switch.refresh_map());
+    let page_for_map = page.clone();
+    let window_for_map = window.clone();
+    page.map
+        .connect_changed(move || page_for_map.refresh(&window_for_map));
     page.refresh(window);
     page
+}
+
+fn tidy_notice() -> adw::Banner {
+    let banner = adw::Banner::new("");
+    banner.set_revealed(false);
+    banner.set_button_label(Some("Dismiss"));
+    let banner_for_click = banner.clone();
+    banner.connect_button_clicked(move |_| banner_for_click.set_revealed(false));
+    banner
+}
+
+fn show_tidy_notice(banner: &adw::Banner, summary: &tidy::Summary) {
+    if let Some(removed) = summary.describe() {
+        banner.set_title(&format!("Tidied {removed}."));
+        banner.set_revealed(true);
+    }
+}
+
+/// Tidies learned voices once in the background, as the app starts.
+fn start_tidy(page: &SpeakersPage, window: &adw::ApplicationWindow) {
+    let result = Arc::new(Mutex::new(None));
+    let thread_result = result.clone();
+    let path = page.database_path.clone();
+    std::thread::spawn(move || {
+        let summary = tidy::run(&path, DEFAULT_SPEAKER_THRESHOLD).map(|(_, summary)| summary);
+        *thread_result.lock().expect("tidy result mutex") = Some(summary);
+    });
+    let page = page.clone();
+    let window = window.clone();
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        let Some(result) = result.lock().expect("tidy result mutex").take() else {
+            return glib::ControlFlow::Continue;
+        };
+        match result {
+            Ok(summary) if summary != tidy::Summary::default() => {
+                show_tidy_notice(&page.notice, &summary);
+                page.refresh(&window);
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("warning: tidying learned voices failed: {error}"),
+        }
+        glib::ControlFlow::Break
+    });
 }
 
 impl SpeakersPage {
@@ -5617,6 +5677,7 @@ fn start_assignment(
         reload_session(&detail);
         match result {
             Ok(outcome) => {
+                show_tidy_notice(&detail.tidy_notice, &outcome.tidied);
                 show_assignment_notice(&detail, outcome.learning_available);
             }
             Err(error) => show_error(&detail.window, "Could not assign speaker", &error),

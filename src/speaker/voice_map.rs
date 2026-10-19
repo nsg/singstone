@@ -9,9 +9,10 @@
 //! sample distances first: in high dimensions every sample lies about equally
 //! far from its centroid, which would otherwise draw each cloud as a ring.
 
-use crate::speaker::classify::{self, Flag, distance, median, nearest};
-use crate::speaker::database::SpeakerDatabase;
-use crate::speaker::embedding::mean_normalized;
+use crate::speaker::classify::{self, Flag, Review, distance, median, nearest};
+use crate::speaker::database::{PruneReason, SpeakerDatabase};
+use crate::speaker::embedding::{mean_normalized, topk_mean};
+use crate::speaker::tidy::{self, Verdict};
 
 /// Above this many flagged samples, regrouping costs more than it shows.
 const MAX_REGROUP: usize = 1_000;
@@ -25,6 +26,8 @@ pub const CLOSE_MARGIN: f32 = 0.1;
 pub struct VoiceMap {
     pub people: Vec<Person>,
     pub dots: Vec<Dot>,
+    /// Samples set aside by tidying or the user, placed like the others.
+    pub removed: Vec<Dot>,
     pub close_pairs: Vec<ClosePair>,
     pub threshold: f32,
     /// Normalized stress of the center layout: 0 is a perfect fit.
@@ -40,6 +43,9 @@ pub struct Person {
     pub median_similarity: f32,
     pub outliers: usize,
     pub strays: usize,
+    /// Samples the next tidy pass removes or would, but for its limit.
+    pub due: usize,
+    pub settling: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +57,21 @@ pub struct Dot {
     pub own_score: Option<f32>,
     pub rival: Option<(usize, f32)>,
     pub flag: Flag,
+    pub embedding: Vec<f32>,
+    /// What tidying decided, for a sample it judged.
+    pub tidy: Option<(PruneReason, Verdict)>,
+    /// Why and when (unix seconds) a removed sample was set aside.
+    pub removed: Option<(PruneReason, u64)>,
+}
+
+impl Dot {
+    pub fn due(&self) -> bool {
+        matches!(self.tidy, Some((_, Verdict::Remove | Verdict::Deferred)))
+    }
+
+    pub fn settling(&self) -> bool {
+        matches!(self.tidy, Some((_, Verdict::Settling(_))))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,33 +90,76 @@ impl ClosePair {
 }
 
 impl VoiceMap {
-    pub fn build(database: &SpeakerDatabase, threshold: f32) -> Self {
-        let speakers = database
-            .speakers
+    /// Maps `database` and marks what a tidy pass at `now` would decide.
+    pub fn build(database: &SpeakerDatabase, threshold: f32, now: u64) -> Self {
+        let (names, records) = tidy::reviewed_people(database);
+        let samples = records
             .iter()
-            .filter_map(|(name, record)| {
-                let centroid = mean_normalized(&record.samples)?;
-                Some((name.clone(), record.samples.as_slice(), centroid))
+            .map(|record| record.samples.as_slice())
+            .collect::<Vec<_>>();
+        let centroids = samples
+            .iter()
+            .map(|samples| mean_normalized(samples).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let removed = records
+            .iter()
+            .map(|record| {
+                record
+                    .pruned
+                    .iter()
+                    .map(|pruned| pruned.sample.embedding.as_slice())
+                    .collect()
             })
             .collect::<Vec<_>>();
-        let names = speakers.iter().map(|s| s.0.clone()).collect::<Vec<_>>();
-        let samples = speakers.iter().map(|s| s.1).collect::<Vec<_>>();
-        let centroids = speakers.into_iter().map(|s| s.2).collect::<Vec<_>>();
-        Self::from_parts(names, &samples, &centroids, threshold)
+        let review = classify::review(&samples, &centroids, threshold);
+        let plan = tidy::plan_reviewed(database, &names, &review, threshold, now);
+        let mut map = Self::from_review(names, &samples, &centroids, &removed, review, threshold);
+        for (index, person) in plan.people.iter().take(map.people.len()).enumerate() {
+            for finding in &person.findings {
+                if let Some(dot) = map
+                    .dots
+                    .iter_mut()
+                    .find(|dot| dot.person == index && dot.sample == finding.sample)
+                {
+                    dot.tidy = Some((finding.reason.clone(), finding.verdict.clone()));
+                    map.people[index].due += usize::from(dot.due());
+                    map.people[index].settling += usize::from(dot.settling());
+                }
+            }
+        }
+        for dot in &mut map.removed {
+            let pruned = &records[dot.person].pruned[dot.sample];
+            dot.removed = Some((pruned.reason.clone(), pruned.pruned_at));
+        }
+        map
     }
 
+    #[cfg(test)]
     fn from_parts<V: AsRef<[f32]>>(
         names: Vec<String>,
         samples: &[&[V]],
         centroids: &[Vec<f32>],
         threshold: f32,
     ) -> Self {
-        let count = names.len();
         let review = classify::review(samples, centroids, threshold);
+        let removed = vec![Vec::new(); names.len()];
+        Self::from_review(names, samples, centroids, &removed, review, threshold)
+    }
+
+    fn from_review<V: AsRef<[f32]>>(
+        names: Vec<String>,
+        samples: &[&[V]],
+        centroids: &[Vec<f32>],
+        removed: &[Vec<&[f32]>],
+        review: Review,
+        threshold: f32,
+    ) -> Self {
+        let count = names.len();
         let center_distance = review.center_distance;
         let (centers, stress) = layout_centers(&center_distance);
 
         let mut dots = Vec::new();
+        let mut removed_dots = Vec::new();
         let mut flagged = Vec::new();
         let mut pair_scores = vec![vec![None::<f32>; count]; count];
         let mut people = Vec::with_capacity(count);
@@ -141,6 +205,38 @@ impl VoiceMap {
                     own_score: verdict.own_score,
                     rival: verdict.rival,
                     flag: verdict.flag,
+                    embedding: vector.as_ref().to_vec(),
+                    tidy: None,
+                    removed: None,
+                });
+            }
+            for (sample, vector) in removed[person].iter().enumerate() {
+                let to_centroids = centroids
+                    .iter()
+                    .map(|centroid| distance(vector, centroid))
+                    .collect::<Vec<_>>();
+                let anchors =
+                    center_anchors(&to_centroids, person, &centers, &center_distance, shell);
+                let own = (to_centroids[person] - shell).max(MIN_DISTANCE);
+                let angle = sample as f32 * 2.399_963;
+                let mut position = [
+                    centers[person][0] + angle.cos() * own,
+                    centers[person][1] + angle.sin() * own,
+                ];
+                for _ in 0..30 {
+                    position = majorize(position, &anchors);
+                }
+                removed_dots.push(Dot {
+                    person,
+                    sample,
+                    position,
+                    center_similarity: 1.0 - to_centroids[person],
+                    own_score: topk_mean(vector, samples[person]),
+                    rival: None,
+                    flag: Flag::None,
+                    embedding: vector.to_vec(),
+                    tidy: None,
+                    removed: None,
                 });
             }
             for other in verdicts.rivals {
@@ -158,6 +254,8 @@ impl VoiceMap {
                     .filter(|d| matches!(d.flag, Flag::Outlier | Flag::Isolated))
                     .count(),
                 strays: mine.iter().filter(|d| d.flag == Flag::Stray).count(),
+                due: 0,
+                settling: 0,
             });
         }
         regroup(&mut dots, samples, &flagged);
@@ -188,6 +286,7 @@ impl VoiceMap {
         Self {
             people,
             dots,
+            removed: removed_dots,
             close_pairs,
             threshold,
             stress,
@@ -677,6 +776,9 @@ mod tests {
                     own_score: None,
                     rival: None,
                     flag: Flag::None,
+                    embedding: Vec::new(),
+                    tidy: None,
+                    removed: None,
                 }
             })
             .collect::<Vec<_>>();

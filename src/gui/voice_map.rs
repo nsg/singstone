@@ -4,7 +4,7 @@ use crate::speaker::tidy::{RESTORE_PERIOD, Verdict};
 use crate::speaker::voice_map::{Dot, VoiceMap, assign_colors};
 use crate::types::DEFAULT_SPEAKER_THRESHOLD;
 use adw::prelude::*;
-use gtk::{cairo, glib};
+use gtk::{cairo, gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use std::cell::RefCell;
@@ -38,7 +38,7 @@ enum Hover {
     Person(usize),
 }
 
-/// A change to one sample, offered in the popover of a clicked dot.
+/// A change to one sample, offered in the context menu of a dot.
 #[derive(Clone)]
 enum SampleAction {
     Remove { person: String, embedding: Vec<f32> },
@@ -198,8 +198,8 @@ pub struct VoiceMapView {
     findings: gtk::ListBox,
     voices: gtk::ListBox,
     summary: gtk::Label,
-    popover: gtk::Popover,
-    action_button: gtk::Button,
+    menu: gtk::PopoverMenu,
+    apply_action: gio::SimpleAction,
     changed: Rc<RefCell<Option<Callback>>>,
     state: Rc<RefCell<State>>,
 }
@@ -232,7 +232,7 @@ impl VoiceMapView {
             .build();
         let removed = gtk::ToggleButton::builder()
             .icon_name("user-trash-symbolic")
-            .tooltip_text("Show removed samples")
+            .tooltip_text("Show deleted samples")
             .build();
         let fit = gtk::Button::from_icon_name("zoom-fit-best-symbolic");
         fit.set_tooltip_text(Some("Show everyone"));
@@ -303,13 +303,14 @@ impl VoiceMapView {
         root.append(&canvas_stack);
         root.append(&side_panel);
 
-        let action_button = gtk::Button::new();
-        action_button.add_css_class("flat");
-        let popover = gtk::Popover::builder()
-            .child(&action_button)
-            .position(gtk::PositionType::Top)
-            .build();
-        popover.set_parent(&area);
+        let menu = gtk::PopoverMenu::from_model(None::<&gio::MenuModel>);
+        menu.set_has_arrow(false);
+        menu.set_halign(gtk::Align::Start);
+        menu.set_parent(&area);
+        let apply_action = gio::SimpleAction::new("apply", None);
+        let actions = gio::SimpleActionGroup::new();
+        actions.add_action(&apply_action);
+        area.insert_action_group("sample", Some(&actions));
 
         let view = Self {
             root,
@@ -320,8 +321,8 @@ impl VoiceMapView {
             findings,
             voices,
             summary,
-            popover,
-            action_button,
+            menu,
+            apply_action,
             changed: Rc::new(RefCell::new(None)),
             state,
         };
@@ -424,11 +425,22 @@ impl VoiceMapView {
                 _ => None,
             };
             view.set_focus(person.into_iter().collect(), false);
-            if let Some(hit) = hit {
-                view.offer_action(hit, x, y);
-            }
         });
         self.area.add_controller(drag);
+
+        let context = gtk::GestureClick::builder()
+            .button(gtk::gdk::BUTTON_SECONDARY)
+            .build();
+        let view = self.clone();
+        context.connect_pressed(move |gesture, _, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            view.open_menu(x, y);
+        });
+        self.area.add_controller(context);
+        let long_press = gtk::GestureLongPress::builder().touch_only(true).build();
+        let view = self.clone();
+        long_press.connect_pressed(move |_, x, y| view.open_menu(x, y));
+        self.area.add_controller(long_press);
 
         let keys = gtk::EventControllerKey::new();
         let view = self.clone();
@@ -452,8 +464,7 @@ impl VoiceMapView {
             view.area.queue_draw();
         });
         let view = self.clone();
-        self.action_button.connect_clicked(move |_| {
-            view.popover.popdown();
+        self.apply_action.connect_activate(move |_, _| {
             let action = view.state.borrow_mut().action.take();
             if let Some(action) = action {
                 view.apply(action);
@@ -470,9 +481,13 @@ impl VoiceMapView {
         });
     }
 
-    /// Pops up the remove or restore button for a clicked sample.
-    fn offer_action(&self, hit: Hover, x: f64, y: f64) {
+    /// Offers to delete or restore the sample under the pointer.
+    fn open_menu(&self, x: f64, y: f64) {
+        let (width, height) = self.size();
         let mut state = self.state.borrow_mut();
+        let Some(hit) = state.hit(x, y, width, height) else {
+            return;
+        };
         let Some(map) = &state.map else { return };
         let (action, label) = match hit {
             // A voice's last sample is removed with the voice, on the Voices tab.
@@ -483,7 +498,7 @@ impl VoiceMapView {
                         person: map.people[dot.person].name.clone(),
                         embedding: dot.embedding.clone(),
                     },
-                    "Remove sample",
+                    "Delete sample",
                 )
             }
             Hover::Removed(index) => {
@@ -500,10 +515,12 @@ impl VoiceMapView {
         };
         state.action = Some(action);
         drop(state);
-        self.action_button.set_label(label);
-        self.popover
+        let model = gio::Menu::new();
+        model.append(Some(label), Some("sample.apply"));
+        self.menu.set_menu_model(Some(&model));
+        self.menu
             .set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        self.popover.popup();
+        self.menu.popup();
     }
 
     fn apply(&self, action: SampleAction) {
@@ -772,7 +789,7 @@ impl VoiceMapView {
                 let mut parts = Vec::new();
                 if person.due > 0 {
                     parts.push(format!(
-                        "{} due for removal",
+                        "{} due for deletion",
                         plural(person.due, "sample", "samples")
                     ));
                 }
@@ -1376,7 +1393,7 @@ fn reason_color(reason: &PruneReason) -> [f64; 3] {
     }
 }
 
-/// The "due for removal" mark across a dot's ring.
+/// The "due for deletion" mark across a dot's ring.
 fn cross(cr: &cairo::Context, x: f64, y: f64, reach: f64) -> Result<(), cairo::Error> {
     let d = reach * std::f64::consts::FRAC_1_SQRT_2;
     cr.set_line_width(1.6);
@@ -1407,7 +1424,7 @@ fn draw_legend(state: &State, cr: &cairo::Context, height: f64) -> Result<(), ca
             MUTED,
             Mark::Settling,
         ),
-        ("Due for removal at the next tidy", MUTED, Mark::Due),
+        ("Due for deletion at the next tidy", MUTED, Mark::Due),
         ("Close voices", CAUTION, Mark::Line),
         ("Overlapping voices", OVERLAP, Mark::Line),
     ];
@@ -1493,8 +1510,8 @@ fn draw_hover(
             if let Some((reason, verdict)) = &dot.tidy {
                 let color = reason_color(reason);
                 lines.push(match verdict {
-                    Verdict::Remove => ("Due for removal at the next tidy".into(), color),
-                    Verdict::Deferred => ("Due for removal, after worse samples go".into(), color),
+                    Verdict::Remove => ("Due for deletion at the next tidy".into(), color),
+                    Verdict::Deferred => ("Due for deletion, after worse samples go".into(), color),
                     Verdict::Settling(sessions) => (
                         format!(
                             "Settling: judged after {}",
@@ -1507,7 +1524,7 @@ fn draw_hover(
                 });
             }
             if owner.samples > 1 {
-                lines.push(("Click to remove this sample".into(), MUTED));
+                lines.push(("Right-click to delete this sample".into(), MUTED));
             }
             (dot.person, dot.position, lines)
         }
@@ -1516,10 +1533,10 @@ fn draw_hover(
             let mut lines = vec![(
                 match dot.removed.as_ref().map(|r| &r.0) {
                     Some(PruneReason::SoundsLike { rival }) => {
-                        format!("Removed: sounded like {rival}")
+                        format!("Deleted: sounded like {rival}")
                     }
-                    Some(PruneReason::Isolated) => "Removed: isolated".into(),
-                    _ => "Removed by you".into(),
+                    Some(PruneReason::Isolated) => "Deleted: isolated".into(),
+                    _ => "Deleted by you".into(),
                 },
                 CAUTION,
             )];
@@ -1530,14 +1547,11 @@ fn draw_hover(
                 let days = unix_now().saturating_sub(at) / 86_400;
                 let left = (RESTORE_PERIOD / 86_400).saturating_sub(days);
                 lines.push((
-                    format!(
-                        "Deleted for good in {}",
-                        plural(left as usize, "day", "days")
-                    ),
+                    format!("Gone for good in {}", plural(left as usize, "day", "days")),
                     MUTED,
                 ));
             }
-            lines.push(("Click to restore".into(), MUTED));
+            lines.push(("Right-click to restore".into(), MUTED));
             (dot.person, dot.position, lines)
         }
         Hover::Person(index) => {
@@ -1567,7 +1581,7 @@ fn draw_hover(
             if person.due > 0 {
                 lines.push((
                     format!(
-                        "{} due for removal",
+                        "{} due for deletion",
                         plural(person.due, "sample", "samples")
                     ),
                     OVERLAP,

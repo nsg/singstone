@@ -6,6 +6,8 @@ pub mod whisper;
 
 use crate::types::{AudioSource, TimedWord};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,6 +39,24 @@ impl TranscriptionProgress {
     }
 }
 
+/// The Whisper model configured for Swedish or for everything else, else `fallback`.
+pub fn language_model(swedish: bool, fallback: Option<PathBuf>) -> Option<PathBuf> {
+    language_model_from(swedish, fallback, |name| std::env::var_os(name))
+}
+
+pub fn language_model_from(
+    swedish: bool,
+    fallback: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    let name = if swedish {
+        "SINGSTONE_WHISPER_MODEL_SWEDISH"
+    } else {
+        "SINGSTONE_WHISPER_MODEL_MULTILINGUAL"
+    };
+    env(name).map(PathBuf::from).or(fallback)
+}
+
 pub type ProgressReporter = Arc<dyn Fn(TranscriptionProgress) + Send + Sync>;
 
 pub trait Transcriber {
@@ -66,5 +86,23 @@ mod tests {
         no_elapsed.elapsed_seconds = 0.0;
         assert_eq!(no_elapsed.realtime_speed(), 0.0);
         assert_eq!(progress.fraction(), 0.25);
+    }
+
+    #[test]
+    fn language_model_prefers_the_language_specific_model() {
+        let env = |name: &str| match name {
+            "SINGSTONE_WHISPER_MODEL_SWEDISH" => Some(OsString::from("kb.bin")),
+            _ => None,
+        };
+        let fallback = Some(PathBuf::from("default.bin"));
+        assert_eq!(
+            language_model_from(true, fallback.clone(), env),
+            Some(PathBuf::from("kb.bin"))
+        );
+        assert_eq!(language_model_from(false, fallback.clone(), env), fallback);
+        assert_eq!(
+            language_model_from(false, None, |_| Some(OsString::from("small.bin"))),
+            Some(PathBuf::from("small.bin"))
+        );
     }
 }

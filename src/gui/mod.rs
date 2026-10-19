@@ -13,7 +13,7 @@ use crate::merge::events::{self, ProcessingEvent};
 use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
-use crate::transcription::{TranscriptionProgress, backend};
+use crate::transcription::{self, TranscriptionProgress, backend};
 use crate::types::{AudioSource, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState, Utterance};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -3321,14 +3321,8 @@ impl QueueController {
                     .map_err(|error| error.to_string())?
                     .mic
                     .enabled;
-                let model_env = if swedish_transcription {
-                    "SINGSTONE_WHISPER_MODEL_SWEDISH"
-                } else {
-                    "SINGSTONE_WHISPER_MODEL_MULTILINGUAL"
-                };
-                if let Some(model) = std::env::var_os(model_env) {
-                    args.whisper_model = Some(PathBuf::from(model));
-                }
+                args.whisper_model =
+                    transcription::language_model(swedish_transcription, args.whisper_model.take());
                 args.language = if swedish_transcription { "sv" } else { "auto" }.into();
                 args.events = true;
                 Ok(args)

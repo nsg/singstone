@@ -6,7 +6,13 @@ use std::path::Path;
 
 pub fn run(args: SpeakersArgs) -> Result<(), Box<dyn std::error::Error>> {
     let path = args.speakers_db.unwrap_or_else(database::default_path);
-    let database = match SpeakerDatabase::load(&path) {
+    let dry_run = matches!(&args.command, Some(SpeakersCommand::Tidy(tidy)) if tidy.dry_run);
+    let loaded = if dry_run {
+        SpeakerDatabase::peek(&path)
+    } else {
+        SpeakerDatabase::load(&path)
+    };
+    let database = match loaded {
         Ok(database) => database,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             println!("No learned speakers ({})", path.display());

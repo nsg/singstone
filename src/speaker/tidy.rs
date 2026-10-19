@@ -39,15 +39,31 @@ pub const MAX_REMOVED_SHARE: f64 = 0.10;
 /// How long removed samples can be restored, in seconds.
 pub const RESTORE_PERIOD: u64 = 30 * 24 * 60 * 60;
 
-/// Whether `vector` may be learned as `name`: not when another known person
-/// matches it clearly better and well enough to be recognized.
-pub fn admits(database: &SpeakerDatabase, name: &str, vector: &[f32], threshold: f32) -> bool {
-    let Some(own) = database
+/// Whether `vector`, heard in `session`, may be learned as `name`: not when
+/// another known person matches it clearly better and well enough to be
+/// recognized. The name is judged by its samples from other sessions only.
+pub fn admits(
+    database: &SpeakerDatabase,
+    name: &str,
+    session: &str,
+    vector: &[f32],
+    threshold: f32,
+) -> bool {
+    let earlier = database
         .speakers
         .get(name)
-        .filter(|record| record.samples.len() >= MIN_JUDGED_SAMPLES)
-        .and_then(|record| topk_mean(vector, &record.samples))
-    else {
+        .map(|record| {
+            record
+                .samples
+                .iter()
+                .filter(|sample| sample.session.as_deref() != Some(session))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if earlier.len() < MIN_JUDGED_SAMPLES {
+        return true;
+    }
+    let Some(own) = topk_mean(vector, &earlier) else {
         return true;
     };
     !database
@@ -533,12 +549,31 @@ mod tests {
     fn admission_skips_a_chunk_that_clearly_matches_another_known_person() {
         let chunk = voice(1, 11).pop().unwrap();
         let known = database(&[("Alice", voice(0, 10)), ("Bob", voice(1, 10))]);
-        assert!(!admits(&known, "Alice", &chunk, 0.72));
-        assert!(admits(&known, "Bob", &chunk, 0.72));
+        assert!(!admits(&known, "Alice", "s", &chunk, 0.72));
+        assert!(admits(&known, "Bob", "s", &chunk, 0.72));
         let new_rival = database(&[("Alice", voice(0, 10)), ("Bob", voice(1, 9))]);
-        assert!(admits(&new_rival, "Alice", &chunk, 0.72));
+        assert!(admits(&new_rival, "Alice", "s", &chunk, 0.72));
         let new_voice = database(&[("Alice", voice(0, 9)), ("Bob", voice(1, 10))]);
-        assert!(admits(&new_voice, "Alice", &chunk, 0.72));
+        assert!(admits(&new_voice, "Alice", "s", &chunk, 0.72));
+    }
+
+    #[test]
+    fn admission_judges_a_name_by_its_samples_from_other_sessions() {
+        let chunk = voice(1, 11).pop().unwrap();
+        let mut known = database(&[("Alice", voice(0, 10)), ("Bob", voice(1, 10))]);
+        let alice = known.speakers.get_mut("Alice").unwrap();
+        for vector in around(&toward(1, 1, 0.0), 5, 50) {
+            alice.learn(learned(vector, "today"));
+        }
+        assert!(!admits(&known, "Alice", "today", &chunk, 0.72));
+        assert!(admits(&known, "Alice", "tomorrow", &chunk, 0.72));
+        let mut one_meeting = database(&[("Alice", Vec::new()), ("Bob", voice(1, 10))]);
+        one_meeting.speakers.get_mut("Alice").unwrap().samples = voice(0, 12)
+            .into_iter()
+            .map(|vector| learned(vector, "today"))
+            .collect();
+        assert!(admits(&one_meeting, "Alice", "today", &chunk, 0.72));
+        assert!(!admits(&one_meeting, "Alice", "tomorrow", &chunk, 0.72));
     }
 
     #[test]

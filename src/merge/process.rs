@@ -1024,7 +1024,7 @@ fn apply_correction_learning(
         let admitted = update
             .vectors
             .iter()
-            .map(|vector| tidy::admits(database, &update.speaker, vector, threshold))
+            .map(|vector| tidy::admits(database, &update.speaker, session, vector, threshold))
             .collect::<Vec<_>>();
         let record = database.speakers.entry(update.speaker.clone()).or_default();
         for (vector, admitted) in update.vectors.iter().zip(admitted) {

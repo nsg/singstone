@@ -58,6 +58,21 @@ approximation of the distances between voices: the scale bar shows how far
 apart two centers sit when their voices are exactly at the match threshold,
 and the scores are exact where the picture is not.
 
+Learned voices are tidied automatically. When you name a line, chunks in it
+that clearly sound like another known person, such as a colleague's quick
+"sounds good" inside your line, are not learned. At start and after each
+learning, a tidy pass sets aside samples that sound like someone else or sit
+isolated from the rest of their voice. A sample is judged only once its voice
+has been learned in three later meetings, so a new microphone or room gets
+time to build up, and a group of close samples heard in two or more meetings
+stays however far it lies from the rest. Voices with fewer than 20 samples are
+left alone, and one pass removes at most a tenth of a voice. The map marks a
+sample due for removal with a crossed ring and one still settling with a
+dashed ring, and the Speakers page says when a pass removed something.
+Removed samples are kept for 30 days: the trash button on the map draws them
+faded, and clicking one offers **Restore**, after which tidying leaves it
+alone. Clicking any other sample offers **Remove sample**.
+
 ![Voice map showing learned voices as colored clouds of samples, with close voices joined by dashed lines and a findings list](docs/images/voice-map.png)
 
 Use Meeting details… to title the meeting and place attendees in the room or on
@@ -406,7 +421,7 @@ snap logs -n=100 singstone.model-download
 | `correct` | Lock one transcript line to a name, learn it, and print forward proposals |
 | `render` | Build transcripts from persistent intermediate artifacts |
 | `archive` | Convert a processed session's raw audio to 16-bit FLAC |
-| `speakers` | List learned speakers |
+| `speakers` | List learned speakers; `speakers tidy --dry-run` shows what tidying would remove and why |
 
 Run `singstone COMMAND --help` for command-specific flags. Use `process` for the
 normal path; use the split processing commands when tuning or debugging one

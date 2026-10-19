@@ -261,30 +261,53 @@ unrestricted when its attendee list is empty or its corresponding end has
 unnamed people. This is a filtered view of the speaker database; the database
 on disk is unchanged.
 
-The version 2 speaker database stores only a model identity and unit-length
-vectors ("dots") for each name. Dot count is the weight; dots have no dates,
-provenance, or serialized weights. A normalized mean centroid is computed at
-load time for candidate prefiltering but is not written to disk.
+The version 3 speaker database stores a model identity and, for each name,
+its unit-length voice samples ("dots"), the sessions it learned samples in
+(oldest first) and the samples set aside by tidying or by hand. Dot count is
+the weight. Each sample records when it was learned (unix seconds), the
+session directory name and the track it came from, all absent for samples
+imported from older versions, which count as settled. `kept_by_user` marks a
+restored sample that tidying leaves alone. Each sample is written on one line.
+A normalized mean centroid is computed at load time for candidate
+prefiltering but is not written to disk.
 Names that differ only by Unicode case or whitespace are merged when the
 database is loaded, keeping the spelling from the record with the most dots.
 Manual corrections reuse that stored spelling for matching names.
 
 ```json
 {
-  "format_version": 2,
+  "format_version": 3,
   "embedding_model": {"name":"nemo_en_titanet_small","sha256":"...","dimension":192},
-  "speakers": {"Alice":{"embeddings":[[0.01,-0.02]]}}
+  "speakers": {
+    "Alice": {
+      "sessions": ["2026-09-14_10-30", "2026-09-21_10-30"],
+      "samples": [
+        {"embedding":[0.01,-0.02]},
+        {"learned_at":1758443400,"session":"2026-09-21_10-30","source":"system","embedding":[0.02,-0.01]}
+      ],
+      "pruned": [
+        {"reason":"sounds_like","rival":"Bob","pruned_at":1758529800,"learned_at":1758443400,"session":"2026-09-21_10-30","source":"system","embedding":[0.3,0.1]}
+      ]
+    }
+  }
 }
 ```
 
-The stored vector is likewise abbreviated in this example.
+The stored vectors are likewise abbreviated in this example. A removed
+sample's `reason` is `sounds_like` (with `rival`), `isolated` or `user`.
+Removed samples take no part in recognition or the learned-line mark, and a
+tidy pass deletes them 30 days after `pruned_at`.
 
-On first use, a legacy database without `format_version` is copied to
-`speakers.json.v1.bak` (then `.v1.bak.2`, `.3`, and so on if needed), its
-vectors are imported under the same names into a version 2 database, and a
+On first use, a version 2 database is copied to `speakers.json.v2.bak` and
+rewritten as version 3. A legacy database without `format_version` is copied
+to `speakers.json.v1.bak` (then `.v1.bak.2`, `.3`, and so on if needed), its
+vectors are imported under the same names into a version 3 database, and a
 line on stderr reports the counts. Each legacy vector was the mean of a whole
 diarization cluster, so it counts as one voice sample; a vector from a merged
 cluster stays in the database until later corrections outweigh it.
+Every change to the database is made under an exclusive lock on
+`speakers.json.lock`, so the app, its processing workers and the command line
+do not overwrite each other's changes.
 
 The versioned `speaker-assignments.json` contains every diarized cluster, even
 when it has no usable embedding or confident match:
@@ -363,7 +386,12 @@ excluding chunks shorter than 1.5 seconds. If another name previously owned
 the lock or is the cluster's current first guess, vectors with cosine
 similarity at least `0.999` to a learned vector are removed from that old name.
 An equivalent vector already stored under the chosen name is not appended
-again. With a configured model, learning preparation must succeed before the
+again; one that was removed is learned again as a new sample. A chunk is
+skipped when another name with at least 10 samples scores it at least 0.05
+higher than the chosen name, which also needs 10 samples, and at or above the
+match threshold; the line keeps its lock, and the printed outcome counts
+skipped chunks in `skipped`. After learning, a tidy pass runs as described
+under [Tidying](#tidying-learned-voices), and `tidied` counts what it removed. With a configured model, learning preparation must succeed before the
 lock is saved; a rendering failure restores the previous corrections. The
 database is updated only after rendering succeeds.
 Without the model, the line is still locked and rendered, but learning and
@@ -373,7 +401,8 @@ same way as system-track corrections.
 The app marks a locked line as learned when one of its chunks is stored under
 the line's name in the database (cosine similarity at least `0.999`). This is
 derived when the session is shown, not recorded: the mark disappears when the
-speaker is deleted, or when reprocessing moves the chunk boundaries.
+speaker is deleted, when tidying removes the chunk, or when reprocessing moves
+the chunk boundaries.
 
 The command-line equivalent is:
 
@@ -392,6 +421,41 @@ outcome and each forward proposal as JSON lines but does not apply proposals.
 The GUI applies every proposed row without asking, as an inferred entry. Only
 the line named by hand is locked and learned; rows that are not proposed keep
 their current name.
+
+### Tidying learned voices
+
+A tidy pass runs when the app starts and after every correction that changed
+the database. It judges each voice with at least 20 samples using the same
+scores the voice map shows:
+
+- **Sounds like someone else**: another name's top-3 score for the sample is
+  at least its own top-3 score from the voice's other samples, at least `0.05`
+  higher, and that name has at least 10 samples.
+- **Isolated**: the sample's own top-3 score is below the voice's median own
+  score less four robust deviations (1.4826 times the median absolute
+  deviation), and at least `0.15` below it. Distance to the voice's center is
+  not a reason; a tight group far from it still helps recognition.
+
+A sample with a session is judged only after its voice has learned samples in
+three later sessions, counted from the voice's `sessions` list, which keeps
+its history when samples are removed. Imported samples have no session and are
+judged at once. An isolated sample is kept when it and its close neighbours,
+those of its five closest samples of the same voice that are at least as
+similar as both the match threshold and the isolation floor, come from at
+least two sessions: a recording condition that recurs. Restored samples are never
+removed. One pass removes at most a tenth of a voice's samples, the furthest
+past their limit first, and never takes a voice below 20. Each pass decides
+from one reading of the database, so a removal does not make other samples
+removable in the same pass, and the removals are then applied under the lock to
+the current file, found by their vectors.
+
+```bash
+singstone speakers tidy --dry-run --speakers-db ~/.local/share/singstone/speakers.json
+```
+
+lists per voice each judged sample, its reason and scores, and whether it
+would be removed, is deferred by the per-pass limit, is still settling, or is
+kept as recurring or restored. Without `--dry-run` the pass is applied.
 
 ## 4. Render: intermediate artifacts to the final transcript
 

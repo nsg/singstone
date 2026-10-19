@@ -120,7 +120,7 @@ impl SpeakerRecord {
         }
     }
 
-    fn holds(&self, vector: &[f32]) -> bool {
+    pub fn holds(&self, vector: &[f32]) -> bool {
         self.samples
             .iter()
             .any(|sample| same_vector(&sample.embedding, vector))

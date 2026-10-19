@@ -14,6 +14,7 @@ use crate::speaker::database::{
     self, EmbeddingModelIdentity, SAME_VECTOR_SIMILARITY, Sample, SpeakerDatabase,
 };
 use crate::speaker::embedding::{self, ClusterCandidate, EmbeddingExtractor};
+use crate::speaker::tidy;
 use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
@@ -434,6 +435,8 @@ pub struct Proposal {
 pub struct CorrectionOutcome {
     pub learned: usize,
     pub forgotten: usize,
+    /// Chunks left out because they sound clearly like someone else.
+    pub skipped: usize,
     pub learning_available: bool,
     pub proposals: Vec<Proposal>,
 }
@@ -660,7 +663,7 @@ fn apply_corrections_inner(
     save_corrections_and_render(&session, &corrections)?;
 
     let learning_available = learning.is_some();
-    let (mut learned, mut forgotten) = (0, 0);
+    let (mut learned, mut forgotten, mut skipped) = (0, 0, 0);
     if let Some(learning) = learning.as_ref() {
         let path = &learning.database_path;
         let lock = SpeakerDatabase::lock(path)?;
@@ -671,11 +674,12 @@ fn apply_corrections_inner(
             }
             Err(error) => return Err(error.into()),
         };
-        (learned, forgotten) = apply_correction_learning(
+        (learned, forgotten, skipped) = apply_correction_learning(
             &mut database,
             &learning_updates,
             &session_id(&session),
             database::unix_now(),
+            args.speaker_threshold,
         );
         if learned > 0 || forgotten > 0 {
             database.save(path)?;
@@ -685,6 +689,7 @@ fn apply_corrections_inner(
         CorrectionOutcome {
             learned,
             forgotten,
+            skipped,
             learning_available,
             proposals: Vec::new(),
         },
@@ -998,24 +1003,34 @@ fn apply_correction_learning(
     updates: &[CorrectionLearningUpdate],
     session: &str,
     now: u64,
-) -> (usize, usize) {
-    let mut learned = 0;
-    let mut forgotten = 0;
+    threshold: f32,
+) -> (usize, usize, usize) {
+    let (mut learned, mut forgotten, mut skipped) = (0, 0, 0);
     for update in updates {
         for old_name in &update.old_names {
             for vector in &update.vectors {
                 forgotten += database.forget_matching(old_name, vector, SAME_VECTOR_SIMILARITY);
             }
         }
+        let admitted = update
+            .vectors
+            .iter()
+            .map(|vector| tidy::admits(database, &update.speaker, vector, threshold))
+            .collect::<Vec<_>>();
         let record = database.speakers.entry(update.speaker.clone()).or_default();
-        for vector in &update.vectors {
-            if record.learn(Sample::learned(vector.clone(), session, update.source, now)) {
+        for (vector, admitted) in update.vectors.iter().zip(admitted) {
+            if record.holds(vector) {
+                continue;
+            }
+            if !admitted {
+                skipped += 1;
+            } else if record.learn(Sample::learned(vector.clone(), session, update.source, now)) {
                 learned += 1;
             }
         }
     }
     database.refresh_centroids();
-    (learned, forgotten)
+    (learned, forgotten, skipped)
 }
 
 fn stage_process_args(session: PathBuf) -> ProcessArgs {
@@ -3715,13 +3730,13 @@ mod tests {
         }];
 
         assert_eq!(
-            apply_correction_learning(&mut database, &updates, "s1", 10),
-            (1, 0)
+            apply_correction_learning(&mut database, &updates, "s1", 10, 0.72),
+            (1, 0, 0)
         );
         let after_first = serde_json::to_vec(&database).expect("serialize database");
         assert_eq!(
-            apply_correction_learning(&mut database, &updates, "s1", 20),
-            (0, 0)
+            apply_correction_learning(&mut database, &updates, "s1", 20, 0.72),
+            (0, 0, 0)
         );
         assert_eq!(
             serde_json::to_vec(&database).expect("serialize database again"),

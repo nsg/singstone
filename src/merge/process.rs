@@ -1082,7 +1082,7 @@ fn open_session(path: &Path) -> Result<(Session, Manifest), Box<dyn std::error::
     Ok((session, manifest))
 }
 
-fn thread_count(configured: Option<usize>) -> usize {
+pub(crate) fn thread_count(configured: Option<usize>) -> usize {
     configured
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
         .max(1)

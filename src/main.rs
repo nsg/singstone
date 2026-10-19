@@ -32,6 +32,9 @@ fn main() -> ExitCode {
         };
         return run_event_worker(args);
     }
+    if let cli::Command::Dictate(args) = cli.command {
+        return audio::dictate::run(args);
+    }
     if !matches!(
         cli.command,
         cli::Command::ModelSetup | cli::Command::ModelSetupCheck
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
         cli::Command::ModelSetupCheck => model_setup::check_service().map_err(Into::into),
         cli::Command::Devices => audio::devices::list(),
         cli::Command::Record(args) => audio::record::run(args),
+        cli::Command::Dictate(_) => unreachable!(),
         cli::Command::Process(args) => merge::process::run(args),
         cli::Command::Transcribe(args) => merge::process::run_transcribe(args),
         cli::Command::Diarize(args) => merge::process::run_diarize(args),

@@ -37,6 +37,12 @@ struct ServiceMessage {
 }
 
 pub fn ensure_available(command: &Command) -> io::Result<()> {
+    ensure_models(&requested_models(command))
+}
+
+/// Waits for the Snap's model setup to provide the requested `(purpose, path)` models
+/// when they are pinned default models; anything else is left to model verification.
+pub fn ensure_models(requested: &[(&str, &Path)]) -> io::Result<()> {
     let Some(socket_path) = std::env::var_os(SOCKET_ENV).map(PathBuf::from) else {
         return Ok(());
     };
@@ -47,7 +53,7 @@ pub fn ensure_available(command: &Command) -> io::Result<()> {
         return Ok(());
     };
     let lock = ModelsLock::load(&lock_path)?;
-    let required_models = required_default_models(command, &models_dir, &lock);
+    let required_models = required_default_models(requested, &models_dir, &lock);
     if required_models.is_empty()
         || required_models
             .iter()
@@ -121,11 +127,7 @@ pub fn check_service() -> io::Result<()> {
     Ok(())
 }
 
-fn required_default_models<'a>(
-    command: &'a Command,
-    models_dir: &Path,
-    lock: &'a ModelsLock,
-) -> Vec<&'a ModelEntry> {
+fn requested_models(command: &Command) -> Vec<(&'static str, &Path)> {
     let mut requested: Vec<(&str, &Path)> = Vec::new();
     match command {
         Command::Process(args) => {
@@ -157,8 +159,16 @@ fn required_default_models<'a>(
         _ => {}
     }
     requested
-        .into_iter()
-        .filter_map(|(purpose, path)| {
+}
+
+fn required_default_models<'a>(
+    requested: &[(&str, &Path)],
+    models_dir: &Path,
+    lock: &'a ModelsLock,
+) -> Vec<&'a ModelEntry> {
+    requested
+        .iter()
+        .filter_map(|&(purpose, path)| {
             lock.models
                 .iter()
                 .find(|entry| entry.purpose == purpose && path == models_dir.join(&entry.filename))
@@ -717,7 +727,7 @@ mod tests {
         args.whisper_model = Some(models_dir.join("multilingual.bin"));
         let command = Command::Process(args);
 
-        let required = required_default_models(&command, &models_dir, &lock);
+        let required = required_default_models(&requested_models(&command), &models_dir, &lock);
 
         assert_eq!(required.len(), 1);
         assert_eq!(required[0].name, "multilingual");

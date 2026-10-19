@@ -1,3 +1,4 @@
+use crate::audio::dictate::DictationLanguage;
 use crate::types::{AudioSource, DEFAULT_SPEAKER_THRESHOLD};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use std::ffi::OsString;
@@ -28,6 +29,8 @@ pub enum Command {
     Devices,
     /// Record microphone and/or system audio into a new session directory.
     Record(RecordArgs),
+    /// Dictate from the microphone and print the text; nothing is stored.
+    Dictate(DictateArgs),
     /// Transcribe, diarize and merge a recorded session offline.
     Process(ProcessArgs),
     /// Transcribe a recorded session into words.jsonl.
@@ -69,6 +72,33 @@ pub struct RecordArgs {
     /// Stop automatically after this many seconds (mainly for testing).
     #[arg(long)]
     pub duration: Option<f64>,
+}
+
+#[derive(Args, Debug)]
+pub struct DictateArgs {
+    /// Microphone: `default`, a PipeWire node id or node name.
+    #[arg(long, default_value = "default")]
+    pub mic: String,
+    /// Language used when the stop line names none: `en` or `sv`.
+    #[arg(long, default_value = "en")]
+    pub language: DictationLanguage,
+    /// Whisper model for every language. Without it, the language's model
+    /// (SINGSTONE_WHISPER_MODEL_MULTILINGUAL or SINGSTONE_WHISPER_MODEL_SWEDISH)
+    /// is used, then SINGSTONE_WHISPER_MODEL.
+    #[arg(long)]
+    pub whisper_model: Option<PathBuf>,
+    /// Trusted model manifest with SHA-256 hashes.
+    #[arg(long, env = "SINGSTONE_MODELS_LOCK")]
+    pub models_lock: Option<PathBuf>,
+    /// Skip model hash verification (development only).
+    #[arg(long)]
+    pub allow_unverified_models: bool,
+    /// Inference threads (defaults to available parallelism).
+    #[arg(long)]
+    pub threads: Option<usize>,
+    /// Stream machine-readable dictation events to stdout.
+    #[arg(long, hide = true)]
+    pub events: bool,
 }
 
 #[derive(Args, Debug, PartialEq)]

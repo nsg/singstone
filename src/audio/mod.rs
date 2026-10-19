@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod capture;
 pub mod devices;
+pub mod dictate;
 pub mod pipewire;
 pub mod record;
 pub mod timing;

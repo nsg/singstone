@@ -180,6 +180,15 @@ fn word_speaker(
     (speaker_id, speaker, locked)
 }
 
+/// Joins words into one line of transcript text.
+pub fn words_text(words: &[TimedWord]) -> String {
+    let mut text = String::new();
+    for word in words {
+        append_word(&mut text, &word.text);
+    }
+    text
+}
+
 fn source_order(source: AudioSource) -> u8 {
     match source {
         AudioSource::Mic => 0,

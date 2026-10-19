@@ -241,17 +241,18 @@ fn corrections_learn_and_recognize_ami_speaker() {
     let database_json: serde_json::Value =
         serde_json::from_slice(&fs::read(&database).expect("read speaker database"))
             .expect("parse speaker database");
-    assert_eq!(database_json["format_version"], 2);
+    assert_eq!(database_json["format_version"], 3);
     assert_eq!(
-        database_json["speakers"][temporary_name]["embeddings"]
+        database_json["speakers"][temporary_name]["samples"]
             .as_array()
             .map(Vec::len),
         Some(0)
     );
     assert!(
-        database_json["speakers"][&learned_name]["embeddings"]
+        database_json["speakers"][&learned_name]["samples"]
             .as_array()
-            .is_some_and(|dots| !dots.is_empty())
+            .is_some_and(|samples| !samples.is_empty()
+                && samples.iter().all(|sample| sample["session"].is_string()))
     );
 
     write_speaker_database(&database, &model, extractor.dimension(), &disjoint_learning)

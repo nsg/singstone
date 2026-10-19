@@ -62,15 +62,19 @@ pub fn cosine(left: &[f32], right: &[f32]) -> Option<f32> {
     score.is_finite().then_some(score as f32)
 }
 
-pub fn mean_normalized(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
-    let dimension = vectors.first()?.len();
-    if dimension == 0 || vectors.iter().any(|vector| vector.len() != dimension) {
+pub fn mean_normalized<V: AsRef<[f32]>>(vectors: &[V]) -> Option<Vec<f32>> {
+    let dimension = vectors.first()?.as_ref().len();
+    if dimension == 0
+        || vectors
+            .iter()
+            .any(|vector| vector.as_ref().len() != dimension)
+    {
         return None;
     }
     let mut mean = vec![0.0f32; dimension];
     let mut used = 0usize;
     for vector in vectors {
-        let mut normalized = vector.clone();
+        let mut normalized = vector.as_ref().to_vec();
         if normalize(&mut normalized) {
             for (sum, value) in mean.iter_mut().zip(normalized) {
                 *sum += value;
@@ -86,10 +90,10 @@ pub fn mean_normalized(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
 }
 
 /// Score one query dot against the three nearest stored dots for a speaker.
-pub fn topk_mean(query: &[f32], enrolled: &[Vec<f32>]) -> Option<f32> {
+pub fn topk_mean<V: AsRef<[f32]>>(query: &[f32], enrolled: &[V]) -> Option<f32> {
     let mut scores = enrolled
         .iter()
-        .filter_map(|candidate| cosine(query, candidate))
+        .filter_map(|candidate| cosine(query, candidate.as_ref()))
         .collect::<Vec<_>>();
     scores.sort_by(|left, right| right.total_cmp(left));
     let count = scores.len().min(3);
@@ -97,7 +101,7 @@ pub fn topk_mean(query: &[f32], enrolled: &[Vec<f32>]) -> Option<f32> {
 }
 
 /// Score a speaker as the median query-dot score across a cluster or line.
-pub fn speaker_score(query: &[Vec<f32>], enrolled: &[Vec<f32>]) -> Option<f32> {
+pub fn speaker_score<V: AsRef<[f32]>>(query: &[Vec<f32>], enrolled: &[V]) -> Option<f32> {
     let mut scores = query
         .iter()
         .filter_map(|dot| topk_mean(dot, enrolled))
@@ -177,7 +181,7 @@ mod tests {
         let expected = (first + second) / 2.0;
         assert!((speaker_score(&query, &enrolled).expect("score") - expected).abs() < 1e-6);
         assert_eq!(speaker_score(&[], &enrolled), None);
-        assert_eq!(speaker_score(&query, &[]), None);
+        assert_eq!(speaker_score::<Vec<f32>>(&query, &[]), None);
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub fn list(args: SpeakersArgs) -> Result<(), Box<dyn std::error::Error>> {
         database.embedding_model.dimension
     );
     for (name, speaker) in database.speakers {
-        println!("{name}\t{} embedding(s)", speaker.embeddings.len());
+        println!("{name}\t{} embedding(s)", speaker.samples.len());
     }
     Ok(())
 }

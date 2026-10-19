@@ -10,7 +10,9 @@ use crate::merge::leakage::{self, AudioEnvelopes};
 use crate::merge::utterances::{self, DEFAULT_NEAREST_TOLERANCE_MS};
 use crate::models;
 use crate::session::Session;
-use crate::speaker::database::{self, EmbeddingModelIdentity, SpeakerDatabase};
+use crate::speaker::database::{
+    self, EmbeddingModelIdentity, SAME_VECTOR_SIMILARITY, Sample, SpeakerDatabase,
+};
 use crate::speaker::embedding::{self, ClusterCandidate, EmbeddingExtractor};
 use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
@@ -35,18 +37,18 @@ const HIDDEN_SOURCES_FORMAT_VERSION: u32 = 1;
 const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
 const PROPOSAL_MARGIN: f32 = 0.05;
-const SAME_VECTOR_SIMILARITY: f32 = 0.999;
 
 struct CorrectionLearning {
     chunks: Vec<EmbeddingChunk>,
     database: SpeakerDatabase,
     database_path: PathBuf,
-    migrate_legacy_database: bool,
+    identity: EmbeddingModelIdentity,
 }
 
 struct CorrectionLearningUpdate {
     speaker: String,
     old_names: HashSet<String>,
+    source: AudioSource,
     vectors: Vec<Vec<f32>>,
 }
 
@@ -601,7 +603,7 @@ fn apply_corrections_inner(
         Err(error) => return Err(error.into()),
     };
     let mut corrections = read_speaker_corrections(&session)?;
-    let mut learning = prepare_correction_learning(&args, &session, &segments)?;
+    let learning = prepare_correction_learning(&args, &session, &segments)?;
     if let Some(learning) = learning.as_ref() {
         for request in &mut requests {
             request.speaker = learning.database.resolve_name(&request.speaker);
@@ -642,6 +644,7 @@ fn apply_corrections_inner(
                     CorrectionLearningUpdate {
                         speaker: request.speaker.clone(),
                         old_names,
+                        source: request.source,
                         vectors: embeddings_in_range(
                             &learning.chunks,
                             request.source,
@@ -658,13 +661,23 @@ fn apply_corrections_inner(
 
     let learning_available = learning.is_some();
     let (mut learned, mut forgotten) = (0, 0);
-    if let Some(learning) = learning.as_mut() {
-        if learning.migrate_legacy_database {
-            SpeakerDatabase::load(&learning.database_path)?;
-        }
-        (learned, forgotten) = apply_correction_learning(&mut learning.database, &learning_updates);
+    if let Some(learning) = learning.as_ref() {
+        let path = &learning.database_path;
+        let mut database = match SpeakerDatabase::load(path) {
+            Ok(database) => database.checked(&learning.identity)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                SpeakerDatabase::empty(learning.identity.clone())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        (learned, forgotten) = apply_correction_learning(
+            &mut database,
+            &learning_updates,
+            &session_id(&session),
+            database::unix_now(),
+        );
         if learned > 0 || forgotten > 0 {
-            learning.database.save(&learning.database_path)?;
+            database.save(path)?;
         }
     }
     Ok((
@@ -938,7 +951,7 @@ fn prepare_correction_learning(
         .speakers_db
         .clone()
         .unwrap_or_else(database::default_path);
-    let (database, migrate_legacy_database) = load_correction_database(&path, &identity)?;
+    let database = load_correction_database(&path, &identity)?;
     let chunks = ensure_embeddings(
         session,
         segments,
@@ -950,38 +963,40 @@ fn prepare_correction_learning(
         chunks,
         database,
         database_path: path,
-        migrate_legacy_database,
+        identity,
     }))
 }
 
+/// Reads the database without converting an older file, which waits until
+/// the correction has rendered.
 fn load_correction_database(
     path: &Path,
     identity: &EmbeddingModelIdentity,
-) -> io::Result<(SpeakerDatabase, bool)> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+) -> io::Result<SpeakerDatabase> {
+    match SpeakerDatabase::peek(path) {
+        Ok(database) => database.checked(identity),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok((SpeakerDatabase::empty(identity.clone()), false));
+            Ok(SpeakerDatabase::empty(identity.clone()))
         }
-        Err(error) => return Err(error),
-    };
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid speaker database {}: {error}", path.display()),
-        )
-    })?;
-    if value.get("format_version").is_none() {
-        let (database, _, _) = SpeakerDatabase::import_legacy(value, path)?;
-        database.validate_identity(identity)?;
-        return Ok((database, true));
+        Err(error) => Err(error),
     }
-    SpeakerDatabase::load_checked(path, identity).map(|database| (database, false))
+}
+
+/// The session's identity in learned-sample history: its directory name.
+fn session_id(session: &Session) -> String {
+    session
+        .dir
+        .file_name()
+        .unwrap_or(session.dir.as_os_str())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn apply_correction_learning(
     database: &mut SpeakerDatabase,
     updates: &[CorrectionLearningUpdate],
+    session: &str,
+    now: u64,
 ) -> (usize, usize) {
     let mut learned = 0;
     let mut forgotten = 0;
@@ -991,20 +1006,11 @@ fn apply_correction_learning(
                 forgotten += database.forget_matching(old_name, vector, SAME_VECTOR_SIMILARITY);
             }
         }
-        let embeddings = &mut database
-            .speakers
-            .entry(update.speaker.clone())
-            .or_default()
-            .embeddings;
+        let record = database.speakers.entry(update.speaker.clone()).or_default();
         for vector in &update.vectors {
-            if embeddings.iter().any(|existing| {
-                embedding::cosine(existing, vector)
-                    .is_some_and(|score| score >= SAME_VECTOR_SIMILARITY)
-            }) {
-                continue;
+            if record.learn(Sample::learned(vector.clone(), session, update.source, now)) {
+                learned += 1;
             }
-            embeddings.push(vector.clone());
-            learned += 1;
         }
     }
     database.refresh_centroids();
@@ -1505,7 +1511,7 @@ fn validate_recognition_database(
     if database
         .speakers
         .values()
-        .all(|speaker| speaker.embeddings.is_empty())
+        .all(|speaker| speaker.samples.is_empty())
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2437,14 +2443,15 @@ fn line_is_learned(
     )
     .iter()
     .any(|vector| {
-        record.embeddings.iter().any(|stored| {
-            embedding::cosine(stored, vector).is_some_and(|score| score >= SAME_VECTOR_SIMILARITY)
+        record.samples.iter().any(|stored| {
+            embedding::cosine(&stored.embedding, vector)
+                .is_some_and(|score| score >= SAME_VECTOR_SIMILARITY)
         })
     })
 }
 
 fn score_speaker_name(database: &SpeakerDatabase, name: &str, query: &[Vec<f32>]) -> Option<f32> {
-    embedding::speaker_score(query, &database.speakers.get(name)?.embeddings)
+    embedding::speaker_score(query, &database.speakers.get(name)?.samples)
 }
 
 fn centroid_prefilter<'a>(
@@ -2702,10 +2709,7 @@ mod tests {
         ] {
             database.speakers.insert(
                 name.into(),
-                SpeakerRecord {
-                    embeddings: vec![vec![x, (1.0 - x * x).max(0.0).sqrt()]],
-                    centroid: None,
-                },
+                SpeakerRecord::settled(vec![vec![x, (1.0 - x * x).max(0.0).sqrt()]]),
             );
         }
         database.refresh_centroids();
@@ -2775,20 +2779,12 @@ mod tests {
             sha256: "x".into(),
             dimension: 2,
         });
-        database.speakers.insert(
-            "Alice".into(),
-            SpeakerRecord {
-                embeddings: vec![vec![1.0, 0.0]],
-                centroid: None,
-            },
-        );
-        database.speakers.insert(
-            "Bob".into(),
-            SpeakerRecord {
-                embeddings: vec![vec![0.0, 1.0]],
-                centroid: None,
-            },
-        );
+        database
+            .speakers
+            .insert("Alice".into(), SpeakerRecord::settled(vec![vec![1.0, 0.0]]));
+        database
+            .speakers
+            .insert("Bob".into(), SpeakerRecord::settled(vec![vec![0.0, 1.0]]));
         database.refresh_centroids();
         let allowed = HashSet::from(["Bob".into()]);
         assert_eq!(
@@ -3531,7 +3527,7 @@ mod tests {
         assert_eq!(transcript[0].speaker, "Laura");
         assert!(transcript[0].locked);
         let database = SpeakerDatabase::load(&database_path).expect("read learned database");
-        assert_eq!(database.speakers["Laura"].embeddings.len(), 1);
+        assert_eq!(database.speakers["Laura"].samples.len(), 1);
         assert!(!database.speakers.contains_key("laura"));
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -3713,12 +3709,19 @@ mod tests {
         let updates = [CorrectionLearningUpdate {
             speaker: "Carol".into(),
             old_names: HashSet::new(),
+            source: AudioSource::System,
             vectors: vec![vec![1.0, 0.0]],
         }];
 
-        assert_eq!(apply_correction_learning(&mut database, &updates), (1, 0));
+        assert_eq!(
+            apply_correction_learning(&mut database, &updates, "s1", 10),
+            (1, 0)
+        );
         let after_first = serde_json::to_vec(&database).expect("serialize database");
-        assert_eq!(apply_correction_learning(&mut database, &updates), (0, 0));
+        assert_eq!(
+            apply_correction_learning(&mut database, &updates, "s1", 20),
+            (0, 0)
+        );
         assert_eq!(
             serde_json::to_vec(&database).expect("serialize database again"),
             after_first
@@ -3759,12 +3762,14 @@ mod tests {
             dimension: 2,
         };
 
-        let (database, migrate) =
+        let database =
             load_correction_database(&path, &expected).expect("load correction database");
 
-        assert!(migrate);
         assert_eq!(database.embedding_model, expected);
-        assert_eq!(database.speakers["Alice"].embeddings, vec![vec![1.0, 0.0]]);
+        assert_eq!(
+            database.speakers["Alice"].samples,
+            vec![Sample::settled(vec![1.0, 0.0])]
+        );
         assert_eq!(fs::read(&path).expect("reread legacy database"), previous);
         assert!(!root.join("speakers.json.v1.bak").exists());
         fs::remove_dir_all(root).expect("remove fixture");
@@ -3838,20 +3843,12 @@ mod tests {
             sha256: "hash".into(),
             dimension: 2,
         });
-        database.speakers.insert(
-            "Alice".into(),
-            SpeakerRecord {
-                embeddings: vec![vec![1.0, 0.0]],
-                centroid: None,
-            },
-        );
-        database.speakers.insert(
-            "Bob".into(),
-            SpeakerRecord {
-                embeddings: vec![vec![0.96, 0.28]],
-                centroid: None,
-            },
-        );
+        database
+            .speakers
+            .insert("Alice".into(), SpeakerRecord::settled(vec![vec![1.0, 0.0]]));
+        database
+            .speakers
+            .insert("Bob".into(), SpeakerRecord::settled(vec![vec![0.96, 0.28]]));
         let candidate = Utterance {
             start_ms: 2_000,
             end_ms: 4_000,
@@ -3871,7 +3868,7 @@ mod tests {
         assert!(proposal.score_old.is_some_and(|score| score > 0.95));
         assert!(!proposal.proposed);
 
-        database.speakers.get_mut("Bob").unwrap().embeddings = vec![vec![0.8, 0.6]];
+        database.speakers.get_mut("Bob").unwrap().samples = vec![Sample::settled(vec![0.8, 0.6])];
         assert!(
             proposal_for_utterance(&request, 7, candidate.clone(), &chunks, &database, 0.6)
                 .expect("positive margin proposal")
@@ -3932,10 +3929,7 @@ mod tests {
             sha256: "hash".into(),
             dimension: 2,
         });
-        let record = |embedding| SpeakerRecord {
-            embeddings: vec![embedding],
-            centroid: None,
-        };
+        let record = |embedding| SpeakerRecord::settled(vec![embedding]);
         database
             .speakers
             .insert("Alice".into(), record(vec![1.0, 0.0]));

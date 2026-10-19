@@ -74,8 +74,8 @@ impl VoiceMap {
             .speakers
             .iter()
             .filter_map(|(name, record)| {
-                let centroid = mean_normalized(&record.embeddings)?;
-                Some((name.clone(), record.embeddings.as_slice(), centroid))
+                let centroid = mean_normalized(&record.samples)?;
+                Some((name.clone(), record.samples.as_slice(), centroid))
             })
             .collect::<Vec<_>>();
         let names = speakers.iter().map(|s| s.0.clone()).collect::<Vec<_>>();
@@ -84,9 +84,9 @@ impl VoiceMap {
         Self::from_parts(names, &samples, &centroids, threshold)
     }
 
-    fn from_parts(
+    fn from_parts<V: AsRef<[f32]>>(
         names: Vec<String>,
-        samples: &[&[Vec<f32>]],
+        samples: &[&[V]],
         centroids: &[Vec<f32>],
         threshold: f32,
     ) -> Self {
@@ -118,7 +118,7 @@ impl VoiceMap {
                 }
                 let to_centroids = centroids
                     .iter()
-                    .map(|centroid| distance(vector, centroid))
+                    .map(|centroid| distance(vector.as_ref(), centroid))
                     .collect::<Vec<_>>();
                 let anchors =
                     center_anchors(&to_centroids, person, &centers, &center_distance, shell);
@@ -212,11 +212,12 @@ fn shell_offset(similarities: &[f32]) -> f32 {
 }
 
 /// Unit direction of each sample in its person's two main axes of variation.
-fn principal_directions(samples: &[Vec<f32>], centroid: &[f32]) -> Vec<[f32; 2]> {
+fn principal_directions<V: AsRef<[f32]>>(samples: &[V], centroid: &[f32]) -> Vec<[f32; 2]> {
     let residuals = samples
         .iter()
         .map(|v| {
-            v.iter()
+            v.as_ref()
+                .iter()
                 .zip(centroid)
                 .map(|(a, b)| a - b)
                 .collect::<Vec<_>>()
@@ -316,11 +317,15 @@ fn center_anchors(
 /// Lets flagged samples also pull toward the samples they sound most like,
 /// so a batch of similar bad samples shows as one island rather than being
 /// spread out by their centroid distances alone.
-fn regroup(dots: &mut [Dot], samples: &[&[Vec<f32>]], flagged: &[(usize, Vec<Anchor>, f32)]) {
+fn regroup<V: AsRef<[f32]>>(
+    dots: &mut [Dot],
+    samples: &[&[V]],
+    flagged: &[(usize, Vec<Anchor>, f32)],
+) {
     if flagged.len() > MAX_REGROUP {
         return;
     }
-    let vector = |dot: &Dot| samples[dot.person][dot.sample].as_slice();
+    let vector = |dot: &Dot| samples[dot.person][dot.sample].as_ref();
     let neighbors = flagged
         .iter()
         .map(|(index, _, shell)| {

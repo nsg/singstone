@@ -1551,12 +1551,8 @@ impl SpeakersPage {
                         .title(&name)
                         .subtitle(format!(
                             "{} voice sample{}",
-                            speaker.embeddings.len(),
-                            if speaker.embeddings.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
+                            speaker.samples.len(),
+                            if speaker.samples.len() == 1 { "" } else { "s" }
                         ))
                         .build();
                     row.add_prefix(&gtk::Image::from_icon_name("avatar-default-symbolic"));

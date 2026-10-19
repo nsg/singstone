@@ -19,11 +19,14 @@ use std::path::Path;
 pub const MIN_JUDGED_SAMPLES: usize = 10;
 /// How much better another person must match for a sample to count as theirs.
 pub const CLEARLY_BETTER: f32 = 0.05;
+/// Own samples from other sessions a sample needs to be compared with them
+/// alone; with fewer it is compared with all of its voice's samples.
+pub const MIN_OTHER_SESSION_SAMPLES: usize = 3;
 /// Least gap below a voice's median own score that counts as isolated.
 pub const ISOLATION_MIN_GAP: f32 = 0.15;
-/// Closest own samples that form a sample's neighbourhood; those at least
-/// as similar as both the recognition threshold and the isolation floor
-/// count as close.
+/// Closest own samples, from other sessions where there are enough, that
+/// form a sample's neighbourhood; those at least as similar as both the
+/// recognition threshold and the isolation floor count as close.
 pub const NEIGHBORHOOD: usize = 5;
 /// Sessions a close neighbourhood must span to be a recurring condition.
 pub const RECURRING_SESSIONS: usize = 2;
@@ -278,6 +281,8 @@ fn judge(
         return None;
     };
     let close = threshold.max(limit);
+    // A close group that spans two or more sessions is a recording condition
+    // that recurs, such as a second microphone.
     let recurring = || {
         let mut sessions = judged
             .neighbors
@@ -483,6 +488,28 @@ mod tests {
         database
     }
 
+    /// Three sessions after the ones a test sets up, which settles them.
+    fn later_sessions() -> Vec<Sample> {
+        vec![
+            learned(toward(0, 1, 0.1), "c"),
+            learned(toward(0, 2, 0.1), "d"),
+            learned(toward(0, 3, 0.1), "e"),
+        ]
+    }
+
+    /// Tidies until a pass removes nothing; returns what each pass removed.
+    fn passes(database: &mut SpeakerDatabase) -> Vec<Summary> {
+        let mut passes = Vec::new();
+        loop {
+            let plan = plan(database, 0.72, NOW);
+            let summary = apply(database, &plan, NOW);
+            if summary.removed() == 0 {
+                return passes;
+            }
+            passes.push(summary);
+        }
+    }
+
     fn learned(embedding: Vec<f32>, session: &str) -> Sample {
         Sample::learned(embedding, session, AudioSource::Mic, 0)
     }
@@ -552,31 +579,54 @@ mod tests {
     }
 
     #[test]
-    fn keeps_an_isolated_group_that_recurs_across_sessions() {
-        let room = around(&toward(0, 9, 1.0), 2, 7);
-        let recurring = me_and_bob(vec![
+    fn keeps_a_far_group_heard_in_two_sessions() {
+        let room = around(&toward(0, 9, 1.0), 4, 7);
+        let mut extra = vec![
             learned(room[0].clone(), "a"),
-            learned(room[1].clone(), "b"),
-            learned(toward(0, 1, 0.1), "c"),
-            learned(toward(0, 2, 0.1), "d"),
-            learned(toward(0, 3, 0.1), "e"),
-        ]);
-        assert_eq!(
-            findings(&recurring)
-                .into_iter()
-                .map(|f| f.2)
-                .collect::<Vec<_>>(),
-            [Verdict::Recurring, Verdict::Recurring]
+            learned(room[1].clone(), "a"),
+            learned(room[2].clone(), "b"),
+            learned(room[3].clone(), "b"),
+        ];
+        extra.extend(later_sessions());
+        let mut database = me_and_bob(extra);
+        assert!(
+            findings(&database)
+                .iter()
+                .all(|finding| finding.2 == Verdict::Recurring)
         );
-        let mut once = recurring.clone();
-        once.speakers.get_mut("Me").unwrap().samples[25].session = Some("a".into());
-        assert_eq!(
-            findings(&once),
-            [
-                (24, PruneReason::Isolated, Verdict::Remove),
-                (25, PruneReason::Isolated, Verdict::Remove)
-            ]
+        assert!(passes(&mut database).is_empty());
+    }
+
+    #[test]
+    fn removes_a_far_group_from_one_session_once_settled() {
+        let mut extra = around(&toward(0, 9, 1.0), 5, 7)
+            .into_iter()
+            .map(|vector| learned(vector, "room"))
+            .collect::<Vec<_>>();
+        extra.extend(later_sessions());
+        let mut database = me_and_bob(extra);
+        let passes = passes(&mut database);
+        assert!(passes.len() > 1);
+        assert_eq!(passes.iter().map(|pass| pass.isolated).sum::<usize>(), 5);
+        assert!(
+            database.speakers["Me"]
+                .samples
+                .iter()
+                .all(|sample| sample.session.as_deref() != Some("room"))
         );
+    }
+
+    #[test]
+    fn removes_a_whole_group_named_wrongly_in_one_session() {
+        let mut extra = around(&toward(4, 4, 0.0), 6, 77)
+            .into_iter()
+            .map(|vector| learned(vector, "wrong"))
+            .collect::<Vec<_>>();
+        extra.extend(later_sessions());
+        let mut database = me_and_bob(extra);
+        let passes = passes(&mut database);
+        assert!(passes.len() > 1);
+        assert_eq!(passes.iter().map(|pass| pass.sounds_like).sum::<usize>(), 6);
     }
 
     #[test]

@@ -2,9 +2,30 @@
 //!
 //! The voice map draws these verdicts and tidying acts on them, so both read
 //! them from here.
+//!
+//! A sample is compared with its voice's samples from other sessions, so a
+//! batch learned under the wrong name in one meeting cannot vouch for itself.
 
+use crate::speaker::database::Sample;
 use crate::speaker::embedding::cosine;
-use crate::speaker::tidy::{ISOLATION_MIN_GAP, NEIGHBORHOOD};
+use crate::speaker::tidy::{ISOLATION_MIN_GAP, MIN_OTHER_SESSION_SAMPLES, NEIGHBORHOOD};
+
+/// A voice sample: its vector and the session it was learned in, if known.
+pub trait Recorded: AsRef<[f32]> {
+    fn session(&self) -> Option<&str>;
+}
+
+impl Recorded for Sample {
+    fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+}
+
+impl Recorded for Vec<f32> {
+    fn session(&self) -> Option<&str> {
+        None
+    }
+}
 
 /// People every sample is scored against, as the recognizer's centroid
 /// prefilter does for a cluster.
@@ -55,7 +76,7 @@ pub struct Review {
     pub people: Vec<PersonReview>,
 }
 
-pub fn review<V: AsRef<[f32]>>(samples: &[&[V]], centroids: &[Vec<f32>], threshold: f32) -> Review {
+pub fn review<V: Recorded>(samples: &[&[V]], centroids: &[Vec<f32>], threshold: f32) -> Review {
     let count = samples.len();
     let center_distance = (0..count)
         .map(|i| {
@@ -185,13 +206,22 @@ pub(crate) fn nearest(row: &[f32], skip: usize, take: usize) -> Vec<usize> {
     order
 }
 
-/// The `NEIGHBORHOOD` samples most similar to `own[sample]`, closest first.
-fn closest_samples<V: AsRef<[f32]>>(own: &[V], sample: usize) -> Vec<(usize, f32)> {
+/// The `NEIGHBORHOOD` samples most similar to `own[sample]`, closest first,
+/// from other sessions. A sample without a session is its own session. When
+/// too few samples lie outside the session, as for a voice learned in one
+/// meeting, all others are used.
+fn closest_samples<V: Recorded>(own: &[V], sample: usize) -> Vec<(usize, f32)> {
     let query = own[sample].as_ref();
-    let mut similar = own
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| *index != sample)
+    let session = own[sample].session();
+    let foreign = |other: &V| session.is_none() || other.session() != session;
+    let others = || {
+        own.iter()
+            .enumerate()
+            .filter(move |(index, _)| *index != sample)
+    };
+    let everyone = others().filter(|(_, other)| foreign(other)).count() < MIN_OTHER_SESSION_SAMPLES;
+    let mut similar = others()
+        .filter(|(_, other)| everyone || foreign(other))
         .filter_map(|(index, other)| cosine(query, other.as_ref()).map(|score| (index, score)))
         .collect::<Vec<_>>();
     similar.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -241,6 +271,32 @@ fn mad_floor(values: &[f32], min_gap: f32, min_samples: usize) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn neighbors_come_from_other_sessions_while_enough_are_there() {
+        let sample = |angle: f32, session: Option<&str>| {
+            let mut sample = Sample::settled(vec![angle.cos(), angle.sin()]);
+            sample.session = session.map(str::to_owned);
+            sample
+        };
+        let indexes = |own: &[Sample], index: usize| {
+            let mut found = closest_samples(own, index)
+                .into_iter()
+                .map(|n| n.0)
+                .collect::<Vec<_>>();
+            found.sort_unstable();
+            found
+        };
+        let mut mixed = vec![sample(0.0, Some("a")), sample(0.01, Some("a"))];
+        mixed.extend((1..4).map(|i| sample(i as f32 * 0.3, Some("b"))));
+        mixed.push(sample(0.02, None));
+        assert_eq!(indexes(&mixed, 0), [2, 3, 4, 5]);
+        assert_eq!(indexes(&mixed, 5), [0, 1, 2, 3, 4]);
+        let one_meeting = (0..5)
+            .map(|i| sample(i as f32 * 0.1, Some("only")))
+            .collect::<Vec<_>>();
+        assert_eq!(indexes(&one_meeting, 0), [1, 2, 3, 4]);
+    }
 
     #[test]
     fn median_matches_the_recognizer_for_even_counts() {

@@ -135,7 +135,7 @@ impl VoiceMap {
     }
 
     #[cfg(test)]
-    fn from_parts<V: AsRef<[f32]>>(
+    fn from_parts<V: classify::Recorded>(
         names: Vec<String>,
         samples: &[&[V]],
         centroids: &[Vec<f32>],

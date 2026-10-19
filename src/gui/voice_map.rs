@@ -475,7 +475,8 @@ impl VoiceMapView {
         let mut state = self.state.borrow_mut();
         let Some(map) = &state.map else { return };
         let (action, label) = match hit {
-            Hover::Dot(index) => {
+            // A voice's last sample is removed with the voice, on the Voices tab.
+            Hover::Dot(index) if map.people[map.dots[index].person].samples > 1 => {
                 let dot = &map.dots[index];
                 (
                     SampleAction::Remove {
@@ -495,7 +496,7 @@ impl VoiceMapView {
                     "Restore",
                 )
             }
-            Hover::Person(_) => return,
+            _ => return,
         };
         state.action = Some(action);
         drop(state);
@@ -1504,7 +1505,9 @@ fn draw_hover(
                     Verdict::Kept => ("Kept: you restored it".into(), MUTED),
                 });
             }
-            lines.push(("Click to remove this sample".into(), MUTED));
+            if owner.samples > 1 {
+                lines.push(("Click to remove this sample".into(), MUTED));
+            }
             (dot.person, dot.position, lines)
         }
         Hover::Removed(index) => {

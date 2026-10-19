@@ -382,21 +382,22 @@ session loses those names.
 
 When the embedding model is configured, correction also learns every
 same-source chunk for which at least half of the chunk overlaps the range,
-excluding chunks shorter than 1.5 seconds. If another name previously owned
-the lock or is the cluster's current first guess, vectors with cosine
-similarity at least `0.999` to a learned vector are removed from that old name.
-An equivalent vector already stored under the chosen name is not appended
-again; one that was removed is learned again as a new sample. A chunk is
-skipped when another name with at least 10 samples scores it at least 0.05
-higher than the chosen name, which also needs 10 samples, and at or above the
-match threshold; the line keeps its lock, and the printed outcome counts
-skipped chunks in `skipped`. After learning, a tidy pass runs as described
-under [Tidying](#tidying-learned-voices), and `tidied` counts what it removed. With a configured model, learning preparation must succeed before the
+excluding chunks shorter than 1.5 seconds. If another name previously owned the
+lock or is the cluster's current first guess, vectors with cosine similarity at
+least `0.999` to a learned vector are removed from that old name. An equivalent
+vector already stored under the chosen name is not appended again; one that was
+removed is learned again as a new sample. A chunk is skipped when another name
+with at least 10 samples scores it at least 0.05 higher than the chosen name
+does with its samples from other sessions, of which it needs 10, and at or
+above the match threshold; the line keeps its lock, and the printed outcome
+counts skipped chunks in `skipped`. After learning, a tidy pass runs as
+described under [Tidying](#tidying-learned-voices), and `tidied` counts what it
+removed. With a configured model, learning preparation must succeed before the
 lock is saved; a rendering failure restores the previous corrections. The
-database is updated only after rendering succeeds.
-Without the model, the line is still locked and rendered, but learning and
-unlearning are skipped. Microphone corrections are stored and learned in the
-same way as system-track corrections.
+database is updated only after rendering succeeds. Without the model, the line
+is still locked and rendered, but learning and unlearning are skipped.
+Microphone corrections are stored and learned in the same way as system-track
+corrections.
 
 The app marks a locked line as learned when one of its chunks is stored under
 the line's name in the database (cosine similarity at least `0.999`). This is
@@ -426,30 +427,37 @@ their current name.
 
 A tidy pass runs when the app starts and after every correction that changed
 the database. It judges each voice with at least 20 samples using the same
-scores the voice map shows:
+scores the voice map shows. A sample's own score is its top-3 score against
+the voice's samples from other sessions, so a batch named after the wrong
+person in one meeting cannot vouch for itself. A sample without a session
+counts as its own session, and with fewer than three samples outside the
+session, as for a voice learned in one meeting, all of the voice's samples
+are used.
 
 - **Sounds like someone else**: another name's top-3 score for the sample is
-  at least its own top-3 score from the voice's other samples, at least `0.05`
-  higher, and that name has at least 10 samples.
-- **Isolated**: the sample's own top-3 score is below the voice's median own
+  at least its own score, at least `0.05` higher, and that name has at least
+  10 samples.
+- **Isolated**: the sample's own score is below the voice's median own
   score less four robust deviations (1.4826 times the median absolute
   deviation), and at least `0.15` below it. Distance to the voice's center is
   not a reason; a tight group far from it still helps recognition.
 
 A sample with a session is judged only after its voice has learned samples in
-three later sessions, counted from the voice's `sessions` list, which keeps
-its history when samples are removed. Learning in a session moves it to the
-end of that list, so naming lines in an old meeting, or learning a removed
-sample again, starts that session's samples settling anew. Imported samples have no session and are
-judged at once. An isolated sample is kept when it and its close neighbours,
-those of its five closest samples of the same voice that are at least as
-similar as both the match threshold and the isolation floor, come from at
-least two sessions: a recording condition that recurs. Restored samples are never
-removed. One pass removes at most a tenth of a voice's samples, the furthest
-past their limit first, and never takes a voice below 20. Each pass decides
-from one reading of the database, so a removal does not make other samples
-removable in the same pass, and the removals are then applied under the lock to
-the current file, found by their vectors.
+three later sessions, counted from the voice's `sessions` list, which keeps its
+history when samples are removed. Learning in a session moves it to the end of
+that list, so naming lines in an old meeting, or learning a removed sample
+again, starts that session's samples settling anew. Imported samples have no
+session and are judged at once. A close group that spans two or more sessions
+is kept: an isolated sample stays when its close neighbours, those of its five
+closest samples from other sessions that are at least as similar as both the
+match threshold and the isolation floor, come from another session. That is a
+recording condition that recurs, such as a second microphone. A far group from
+a single session has no such neighbours and is removed once settled. Restored
+samples are never removed. One pass removes at most a tenth of a voice's
+samples, the furthest past their limit first, and never takes a voice below 20.
+Each pass decides from one reading of the database, so a removal does not make
+other samples removable in the same pass, and the removals are then applied
+under the lock to the current file, found by their vectors.
 
 ```bash
 singstone speakers tidy --dry-run --speakers-db ~/.local/share/singstone/speakers.json

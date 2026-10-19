@@ -1484,9 +1484,10 @@ fn draw_hover(
                 DotFlag::Outlier => {
                     lines.push(("Far from this voice's other samples".into(), CAUTION))
                 }
-                DotFlag::Isolated => {
-                    lines.push(("Isolated: no close samples of this voice".into(), CAUTION))
-                }
+                DotFlag::Isolated => lines.push((
+                    "Isolated: no close samples in other sessions".into(),
+                    CAUTION,
+                )),
                 DotFlag::None => {}
             }
             if let Some((reason, verdict)) = &dot.tidy {

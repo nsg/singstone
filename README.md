@@ -66,12 +66,14 @@ isolated from the rest of their voice. A sample is judged only once its voice
 has been learned in three later meetings, so a new microphone or room gets
 time to build up, and a group of close samples heard in two or more meetings
 stays however far it lies from the rest. Voices with fewer than 20 samples are
-left alone, and one pass removes at most a tenth of a voice. The map marks a
-sample due for removal with a crossed ring and one still settling with a
-dashed ring, and the Speakers page says when a pass removed something.
-Removed samples are kept for 30 days: the trash button on the map draws them
-faded, and clicking one offers **Restore**, after which tidying leaves it
-alone. Clicking any other sample offers **Remove sample**.
+left alone, and one pass removes at most a tenth of a voice. Samples are
+compared with the voice's samples from other meetings, so a batch named after
+the wrong person in one meeting goes as a whole. The map marks a sample due
+for removal with a crossed ring and one still settling with a dashed ring, and
+the Speakers page says when a pass removed something. Removed samples are kept
+for 30 days: the trash button on the map draws them faded, and clicking one
+offers **Restore**, after which tidying leaves it alone. Clicking any other
+sample offers **Remove sample**.
 
 ![Voice map showing learned voices as colored clouds of samples, with close voices joined by dashed lines and a findings list](docs/images/voice-map.png)
 

@@ -1,10 +1,15 @@
 [advisories]
+# Temporary ignores (added 2026-10-19). Anyone touching dependencies or this
+# file: check whether they are still needed, and if not, bump and delete them.
+#
 # zip 2.4.2 is only a build dependency of sherpa-onnx-sys 1.13.8, whose build
 # script extracts a zip archive solely when it downloads prebuilt iOS libraries.
 # SHERPA_ONNX_LIB_DIR is always set (.cargo/config.toml, snap/snapcraft.yaml),
 # so it never downloads or extracts anything. Upstream moved to zip 9 in
-# k2-fsa/sherpa-onnx#4059 (commit 1a9d234); drop these once a sherpa-onnx-sys
-# release after 1.13.8 ships it and the dependency is bumped.
+# k2-fsa/sherpa-onnx#4059 (commit 1a9d234). Once a sherpa-onnx-sys release
+# after 1.13.8 ships it, bump sherpa-onnx (Cargo.toml, Cargo.lock, the
+# sherpa-onnx source-commit in snap/snapcraft.yaml, docs/dependencies.md),
+# verify diarization still works, and remove these entries.
 ignore = [
     "RUSTSEC-2026-0367",
     "RUSTSEC-2026-0368",

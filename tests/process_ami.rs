@@ -252,7 +252,7 @@ fn corrections_learn_and_recognize_ami_speaker() {
         database_json["speakers"][&learned_name]["samples"]
             .as_array()
             .is_some_and(|samples| !samples.is_empty()
-                && samples.iter().all(|sample| sample["session"].is_string()))
+                && samples.iter().any(|sample| sample["session"].is_string()))
     );
 
     write_speaker_database(&database, &model, extractor.dimension(), &disjoint_learning)

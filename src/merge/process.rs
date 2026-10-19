@@ -663,7 +663,8 @@ fn apply_corrections_inner(
     let (mut learned, mut forgotten) = (0, 0);
     if let Some(learning) = learning.as_ref() {
         let path = &learning.database_path;
-        let mut database = match SpeakerDatabase::load(path) {
+        let lock = SpeakerDatabase::lock(path)?;
+        let mut database = match SpeakerDatabase::load_locked(path, &lock) {
             Ok(database) => database.checked(&learning.identity)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 SpeakerDatabase::empty(learning.identity.clone())

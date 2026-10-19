@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufWriter, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 pub const FORMAT_VERSION: u32 = 3;
@@ -155,6 +155,11 @@ pub struct SpeakerDatabase {
     pub speakers: BTreeMap<String, SpeakerRecord>,
 }
 
+/// Exclusive use of a database file, released on drop.
+pub struct DatabaseLock {
+    _file: fs::File,
+}
+
 /// Formats 1 (unversioned) and 2 stored bare vectors.
 #[derive(Deserialize)]
 struct BareVectorDatabase {
@@ -186,11 +191,53 @@ impl SpeakerDatabase {
 
     pub fn load(path: &Path) -> io::Result<Self> {
         let (database, rewrite) = Self::read(path)?;
-        let Some(rewrite) = rewrite else {
+        if rewrite.is_none() {
             return Ok(database);
-        };
-        database.rewrite(path, rewrite)?;
+        }
+        let lock = Self::lock(path)?;
+        Self::load_locked(path, &lock)
+    }
+
+    /// Loads the database while the caller holds its lock.
+    pub fn load_locked(path: &Path, _lock: &DatabaseLock) -> io::Result<Self> {
+        let (database, rewrite) = Self::read(path)?;
+        if let Some(rewrite) = rewrite {
+            database.rewrite(path, rewrite)?;
+        }
         Ok(database)
+    }
+
+    /// Waits for exclusive use of the database file. The GUI, its worker
+    /// processes and the command line all change it, so each change loads
+    /// and saves under this lock to keep the others' changes.
+    pub fn lock(path: &Path) -> io::Result<DatabaseLock> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(PathBuf::from(name))?;
+        file.lock()?;
+        Ok(DatabaseLock { _file: file })
+    }
+
+    /// Loads, changes and saves the database under its lock.
+    pub fn update<T>(path: &Path, change: impl FnOnce(&mut Self) -> T) -> io::Result<T> {
+        let lock = Self::lock(path)?;
+        let mut database = Self::load_locked(path, &lock)?;
+        let result = change(&mut database);
+        database.save(path)?;
+        Ok(result)
     }
 
     /// Reads the database as `load` does, without converting the file.

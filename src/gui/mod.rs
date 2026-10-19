@@ -1599,9 +1599,8 @@ fn confirm_delete_speaker(parent: &adw::ApplicationWindow, page: &SpeakersPage, 
     let parent_for_response = parent.clone();
     let name = name.to_owned();
     dialog.connect_response(Some("remove"), move |_, _| {
-        let result = SpeakerDatabase::load(&page.database_path).and_then(|mut database| {
+        let result = SpeakerDatabase::update(&page.database_path, |database| {
             database.speakers.remove(&name);
-            database.save(&page.database_path)
         });
         match result {
             Ok(()) => page.refresh(&parent_for_response),

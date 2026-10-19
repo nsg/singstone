@@ -378,7 +378,7 @@ impl SpeakerDatabase {
         if self
             .speakers
             .values()
-            .all(|speaker| speaker.samples.is_empty())
+            .all(|speaker| speaker.samples.is_empty() && speaker.pruned.is_empty())
         {
             self.embedding_model = expected.clone();
             return Ok(self);
@@ -421,7 +421,7 @@ impl SpeakerDatabase {
     }
 
     /// Drops the samples, removed ones included, that match `embedding`;
-    /// returns how many were in use.
+    /// returns how many were dropped.
     pub fn forget_matching(&mut self, name: &str, embedding: &[f32], min_similarity: f32) -> usize {
         let Some(record) = self.speakers.get_mut(name) else {
             return 0;
@@ -429,13 +429,13 @@ impl SpeakerDatabase {
         let matches = |candidate: &[f32]| {
             cosine(candidate, embedding).is_some_and(|similarity| similarity >= min_similarity)
         };
-        let before = record.samples.len();
+        let before = record.samples.len() + record.pruned.len();
         record.samples.retain(|sample| !matches(&sample.embedding));
         record
             .pruned
             .retain(|pruned| !matches(&pruned.sample.embedding));
         record.centroid = mean_normalized(&record.samples);
-        before - record.samples.len()
+        before - record.samples.len() - record.pruned.len()
     }
 
     pub fn refresh_centroids(&mut self) {

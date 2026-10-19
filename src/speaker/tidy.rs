@@ -360,7 +360,11 @@ pub fn apply(database: &mut SpeakerDatabase, plan: &Plan, now: u64) -> Summary {
         };
         let mut allowed = removal_limit(record.samples.len());
         for finding in &person.findings {
-            if finding.verdict != Verdict::Remove || allowed == 0 {
+            let restored = record
+                .samples
+                .iter()
+                .any(|sample| sample.embedding == finding.embedding && sample.kept_by_user);
+            if finding.verdict != Verdict::Remove || allowed == 0 || restored {
                 continue;
             }
             if record.set_aside(&finding.embedding, finding.reason.clone(), now) {

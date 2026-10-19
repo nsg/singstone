@@ -288,14 +288,15 @@ mod tests {
             found
         };
         let mut mixed = vec![sample(0.0, Some("a")), sample(0.01, Some("a"))];
-        mixed.extend((1..4).map(|i| sample(i as f32 * 0.3, Some("b"))));
+        mixed.extend((1..10).map(|i| sample(i as f32 * 0.3, Some("b"))));
         mixed.push(sample(0.02, None));
-        assert_eq!(indexes(&mixed, 0), [2, 3, 4, 5]);
-        assert_eq!(indexes(&mixed, 5), [0, 1, 2, 3, 4]);
-        let one_meeting = (0..5)
-            .map(|i| sample(i as f32 * 0.1, Some("only")))
+        assert_eq!(indexes(&mixed, 0), [2, 3, 4, 5, 11]);
+        assert_eq!(indexes(&mixed, 11), [0, 1, 2, 3, 4]);
+        let mut few_elsewhere = (0..5)
+            .map(|i| sample(i as f32 * 0.1, Some("big")))
             .collect::<Vec<_>>();
-        assert_eq!(indexes(&one_meeting, 0), [1, 2, 3, 4]);
+        few_elsewhere.extend((1..10).map(|i| sample(0.1 + i as f32 * 0.4, Some("other"))));
+        assert_eq!(indexes(&few_elsewhere, 0), [1, 2, 3, 4, 5]);
     }
 
     #[test]

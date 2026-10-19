@@ -430,7 +430,7 @@ the database. It judges each voice with at least 20 samples using the same
 scores the voice map shows. A sample's own score is its top-3 score against
 the voice's samples from other sessions, so a batch named after the wrong
 person in one meeting cannot vouch for itself. A sample without a session
-counts as its own session, and with fewer than three samples outside the
+counts as its own session, and with fewer than ten samples outside the
 session, as for a voice learned in one meeting, all of the voice's samples
 are used.
 

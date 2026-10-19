@@ -21,7 +21,7 @@ pub const MIN_JUDGED_SAMPLES: usize = 10;
 pub const CLEARLY_BETTER: f32 = 0.05;
 /// Own samples from other sessions a sample needs to be compared with them
 /// alone; with fewer it is compared with all of its voice's samples.
-pub const MIN_OTHER_SESSION_SAMPLES: usize = 3;
+pub const MIN_OTHER_SESSION_SAMPLES: usize = 10;
 /// Least gap below a voice's median own score that counts as isolated.
 pub const ISOLATION_MIN_GAP: f32 = 0.15;
 /// Closest own samples, from other sessions where there are enough, that

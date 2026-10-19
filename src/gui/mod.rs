@@ -1,4 +1,5 @@
 mod config;
+mod dictation;
 mod queue;
 mod remote;
 mod timeline_layout;
@@ -399,7 +400,7 @@ impl QueuePanel {
             });
         } else if recording_held && !queue.waiting().is_empty() {
             let paused = gtk::Label::new(Some(
-                "Paused while recording. The next session starts when the recording stops.",
+                "Paused while recording or dictating. The next session starts afterwards.",
             ));
             paused.set_wrap(true);
             paused.set_xalign(0.0);
@@ -410,7 +411,7 @@ impl QueuePanel {
         if queue.running().is_none() && !queue.waiting().is_empty() {
             let compact = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             let status = gtk::Label::new(Some(if recording_held {
-                "Paused while recording"
+                "Paused while recording or dictating"
             } else {
                 "Starting next session…"
             }));
@@ -543,7 +544,7 @@ impl QueuePanel {
         widgets.stage.set_label(if cancelled {
             "Cancelling…"
         } else if paused {
-            "Paused while recording"
+            "Paused while recording or dictating"
         } else {
             update.stage.label()
         });
@@ -568,7 +569,7 @@ impl QueuePanel {
             widgets.percent.set_label("");
         }
         let mut status = if paused && !cancelled {
-            "Paused while recording".into()
+            "Paused while recording or dictating".into()
         } else {
             position_total
                 .map(|(position, total)| format!("{position} of {total}"))
@@ -646,6 +647,10 @@ fn build_window(app: &adw::Application) {
     new_recording.add_css_class("flat");
     new_recording.set_tooltip_text(Some("Set up a new recording"));
     header.pack_start(&new_recording);
+    let dictate = gtk::Button::from_icon_name("audio-input-microphone-symbolic");
+    dictate.add_css_class("flat");
+    dictate.set_tooltip_text(Some("Dictate"));
+    header.pack_start(&dictate);
     let speakers = header_action_button("system-users-symbolic", "Speakers");
     speakers.set_tooltip_text(Some("Manage learned speakers"));
     header.pack_start(&speakers);
@@ -823,6 +828,21 @@ fn build_window(app: &adw::Application) {
         &recording_page.job,
         &foreground_busy,
     );
+    let window_for_dictation = window.clone();
+    let config_for_dictation = config.clone();
+    let controller_for_dictation = Rc::downgrade(&queue_controller);
+    dictate.connect_clicked(move |_| {
+        let controller = controller_for_dictation.clone();
+        dictation::present(
+            &window_for_dictation,
+            &config_for_dictation,
+            Rc::new(move |active| {
+                if let Some(controller) = controller.upgrade() {
+                    controller.set_dictating(active);
+                }
+            }),
+        );
+    });
     wire_session_actions(
         &window,
         &detail,
@@ -3002,6 +3022,7 @@ struct QueueController {
     running: RefCell<Option<RunningProcessing>>,
     timer_running: Cell<bool>,
     recording_held: Cell<bool>,
+    dictating: Cell<bool>,
     inhibit_cookie: Cell<Option<u32>>,
     panel: QueuePanel,
     detail: SessionDetail,
@@ -3037,6 +3058,7 @@ impl QueueController {
             running: RefCell::new(None),
             timer_running: Cell::new(false),
             recording_held: Cell::new(false),
+            dictating: Cell::new(false),
             inhibit_cookie: Cell::new(None),
             panel: panel.clone(),
             detail: detail.clone(),
@@ -3201,7 +3223,7 @@ impl QueueController {
         self.update_pause_state();
 
         if self.running.borrow().is_none() && !self.queue.borrow().waiting().is_empty() {
-            if self.recording_job.borrow().is_some() {
+            if self.capturing() {
                 if !self.recording_held.replace(true) {
                     self.render_panel();
                 }
@@ -3231,14 +3253,24 @@ impl QueueController {
         }
     }
 
+    fn capturing(&self) -> bool {
+        self.recording_job.borrow().is_some() || self.dictating.get()
+    }
+
+    fn set_dictating(&self, active: bool) {
+        self.dictating.set(active);
+        self.update_pause_state();
+        self.render_panel_if_visible();
+    }
+
     fn update_pause_state(&self) {
-        let recording = self.recording_job.borrow().is_some();
+        let capturing = self.capturing();
         let rerender = {
             let running = self.running.borrow();
             let Some(running) = running.as_ref() else {
                 return;
             };
-            if recording && !running.paused.get() {
+            if capturing && !running.paused.get() {
                 match signal_child(&running.child, Signal::STOP) {
                     Ok(true) => {
                         running.paused.set(true);
@@ -3251,7 +3283,7 @@ impl QueueController {
                         false
                     }
                 }
-            } else if !recording && running.paused.get() {
+            } else if !capturing && running.paused.get() {
                 match signal_child(&running.child, Signal::CONT) {
                     Ok(true) => {
                         if running.metrics_source.get().is_some()
@@ -3462,7 +3494,7 @@ impl QueueController {
     fn render_panel(&self) {
         self.panel.render(
             &self.queue.borrow(),
-            self.recording_job.borrow().is_some(),
+            self.capturing(),
             self.detail.cancel_requested.get(),
         );
         self.apply_progress_snapshot();
@@ -3578,7 +3610,7 @@ fn update_processing_view(
     view.label.set_label(if cancelled {
         "Cancelling…"
     } else if paused {
-        "Paused while recording"
+        "Paused while recording or dictating"
     } else {
         update.stage.label()
     });

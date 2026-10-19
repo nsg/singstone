@@ -15,6 +15,7 @@ pub struct GuiConfig {
     #[serde(alias = "context_dir", skip_serializing_if = "Option::is_none")]
     pub context_file: Option<PathBuf>,
     pub swedish_transcription: bool,
+    pub dictation_swedish: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dark_mode: Option<bool>,
     pub delete_old_archives: bool,
@@ -38,6 +39,7 @@ impl Default for GuiConfig {
                 .or_else(|| std::env::var_os("SINGSTONE_CONTEXT_DIR"))
                 .map(PathBuf::from),
             swedish_transcription: true,
+            dictation_swedish: false,
             dark_mode: None,
             delete_old_archives: false,
             archive_retention_days: 90,
@@ -113,6 +115,7 @@ mod tests {
 
         assert_eq!(config.context_file, None);
         assert!(config.swedish_transcription);
+        assert!(!config.dictation_swedish);
         assert_eq!(config.dark_mode, None);
         assert!(!config.delete_old_archives);
         assert_eq!(config.archive_retention_days, 90);

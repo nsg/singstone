@@ -97,6 +97,8 @@ a session can be archived with or without it.
 - Marks loudspeaker sound picked up by the microphone as echo by comparing the
   two recordings, without deleting it.
 - Hides either audio source from a session's transcript without deleting it.
+- Dictates short text from the microphone, such as a message or a prompt,
+  without storing audio or text.
 - Queues recordings for background processing, one after another, and pauses
   it for as long as a recording is in progress.
 - Provides a native GTK interface with live capture meters, screenshot counts,
@@ -329,6 +331,32 @@ session is archived, not when it was recorded. While sessions are processing,
 and for the session open on screen, deletion waits for a later pass. The
 setting is off by default and deletion cannot be undone.
 
+## Dictation
+
+The microphone button in the header opens **Dictation** and starts listening
+at once, whether or not a meeting is being recorded. Choose **English** or
+**Swedish**; the choice is remembered. Press **Stop** to transcribe, edit the
+text if needed, and press **Copy** to put it on the clipboard. Background
+processing pauses while dictation listens and transcribes. A dictation stops
+listening after 10 minutes.
+
+Dictation is transient: audio stays in memory, and neither audio nor text is
+written to disk or logged. Closing the dialog discards both.
+
+From a terminal, `singstone dictate` listens until Enter, prints the text on
+stdout, and cancels on Ctrl-C:
+
+```bash
+singstone dictate | wl-copy
+```
+
+Answer `sv` or `en` instead of a bare Enter to pick the language when
+stopping; `--language` sets the default, English. `--whisper-model` picks the
+model for both languages. Without it, Swedish uses
+`SINGSTONE_WHISPER_MODEL_SWEDISH` and English
+`SINGSTONE_WHISPER_MODEL_MULTILINGUAL`, falling back to
+`SINGSTONE_WHISPER_MODEL`.
+
 ## Snap behavior
 
 | Component | Access | Purpose |
@@ -350,7 +378,7 @@ downloaded artifacts and final files, then publishes them atomically under
 
 `devices`, `record`, `render`, `archive`, and `speakers` never start the
 download service.
-`process`, `transcribe`, `diarize`, `recognize`, and `correct` wait for setup
+`process`, `transcribe`, `diarize`, `recognize`, `correct`, and `dictate` wait for setup
 when they use a missing default Snap model. Interrupted downloads resume on the
 next attempt.
 
@@ -370,6 +398,7 @@ snap logs -n=100 singstone.model-download
 | `gui` | Launch the GTK4 interface (also the default with no command) |
 | `devices` | List selectable PipeWire sources and sinks |
 | `record` | Capture audio and optional screenshots into a session |
+| `dictate` | Transcribe microphone speech to stdout without storing anything |
 | `process` | Run the pipeline, optionally with `--meeting` details |
 | `transcribe` | Produce word-level text and timestamps |
 | `diarize` | Produce anonymous speaker intervals |

@@ -263,7 +263,7 @@ on disk is unchanged.
 
 The version 3 speaker database stores a model identity and, for each name,
 its unit-length voice samples ("dots"), the sessions it learned samples in
-(oldest first) and the samples set aside by tidying or by hand. Dot count is
+(in the order they last taught it) and the samples set aside by tidying or by hand. Dot count is
 the weight. Each sample records when it was learned (unix seconds), the
 session directory name and the track it came from, all absent for samples
 imported from older versions, which count as settled. `kept_by_user` marks a
@@ -438,7 +438,9 @@ scores the voice map shows:
 
 A sample with a session is judged only after its voice has learned samples in
 three later sessions, counted from the voice's `sessions` list, which keeps
-its history when samples are removed. Imported samples have no session and are
+its history when samples are removed. Learning in a session moves it to the
+end of that list, so naming lines in an old meeting, or learning a removed
+sample again, starts that session's samples settling anew. Imported samples have no session and are
 judged at once. An isolated sample is kept when it and its close neighbours,
 those of its five closest samples of the same voice that are at least as
 similar as both the match threshold and the isolation floor, come from at

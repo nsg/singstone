@@ -102,7 +102,7 @@ pub struct PrunedSample {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SpeakerRecord {
-    /// Sessions this voice learned samples in, in the order they first did.
+    /// Sessions this voice learned samples in, in the order they last did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sessions: Vec<String>,
     pub samples: Vec<Sample>,
@@ -167,16 +167,17 @@ impl SpeakerRecord {
     }
 
     /// Adds a sample unless an equal one is already stored. A removed copy
-    /// of it is dropped, since learning it again is an explicit choice.
+    /// of it is dropped, since learning it again is an explicit choice. The
+    /// sample's session moves to the end of the history, so everything it
+    /// taught settles anew.
     pub fn learn(&mut self, sample: Sample) -> bool {
         if self.holds(&sample.embedding) {
             return false;
         }
         self.pruned
             .retain(|pruned| !same_vector(&pruned.sample.embedding, &sample.embedding));
-        if let Some(session) = &sample.session
-            && !self.sessions.contains(session)
-        {
+        if let Some(session) = &sample.session {
+            self.sessions.retain(|s| s != session);
             self.sessions.push(session.clone());
         }
         self.samples.push(sample);
@@ -769,6 +770,7 @@ mod tests {
     #[test]
     fn relearning_a_removed_sample_brings_it_back_as_new() {
         let mut record = SpeakerRecord::settled(vec![vec![0.0, 1.0]]);
+        record.sessions = vec!["later".into(), "last".into()];
         record.pruned.push(PrunedSample {
             reason: PruneReason::Isolated,
             pruned_at: 5,
@@ -780,7 +782,7 @@ mod tests {
         assert!(!record.learn(again.clone()));
         assert!(record.pruned.is_empty());
         assert_eq!(record.samples[1], again);
-        assert_eq!(record.sessions, ["later"]);
+        assert_eq!(record.sessions, ["last", "later"]);
     }
 
     #[test]

@@ -126,6 +126,12 @@ impl SpeakerRecord {
             .any(|sample| same_vector(&sample.embedding, vector))
     }
 
+    /// Sessions that learned samples after `session`; `None` when unknown.
+    pub fn sessions_since(&self, session: &str) -> Option<usize> {
+        let position = self.sessions.iter().position(|s| s == session)?;
+        Some(self.sessions.len() - position - 1)
+    }
+
     /// Adds a sample unless an equal one is already stored. A removed copy
     /// of it is dropped, since learning it again is an explicit choice.
     pub fn learn(&mut self, sample: Sample) -> bool {
@@ -724,6 +730,23 @@ mod tests {
         assert!(database.speakers.contains_key("Bob"));
         assert!(database.speakers["Bob"].samples.is_empty());
         assert!(database.speakers["Bob"].centroid.is_none());
+    }
+
+    #[test]
+    fn relearning_a_removed_sample_brings_it_back_as_new() {
+        let mut record = SpeakerRecord::settled(vec![vec![0.0, 1.0]]);
+        record.pruned.push(PrunedSample {
+            reason: PruneReason::Isolated,
+            pruned_at: 5,
+            sample: Sample::settled(vec![1.0, 0.0]),
+        });
+        let again = Sample::learned(vec![1.0, 0.0], "later", AudioSource::Mic, 9);
+
+        assert!(record.learn(again.clone()));
+        assert!(!record.learn(again.clone()));
+        assert!(record.pruned.is_empty());
+        assert_eq!(record.samples[1], again);
+        assert_eq!(record.sessions, ["later"]);
     }
 
     #[test]

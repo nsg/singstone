@@ -4,6 +4,7 @@
 //! them from here.
 
 use crate::speaker::embedding::cosine;
+use crate::speaker::tidy::{ISOLATION_MIN_GAP, NEIGHBORHOOD};
 
 /// People every sample is scored against, as the recognizer's centroid
 /// prefilter does for a cluster.
@@ -16,8 +17,10 @@ const OUTLIER_MIN_SAMPLES: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Flag {
     None,
-    /// Unusually far from the rest of its person's samples.
+    /// Unusually far from the center of its person's samples.
     Outlier,
+    /// Unusually far from even its closest samples of the same person.
+    Isolated,
     /// Scores at least as high against another person as against its own.
     Stray,
 }
@@ -27,6 +30,9 @@ pub struct SampleReview {
     pub center_similarity: f32,
     /// Recognizer score against the person's other samples.
     pub own_score: Option<f32>,
+    /// The person's closest other samples, closest first.
+    pub neighbors: Vec<(usize, f32)>,
+    pub isolated: bool,
     /// The best scoring other person.
     pub rival: Option<(usize, f32)>,
     /// Recognizer scores against every person the sample was compared with.
@@ -38,6 +44,8 @@ pub struct SampleReview {
 pub struct PersonReview {
     /// People with the nearest centroids.
     pub rivals: Vec<usize>,
+    /// Own score below which a sample counts as isolated.
+    pub isolation_floor: Option<f32>,
     pub samples: Vec<SampleReview>,
 }
 
@@ -65,16 +73,36 @@ pub fn review<V: AsRef<[f32]>>(samples: &[&[V]], centroids: &[Vec<f32>], thresho
                 .collect::<Vec<_>>();
             let outlier_floor = mad_floor(&similarities, OUTLIER_MIN_GAP, OUTLIER_MIN_SAMPLES);
             let rivals = nearest(&center_distance[person], person, RIVAL_CENTERS);
+            let neighborhoods = (0..own.len())
+                .map(|sample| closest_samples(own, sample))
+                .collect::<Vec<_>>();
+            let own_scores = neighborhoods
+                .iter()
+                .map(|neighbors| {
+                    let top = &neighbors[..neighbors.len().min(3)];
+                    (!top.is_empty())
+                        .then(|| top.iter().map(|n| n.1).sum::<f32>() / top.len() as f32)
+                })
+                .collect::<Vec<_>>();
+            let isolation_floor = mad_floor(
+                &own_scores.iter().flatten().copied().collect::<Vec<_>>(),
+                ISOLATION_MIN_GAP,
+                OUTLIER_MIN_SAMPLES,
+            );
             let reviews = own
                 .iter()
+                .zip(neighborhoods)
                 .enumerate()
-                .map(|(sample, vector)| {
+                .map(|(sample, (vector, neighbors))| {
                     let vector = vector.as_ref();
                     let to_centroids = centroids
                         .iter()
                         .map(|centroid| distance(vector, centroid))
                         .collect::<Vec<_>>();
-                    let own_score = topk_mean_excluding(vector, own, Some(sample));
+                    let own_score = own_scores[sample];
+                    let isolated = own_score
+                        .zip(isolation_floor)
+                        .is_some_and(|(score, floor)| score < floor);
                     let mut candidates = rivals.clone();
                     for j in nearest(&to_centroids, person, SAMPLE_RIVALS) {
                         if !candidates.contains(&j) {
@@ -102,6 +130,8 @@ pub fn review<V: AsRef<[f32]>>(samples: &[&[V]], centroids: &[Vec<f32>], thresho
                     });
                     let flag = if stray {
                         Flag::Stray
+                    } else if isolated {
+                        Flag::Isolated
                     } else if outlier_floor.is_some_and(|floor| similarities[sample] < floor) {
                         Flag::Outlier
                     } else {
@@ -110,6 +140,8 @@ pub fn review<V: AsRef<[f32]>>(samples: &[&[V]], centroids: &[Vec<f32>], thresho
                     SampleReview {
                         center_similarity: similarities[sample],
                         own_score,
+                        neighbors,
+                        isolated,
                         rival,
                         scores,
                         flag,
@@ -118,6 +150,7 @@ pub fn review<V: AsRef<[f32]>>(samples: &[&[V]], centroids: &[Vec<f32>], thresho
                 .collect();
             PersonReview {
                 rivals,
+                isolation_floor,
                 samples: reviews,
             }
         })
@@ -150,6 +183,20 @@ pub(crate) fn nearest(row: &[f32], skip: usize, take: usize) -> Vec<usize> {
     order.sort_by(|&a, &b| row[a].total_cmp(&row[b]));
     order.truncate(take);
     order
+}
+
+/// The `NEIGHBORHOOD` samples most similar to `own[sample]`, closest first.
+fn closest_samples<V: AsRef<[f32]>>(own: &[V], sample: usize) -> Vec<(usize, f32)> {
+    let query = own[sample].as_ref();
+    let mut similar = own
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != sample)
+        .filter_map(|(index, other)| cosine(query, other.as_ref()).map(|score| (index, score)))
+        .collect::<Vec<_>>();
+    similar.sort_by(|a, b| b.1.total_cmp(&a.1));
+    similar.truncate(NEIGHBORHOOD);
+    similar
 }
 
 pub(crate) fn topk_mean_excluding<V: AsRef<[f32]>>(

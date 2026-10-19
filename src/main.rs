@@ -57,7 +57,7 @@ fn main() -> ExitCode {
         cli::Command::Correct(args) => merge::process::run_correct(args),
         cli::Command::Render(args) => merge::process::run_render(args),
         cli::Command::Archive(args) => audio::archive::run(args),
-        cli::Command::Speakers(args) => speaker::speakers::list(args),
+        cli::Command::Speakers(args) => speaker::speakers::run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

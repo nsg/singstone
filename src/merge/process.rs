@@ -437,6 +437,8 @@ pub struct CorrectionOutcome {
     pub forgotten: usize,
     /// Chunks left out because they sound clearly like someone else.
     pub skipped: usize,
+    /// What tidying after learning set aside.
+    pub tidied: tidy::Summary,
     pub learning_available: bool,
     pub proposals: Vec<Proposal>,
 }
@@ -664,6 +666,7 @@ fn apply_corrections_inner(
 
     let learning_available = learning.is_some();
     let (mut learned, mut forgotten, mut skipped) = (0, 0, 0);
+    let mut tidied = tidy::Summary::default();
     if let Some(learning) = learning.as_ref() {
         let path = &learning.database_path;
         let lock = SpeakerDatabase::lock(path)?;
@@ -683,6 +686,11 @@ fn apply_corrections_inner(
         );
         if learned > 0 || forgotten > 0 {
             database.save(path)?;
+            drop(lock);
+            match tidy::run(path, args.speaker_threshold) {
+                Ok((_, summary)) => tidied = summary,
+                Err(error) => eprintln!("warning: tidying learned voices failed: {error}"),
+            }
         }
     }
     Ok((
@@ -690,6 +698,7 @@ fn apply_corrections_inner(
             learned,
             forgotten,
             skipped,
+            tidied,
             learning_available,
             proposals: Vec::new(),
         },

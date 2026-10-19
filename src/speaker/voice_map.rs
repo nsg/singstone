@@ -153,7 +153,10 @@ impl VoiceMap {
                 radius: 0.0,
                 samples: own.len(),
                 median_similarity: median(&similarities).unwrap_or(1.0),
-                outliers: mine.iter().filter(|d| d.flag == Flag::Outlier).count(),
+                outliers: mine
+                    .iter()
+                    .filter(|d| matches!(d.flag, Flag::Outlier | Flag::Isolated))
+                    .count(),
                 strays: mine.iter().filter(|d| d.flag == Flag::Stray).count(),
             });
         }
@@ -645,7 +648,7 @@ mod tests {
         let flagged = map
             .dots
             .iter()
-            .filter(|d| d.flag == Flag::Outlier)
+            .filter(|d| matches!(d.flag, Flag::Outlier | Flag::Isolated))
             .map(|d| (d.person, d.sample))
             .collect::<Vec<_>>();
         assert_eq!(flagged, vec![(0, 20)]);

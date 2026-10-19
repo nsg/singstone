@@ -45,7 +45,7 @@ pub enum Command {
     Render(RenderArgs),
     /// Convert a processed session's raw audio to 16-bit FLAC to save disk space.
     Archive(ArchiveArgs),
-    /// List learned speakers.
+    /// List learned speakers, or tidy their voice samples.
     Speakers(SpeakersArgs),
 }
 
@@ -396,8 +396,27 @@ pub struct ArchiveArgs {
 
 #[derive(Args, Debug)]
 pub struct SpeakersArgs {
-    #[arg(long, env = "SINGSTONE_SPEAKERS_DB")]
+    /// Learned-speaker database (default: $XDG_DATA_HOME/singstone/speakers.json).
+    #[arg(long, env = "SINGSTONE_SPEAKERS_DB", global = true)]
     pub speakers_db: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: Option<SpeakersCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SpeakersCommand {
+    /// Set aside voice samples that sound like someone else or are isolated.
+    Tidy(TidyArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct TidyArgs {
+    /// Show what would be set aside and why, without changing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Minimum speaker-matching score required to name a diarized cluster.
+    #[arg(long, default_value_t = DEFAULT_SPEAKER_THRESHOLD)]
+    pub speaker_threshold: f32,
 }
 
 #[cfg(test)]
@@ -575,6 +594,35 @@ mod tests {
         let check =
             Cli::try_parse_from(["singstone", "model-setup-check"]).expect("parse setup check");
         assert!(matches!(check.command, Command::ModelSetupCheck));
+    }
+
+    #[test]
+    fn speakers_lists_by_default_and_tidies_on_request() {
+        let list = Cli::try_parse_from(["singstone", "speakers", "--speakers-db", "db.json"])
+            .expect("parse speakers");
+        assert!(matches!(
+            list.command,
+            Command::Speakers(SpeakersArgs {
+                command: None,
+                speakers_db: Some(_),
+            })
+        ));
+        let tidy = Cli::try_parse_from([
+            "singstone",
+            "speakers",
+            "tidy",
+            "--dry-run",
+            "--speakers-db",
+            "db.json",
+        ])
+        .expect("parse speakers tidy");
+        assert!(matches!(
+            tidy.command,
+            Command::Speakers(SpeakersArgs {
+                command: Some(SpeakersCommand::Tidy(TidyArgs { dry_run: true, .. })),
+                speakers_db: Some(_),
+            })
+        ));
     }
 
     #[test]

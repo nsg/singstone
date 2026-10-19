@@ -895,7 +895,7 @@ fn draw_scene(
         }
         match dot.flag {
             DotFlag::None => {}
-            DotFlag::Outlier => {
+            DotFlag::Outlier | DotFlag::Isolated => {
                 rgba(cr, CAUTION, 0.9);
                 cr.set_line_width(1.3);
                 cr.arc(x, y, point_radius + 3.5, 0.0, TAU);
@@ -1236,6 +1236,9 @@ fn draw_hover(
                 DotFlag::Stray => lines.push(("Sounds more like someone else".into(), OVERLAP)),
                 DotFlag::Outlier => {
                     lines.push(("Far from this voice's other samples".into(), CAUTION))
+                }
+                DotFlag::Isolated => {
+                    lines.push(("Isolated: no close samples of this voice".into(), CAUTION))
                 }
                 DotFlag::None => {}
             }

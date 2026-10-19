@@ -615,19 +615,16 @@ mod tests {
 
     #[test]
     fn keeps_a_far_group_heard_in_two_sessions() {
-        let room = around(&toward(0, 9, 1.0), 4, 7);
-        let mut extra = vec![
-            learned(room[0].clone(), "a"),
-            learned(room[1].clone(), "a"),
-            learned(room[2].clone(), "b"),
-            learned(room[3].clone(), "b"),
-        ];
+        let room = around(&toward(0, 9, 1.0), 2, 7);
+        let mut extra = vec![learned(room[0].clone(), "a"), learned(room[1].clone(), "b")];
         extra.extend(later_sessions());
         let mut database = me_and_bob(extra);
-        assert!(
-            findings(&database)
-                .iter()
-                .all(|finding| finding.2 == Verdict::Recurring)
+        assert_eq!(
+            findings(&database),
+            [
+                (24, PruneReason::Isolated, Verdict::Recurring),
+                (25, PruneReason::Isolated, Verdict::Recurring)
+            ]
         );
         assert!(passes(&mut database).is_empty());
     }

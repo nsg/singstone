@@ -1,0 +1,11 @@
+[advisories]
+# zip 2.4.2 is only a build dependency of sherpa-onnx-sys 1.13.8, whose build
+# script extracts a zip archive solely when it downloads prebuilt iOS libraries.
+# SHERPA_ONNX_LIB_DIR is always set (.cargo/config.toml, snap/snapcraft.yaml),
+# so it never downloads or extracts anything. Drop these once sherpa-onnx-sys
+# depends on zip 9 or later.
+ignore = [
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+]

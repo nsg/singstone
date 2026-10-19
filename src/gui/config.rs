@@ -17,6 +17,8 @@ pub struct GuiConfig {
     pub swedish_transcription: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dark_mode: Option<bool>,
+    pub delete_old_archives: bool,
+    pub archive_retention_days: u32,
 }
 
 impl Default for GuiConfig {
@@ -37,6 +39,8 @@ impl Default for GuiConfig {
                 .map(PathBuf::from),
             swedish_transcription: true,
             dark_mode: None,
+            delete_old_archives: false,
+            archive_retention_days: 90,
         }
     }
 }
@@ -110,6 +114,8 @@ mod tests {
         assert_eq!(config.context_file, None);
         assert!(config.swedish_transcription);
         assert_eq!(config.dark_mode, None);
+        assert!(!config.delete_old_archives);
+        assert_eq!(config.archive_retention_days, 90);
     }
 
     #[test]

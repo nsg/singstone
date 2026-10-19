@@ -15,6 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime};
 
 const RAW_PCM: [&str; 4] = [
     "--silent",
@@ -106,6 +107,30 @@ pub fn archive_session(session: &Session) -> io::Result<ArchiveSummary> {
         ));
     }
     Ok(summary)
+}
+
+/// Session folders under `root` whose audio was archived longer than `keep`
+/// before `now`.
+pub fn expired_sessions(root: &Path, keep: Duration, now: SystemTime) -> Vec<PathBuf> {
+    let Some(cutoff) = now.checked_sub(keep) else {
+        return Vec::new();
+    };
+    fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| Session::open(entry.path()).ok())
+        .filter(|session| {
+            session
+                .read_manifest()
+                .is_ok_and(|manifest| manifest.state != SessionState::Recording)
+                && session
+                    .archived_at()
+                    .is_some_and(|archived| archived < cutoff)
+        })
+        .map(|session| session.dir)
+        .collect()
 }
 
 /// Fails with an explanation when the `flac` program cannot be run.
@@ -513,6 +538,41 @@ mod tests {
 
         assert!(archive_session(&session).expect("repeat").tracks.is_empty());
         remove(session);
+    }
+
+    #[test]
+    fn only_sessions_archived_before_the_cutoff_expire() {
+        let day = Duration::from_secs(86_400);
+        let now = SystemTime::now();
+        let old = processed_session("expiry", &speech_like(100));
+        let root = old.dir.parent().expect("fixture root").to_path_buf();
+        let fresh = Session::create(root.join("fresh")).expect("create fresh");
+        let unarchived = Session::create(root.join("unarchived")).expect("create unarchived");
+        fs::copy(old.manifest_path(), fresh.manifest_path()).expect("copy manifest");
+        fs::copy(old.manifest_path(), unarchived.manifest_path()).expect("copy manifest");
+        fs::rename(
+            old.audio_path(AudioSource::Mic),
+            unarchived.audio_path(AudioSource::Mic),
+        )
+        .expect("move raw audio");
+        for (session, age) in [(&old, 91), (&fresh, 89)] {
+            let track = session.archived_audio_path(AudioSource::Mic);
+            File::create(&track)
+                .and_then(|file| file.set_modified(now - day * age))
+                .expect("write archived track");
+        }
+        File::open(unarchived.audio_path(AudioSource::Mic))
+            .and_then(|file| file.set_modified(now - day * 400))
+            .expect("age raw audio");
+        fs::create_dir(root.join("not-a-session")).expect("create stray folder");
+
+        assert_eq!(
+            expired_sessions(&root, day * 90, now),
+            std::slice::from_ref(&old.dir)
+        );
+        assert!(expired_sessions(&root, day * 92, now).is_empty());
+        assert_eq!(expired_sessions(&root, day * 30, now).len(), 2);
+        remove(old);
     }
 
     #[test]

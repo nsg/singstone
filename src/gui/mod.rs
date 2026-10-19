@@ -29,7 +29,7 @@ use std::process::{Child, Command as ProcessCommand, ExitCode, ExitStatus, Stdio
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use rustix::process::{Pid, Signal};
 
@@ -767,6 +767,18 @@ fn build_window(app: &adw::Application) {
     split.set_content(Some(&adw::NavigationPage::new(&content_toolbar, "Session")));
     toolbar.set_content(Some(&split));
     window.set_content(Some(&toolbar));
+
+    wire_archive_cleanup(
+        &window,
+        &settings_page,
+        &config,
+        &detail,
+        &stack,
+        &session_list,
+        &session_paths,
+        &processing_queue,
+        &banner,
+    );
 
     wire_session_browser(
         &window,
@@ -1597,6 +1609,8 @@ struct SettingsPage {
     screenshots_change: gtk::Button,
     context_change: gtk::Button,
     context_clear: gtk::Button,
+    delete_old_archives: adw::SwitchRow,
+    archive_retention: adw::SpinRow,
 }
 
 fn build_settings_page(config: &GuiConfig) -> SettingsPage {
@@ -1649,6 +1663,26 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
     context.add_suffix(&context_change);
     storage.add(&context);
     body.append(&storage);
+
+    let archives = adw::PreferencesGroup::builder()
+        .title("Archived sessions")
+        .build();
+    let delete_old_archives = adw::SwitchRow::builder()
+        .title("Delete old archives")
+        .subtitle("Remove the whole session folder after the time below")
+        .active(config.delete_old_archives)
+        .build();
+    archives.add(&delete_old_archives);
+    let archive_retention = adw::SpinRow::with_range(1.0, 3650.0, 1.0);
+    archive_retention.set_title("Keep archives for");
+    archive_retention.set_subtitle("Days after archiving");
+    archive_retention.set_value(f64::from(config.archive_retention_days.clamp(1, 3650)));
+    delete_old_archives
+        .bind_property("active", &archive_retention, "sensitive")
+        .sync_create()
+        .build();
+    archives.add(&archive_retention);
+    body.append(&archives);
 
     let compute_group = adw::PreferencesGroup::builder()
         .title("Transcription compute")
@@ -1735,6 +1769,8 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
         screenshots_change,
         context_change,
         context_clear,
+        delete_old_archives,
+        archive_retention,
     }
 }
 
@@ -1914,6 +1950,192 @@ fn wire_settings(
                 *config_for_language.borrow_mut() = updated;
             }
         });
+}
+
+const ARCHIVE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const ARCHIVE_CLEANUP_SETTLE: Duration = Duration::from_secs(2);
+
+/// Saves the archive cleanup settings and deletes expired archives at start,
+/// hourly, and shortly after the settings change.
+#[allow(clippy::too_many_arguments)]
+fn wire_archive_cleanup(
+    window: &adw::ApplicationWindow,
+    page: &SettingsPage,
+    config: &Rc<RefCell<GuiConfig>>,
+    detail: &SessionDetail,
+    stack: &adw::ViewStack,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+    banner: &adw::Banner,
+) {
+    let cleanup: Rc<dyn Fn()> = {
+        let config = config.clone();
+        let detail = detail.clone();
+        let stack = stack.clone();
+        let list = list.clone();
+        let paths = paths.clone();
+        let queue = queue.clone();
+        let banner = banner.clone();
+        Rc::new(move || {
+            delete_expired_archives(&config, &detail, &stack, &list, &paths, &queue, &banner)
+        })
+    };
+    cleanup();
+    let cleanup_for_timer = cleanup.clone();
+    glib::timeout_add_local(ARCHIVE_CLEANUP_INTERVAL, move || {
+        cleanup_for_timer();
+        glib::ControlFlow::Continue
+    });
+
+    let pending = Rc::new(RefCell::new(None::<glib::SourceId>));
+    let schedule = {
+        let pending = pending.clone();
+        move || {
+            if let Some(source) = pending.borrow_mut().take() {
+                source.remove();
+            }
+            let pending_for_run = pending.clone();
+            let cleanup = cleanup.clone();
+            *pending.borrow_mut() = Some(glib::timeout_add_local_once(
+                ARCHIVE_CLEANUP_SETTLE,
+                move || {
+                    pending_for_run.borrow_mut().take();
+                    cleanup();
+                },
+            ));
+        }
+    };
+    let save = {
+        let window = window.clone();
+        let config = config.clone();
+        let toggle = page.delete_old_archives.clone();
+        let days = page.archive_retention.clone();
+        let reverting = Rc::new(Cell::new(false));
+        move || {
+            if reverting.get() {
+                return;
+            }
+            let mut updated = config.borrow().clone();
+            updated.delete_old_archives = toggle.is_active();
+            updated.archive_retention_days = days.value() as u32;
+            if let Err(error) = updated.save() {
+                let current = config.borrow().clone();
+                reverting.set(true);
+                toggle.set_active(current.delete_old_archives);
+                days.set_value(f64::from(current.archive_retention_days));
+                reverting.set(false);
+                show_error(&window, "Could not save settings", &error.to_string());
+                return;
+            }
+            *config.borrow_mut() = updated;
+            schedule();
+        }
+    };
+    let save = Rc::new(save);
+    let save_for_toggle = save.clone();
+    page.delete_old_archives
+        .connect_active_notify(move |_| save_for_toggle());
+    page.archive_retention.connect_value_notify(move |_| save());
+}
+
+/// Deletes the folders of sessions archived longer ago than the configured
+/// retention. Waits for a later pass while sessions are processing or other
+/// work is running, and leaves alone the session on screen.
+fn delete_expired_archives(
+    config: &Rc<RefCell<GuiConfig>>,
+    detail: &SessionDetail,
+    stack: &adw::ViewStack,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+    banner: &adw::Banner,
+) {
+    let (root, days) = {
+        let config = config.borrow();
+        if !config.delete_old_archives {
+            return;
+        }
+        (
+            config.meetings_dir.clone(),
+            config.archive_retention_days.max(1),
+        )
+    };
+    if detail.busy.get() || queue.borrow().outstanding_count() > 0 {
+        return;
+    }
+    let keep = Duration::from_secs(u64::from(days) * 24 * 60 * 60);
+    let selected = detail
+        .selected
+        .borrow()
+        .as_ref()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.clone()));
+    let on_screen = stack.visible_child_name().as_deref() == Some("session");
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    for path in archive::expired_sessions(&root, keep, SystemTime::now()) {
+        let is_selected = selected.is_some() && fs::canonicalize(&path).ok() == selected;
+        if queue.borrow().has_failed(&path) || (is_selected && on_screen) {
+            continue;
+        }
+        if is_selected {
+            detail.playback.stop();
+        }
+        match Session::open(&path).and_then(Session::delete) {
+            Ok(()) => {
+                deleted += 1;
+                remove_session_row(list, paths, &path);
+                if is_selected {
+                    detail.clear();
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!(
+                    "Could not delete archived session {}: {error}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if deleted > 0 && paths.borrow().is_empty() && list.first_child().is_none() {
+        append_no_sessions(list);
+    }
+    let sessions = |count| if count == 1 { "session" } else { "sessions" };
+    let message = match (deleted, failed) {
+        (0, 0) => return,
+        (deleted, 0) => format!(
+            "Deleted {deleted} {} archived more than {days} days ago",
+            sessions(deleted)
+        ),
+        (0, failed) => format!(
+            "Could not delete {failed} {} archived more than {days} days ago",
+            sessions(failed)
+        ),
+        (deleted, failed) => format!(
+            "Deleted {deleted} {} archived more than {days} days ago; {failed} could not be deleted",
+            sessions(deleted)
+        ),
+    };
+    banner.set_title(&message);
+    banner.set_revealed(true);
+}
+
+fn remove_session_row(list: &gtk::ListBox, paths: &Rc<RefCell<Vec<PathBuf>>>, path: &Path) {
+    let Some(index) = paths
+        .borrow()
+        .iter()
+        .position(|candidate| candidate == path)
+    else {
+        return;
+    };
+    paths.borrow_mut().remove(index);
+    if let Some(row) = i32::try_from(index)
+        .ok()
+        .and_then(|index| list.row_at_index(index))
+    {
+        list.remove(&row);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4571,11 +4793,15 @@ fn populate_sessions(
         list.append(&session_row(&summary));
     }
     if paths.borrow().is_empty() {
-        let empty = gtk::Label::new(Some("No sessions yet"));
-        empty.set_margin_top(24);
-        empty.add_css_class("dim-label");
-        list.append(&empty);
+        append_no_sessions(list);
     }
+}
+
+fn append_no_sessions(list: &gtk::ListBox) {
+    let empty = gtk::Label::new(Some("No sessions yet"));
+    empty.set_margin_top(24);
+    empty.add_css_class("dim-label");
+    list.append(&empty);
 }
 
 fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {

@@ -102,6 +102,19 @@ impl Session {
                 .into_iter()
                 .any(|source| self.audio_path(source).is_file())
     }
+    /// When archiving finished: the newest modification time of the
+    /// archived tracks, or `None` while the session is not archived.
+    pub fn archived_at(&self) -> Option<std::time::SystemTime> {
+        use crate::types::AudioSource::{Mic, System};
+        if !self.is_archived() {
+            return None;
+        }
+        [Mic, System]
+            .into_iter()
+            .filter_map(|source| fs::metadata(self.archived_audio_path(source)).ok())
+            .filter_map(|metadata| metadata.modified().ok())
+            .max()
+    }
     pub fn done_path(&self) -> PathBuf {
         self.dir.join("done")
     }

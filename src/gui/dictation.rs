@@ -49,11 +49,10 @@ struct DictationDialog {
     level: gtk::LevelBar,
     swedish: gtk::ToggleButton,
     stop: gtk::Button,
-    text_scroller: gtk::ScrolledWindow,
+    text_card: gtk::Overlay,
     buffer: gtk::TextBuffer,
     empty: gtk::Label,
     copy: gtk::Button,
-    actions: gtk::Box,
     error: gtk::Label,
     config: Rc<RefCell<GuiConfig>>,
     on_active: Rc<dyn Fn(bool)>,
@@ -127,7 +126,7 @@ impl DictationDialog {
             .top_margin(10)
             .bottom_margin(10)
             .left_margin(10)
-            .right_margin(10)
+            .right_margin(48)
             .build();
         let buffer = text_view.buffer();
         let text_scroller = gtk::ScrolledWindow::builder()
@@ -138,22 +137,26 @@ impl DictationDialog {
             .propagate_natural_height(true)
             .build();
         text_scroller.add_css_class("card");
-        text_scroller.set_vexpand(true);
+        let copy = icon_button("edit-copy-symbolic", "Copy");
+        copy.set_halign(gtk::Align::End);
+        copy.set_valign(gtk::Align::Start);
+        copy.set_margin_top(6);
+        copy.set_margin_end(6);
+        let text_card = gtk::Overlay::builder().child(&text_scroller).build();
+        text_card.add_overlay(&copy);
+        text_card.set_vexpand(true);
         let empty = gtk::Label::new(Some("No speech detected"));
         empty.add_css_class("title-4");
         empty.add_css_class("dim-label");
         empty.set_vexpand(true);
-        let again = gtk::Button::with_label("Dictate again");
-        let copy = gtk::Button::with_label("Copy");
-        copy.add_css_class("suggested-action");
-        copy.set_size_request(96, -1);
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        actions.set_halign(gtk::Align::End);
-        actions.append(&again);
-        actions.append(&copy);
-        result.append(&text_scroller);
+        let again = icon_button("media-record-symbolic", "Dictate again");
+        again.add_css_class("circular");
+        again.add_css_class("destructive-action");
+        again.set_size_request(48, 48);
+        again.set_halign(gtk::Align::Center);
+        result.append(&text_card);
         result.append(&empty);
-        result.append(&actions);
+        result.append(&again);
         pages.add_named(&result, Some("result"));
 
         let failure = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -188,11 +191,10 @@ impl DictationDialog {
             level,
             swedish,
             stop,
-            text_scroller,
+            text_card,
             buffer,
             empty,
             copy,
-            actions,
             error,
             config: config.clone(),
             on_active,
@@ -222,11 +224,31 @@ impl DictationDialog {
             });
         }
         let weak = Rc::downgrade(&this);
-        this.copy.connect_clicked(move |button| {
+        this.copy.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
-                this.copy_text(button);
+                this.copy_text();
             }
         });
+        // Ctrl+C copies the selection, or all of the text when nothing is selected.
+        let weak = Rc::downgrade(&this);
+        let copy_shortcut = gtk::CallbackAction::new(move |_, _| match weak.upgrade() {
+            Some(this) if this.text_card.is_visible() => {
+                if this.buffer.has_selection() {
+                    this.buffer.copy_clipboard(&this.copy.clipboard());
+                } else {
+                    this.copy_text();
+                }
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        });
+        let shortcuts = gtk::ShortcutController::new();
+        shortcuts.set_propagation_phase(gtk::PropagationPhase::Capture);
+        shortcuts.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control>c"),
+            Some(copy_shortcut),
+        ));
+        result.add_controller(shortcuts);
         // The handler owns the dialog state, so it lives exactly as long as the dialog is open.
         let owner = RefCell::new(Some(this.clone()));
         this.dialog.connect_closed(move |_| {
@@ -337,14 +359,8 @@ impl DictationDialog {
                 self.settle();
                 let empty = text.trim().is_empty();
                 self.buffer.set_text(&text);
-                self.text_scroller.set_visible(!empty);
-                self.copy.set_visible(!empty);
+                self.text_card.set_visible(!empty);
                 self.empty.set_visible(empty);
-                self.actions.set_halign(if empty {
-                    gtk::Align::Center
-                } else {
-                    gtk::Align::End
-                });
                 self.pages.set_visible_child_name("result");
             }
             DictationEvent::Failure { error } => {
@@ -378,16 +394,18 @@ impl DictationDialog {
         }
     }
 
-    fn copy_text(&self, button: &gtk::Button) {
+    fn copy_text(&self) {
         let (start, end) = self.buffer.bounds();
-        button
+        self.copy
             .clipboard()
             .set_text(&self.buffer.text(&start, &end, false));
-        button.set_label("Copied");
-        let button = button.downgrade();
+        self.copy.set_icon_name("object-select-symbolic");
+        self.copy.set_tooltip_text(Some("Copied"));
+        let button = self.copy.downgrade();
         glib::timeout_add_local_once(Duration::from_millis(1500), move || {
             if let Some(button) = button.upgrade() {
-                button.set_label("Copy");
+                button.set_icon_name("edit-copy-symbolic");
+                button.set_tooltip_text(Some("Copy"));
             }
         });
     }
@@ -432,6 +450,13 @@ impl DictationDialog {
             (self.on_active)(active);
         }
     }
+}
+
+fn icon_button(icon: &str, label: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.set_tooltip_text(Some(label));
+    button.update_property(&[gtk::accessible::Property::Label(label)]);
+    button
 }
 
 fn read_events(

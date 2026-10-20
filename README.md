@@ -354,9 +354,11 @@ setting is off by default and deletion cannot be undone.
 The microphone button in the header opens **Dictation** and starts listening
 at once, whether or not a meeting is being recorded. Choose **English** or
 **Swedish**; the choice is remembered. Press **Stop** to transcribe, edit the
-text if needed, and press **Copy** to put it on the clipboard. Background
-processing pauses while dictation listens and transcribes. A dictation stops
-listening after 10 minutes.
+text if needed, and press the copy button in the corner of the text to put it
+all on the clipboard. Ctrl+C copies the selected text, or all of it when
+nothing is selected. The red record button below the text discards it and
+dictates again. Background processing pauses while dictation listens and
+transcribes. A dictation stops listening after 10 minutes.
 
 Dictation is transient: audio stays in memory, and neither audio nor text is
 written to disk or logged. Closing the dialog discards both.

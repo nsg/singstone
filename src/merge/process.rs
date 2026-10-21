@@ -18,9 +18,10 @@ use crate::speaker::tidy;
 use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
-    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, HiddenSources, Manifest, SAMPLE_RATE,
-    SessionState, SpeakerAssignment, SpeakerAssignmentProvenance, SpeakerAssignments,
-    SpeakerCorrection, SpeakerCorrections, SpeakerSegment, TimedWord, Utterance,
+    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, HiddenSources, Manifest, MeetingSpan,
+    MeetingSpanFile, SAMPLE_RATE, SessionState, SpeakerAssignment, SpeakerAssignmentProvenance,
+    SpeakerAssignments, SpeakerCorrection, SpeakerCorrections, SpeakerSegment, TimedWord,
+    Utterance,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,13 +36,13 @@ const STAGE_METADATA_FORMAT_VERSION: u32 = 1;
 const EMBEDDINGS_FORMAT_VERSION: u32 = 1;
 const SPEAKER_CORRECTIONS_FORMAT_VERSION: u32 = 1;
 const HIDDEN_SOURCES_FORMAT_VERSION: u32 = 1;
+const MEETING_SPAN_FORMAT_VERSION: u32 = 1;
 const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
 const PROPOSAL_MARGIN: f32 = 0.05;
 
 struct CorrectionLearning {
     chunks: Vec<EmbeddingChunk>,
-    database: SpeakerDatabase,
     database_path: PathBuf,
     identity: EmbeddingModelIdentity,
 }
@@ -50,6 +51,8 @@ struct CorrectionLearningUpdate {
     speaker: String,
     old_names: HashSet<String>,
     source: AudioSource,
+    /// False for a line outside the meeting: its old names still forget it.
+    learn: bool,
     vectors: Vec<Vec<f32>>,
 }
 
@@ -500,21 +503,42 @@ fn save_corrections_and_render(
     write_render_input_and_render(session, &path, |path| write_json_atomic(path, corrections))
 }
 
+/// Writes a render input and renders. When rendering fails, the input and the
+/// transcript files rendered from it are put back as they were, missing ones
+/// included, so that they still agree.
 fn write_render_input_and_render(
     session: &Session,
     path: &Path,
     write: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let previous = read_optional_file(path)?;
+    let paths = [
+        path.to_owned(),
+        session.outside_meeting_path(),
+        session.transcript_path(),
+        session.transcript_text_path(),
+    ];
+    let previous = paths
+        .iter()
+        .map(|path| read_optional_file(path))
+        .collect::<io::Result<Vec<_>>>()?;
     write(path)?;
     if let Err(render_error) = run_render(RenderArgs {
         session: session.dir.clone(),
         diarize_mic: None,
     }) {
-        if let Err(rollback_error) = restore_file(path, previous.as_deref()) {
+        let rollback_errors = paths
+            .iter()
+            .zip(&previous)
+            .filter_map(|(path, previous)| {
+                restore_file(path, previous.as_deref())
+                    .err()
+                    .map(|error| format!("restoring {} also failed: {error}", path.display()))
+            })
+            .collect::<Vec<_>>();
+        if !rollback_errors.is_empty() {
             return Err(io::Error::other(format!(
-                "render failed: {render_error}; restoring {} also failed: {rollback_error}",
-                path.display()
+                "render failed: {render_error}; {}",
+                rollback_errors.join("; ")
             ))
             .into());
         }
@@ -535,13 +559,38 @@ pub fn set_hidden_sources(
     let path = session.hidden_sources_path();
     write_render_input_and_render(&session, &path, |path| {
         if artifact.hidden.is_empty() {
-            match fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            }
+            remove_if_present(path)
         } else {
             write_json_atomic(path, &artifact)
+        }
+    })
+}
+
+pub fn set_meeting_span(
+    session: &Path,
+    span: MeetingSpan,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (session, manifest) = open_session(session)?;
+    let recorded = recorded_duration_ms(&session, &manifest);
+    if !span.is_valid() || (recorded > 0 && !span.is_valid_within(recorded)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the meeting must start before it ends, and before the recording ends",
+        )
+        .into());
+    }
+    let path = session.meeting_span_path();
+    write_render_input_and_render(&session, &path, |path| {
+        if span.is_whole() {
+            remove_if_present(path)
+        } else {
+            write_json_atomic(
+                path,
+                &MeetingSpanFile {
+                    format_version: MEETING_SPAN_FORMAT_VERSION,
+                    span,
+                },
+            )
         }
     })
 }
@@ -569,7 +618,9 @@ fn correct_speaker_resolved(
     let (mut outcome, mut requests) =
         apply_corrections_inner(args, std::slice::from_ref(&request))?;
     let request = requests.remove(0);
+    // Later lines are not named after a line outside the meeting.
     if outcome.learning_available
+        && read_meeting_span(&session)?.contains(request.start_ms)
         && let Some(cluster) = proposal_cluster
         && learning_configured
         && database_path.is_file()
@@ -608,15 +659,55 @@ fn apply_corrections_inner(
         Err(error) => return Err(error.into()),
     };
     let mut corrections = read_speaker_corrections(&session)?;
-    let learning = prepare_correction_learning(&args, &session, &segments)?;
-    if let Some(learning) = learning.as_ref() {
+    let span = read_meeting_span(&session)?;
+    let database_path = args
+        .speakers_db
+        .clone()
+        .unwrap_or_else(database::default_path);
+    let known = args
+        .embedding_model
+        .as_ref()
+        .map(|_| SpeakerDatabase::peek(&database_path));
+    if let Some(Ok(database)) = &known {
         for request in &mut requests {
-            request.speaker = learning.database.resolve_name(&request.speaker);
+            request.speaker = database.resolve_name(&request.speaker);
         }
     }
-    let mut replaced = Vec::with_capacity(requests.len());
+    let previous_names = requests
+        .iter()
+        .map(|request| {
+            previous_names(
+                request,
+                &corrections,
+                &recognized,
+                &prior_utterances,
+                &segments,
+            )
+        })
+        .collect::<Vec<_>>();
+    // A line outside the meeting teaches no voice, but its earlier names may
+    // hold samples learned from it, and only then is the model needed.
+    let needs_learning = match &known {
+        None => false,
+        Some(Err(error)) if error.kind() == io::ErrorKind::NotFound => requests
+            .iter()
+            .any(|request| span.contains(request.start_ms)),
+        Some(Err(_)) => true,
+        Some(Ok(database)) => requests
+            .iter()
+            .zip(&previous_names)
+            .any(|(request, names)| {
+                span.contains(request.start_ms)
+                    || names.iter().any(|name| holds_samples(database, name))
+            }),
+    };
+    let learning = if needs_learning {
+        prepare_correction_learning(&args, &session, &segments)?
+    } else {
+        None
+    };
     for request in &requests {
-        replaced.push(upsert_correction(
+        upsert_correction(
             &mut corrections,
             SpeakerCorrection {
                 source: request.source,
@@ -625,38 +716,25 @@ fn apply_corrections_inner(
                 speaker: request.speaker.clone(),
                 inferred: false,
             },
-        ));
+        );
     }
     let learning_updates = learning
         .as_ref()
         .map(|learning| {
             requests
                 .iter()
-                .zip(&replaced)
-                .map(|(request, replaced)| {
-                    let mut old_names = replaced
-                        .iter()
-                        .filter(|correction| !correction.inferred)
-                        .map(|correction| correction.speaker.clone())
-                        .collect::<HashSet<_>>();
-                    if let Some(cluster) =
-                        cluster_for_request(request, &prior_utterances, &segments)
-                        && let Some(name) = recognized.get(&(request.source, cluster))
-                    {
-                        old_names.insert(name.clone());
-                    }
-                    old_names.remove(&request.speaker);
-                    CorrectionLearningUpdate {
-                        speaker: request.speaker.clone(),
-                        old_names,
-                        source: request.source,
-                        vectors: embeddings_in_range(
-                            &learning.chunks,
-                            request.source,
-                            request.start_ms,
-                            request.end_ms,
-                        ),
-                    }
+                .zip(previous_names)
+                .map(|(request, old_names)| CorrectionLearningUpdate {
+                    speaker: request.speaker.clone(),
+                    old_names,
+                    source: request.source,
+                    learn: span.contains(request.start_ms),
+                    vectors: embeddings_in_range(
+                        &learning.chunks,
+                        request.source,
+                        request.start_ms,
+                        request.end_ms,
+                    ),
                 })
                 .collect::<Vec<_>>()
         })
@@ -664,7 +742,7 @@ fn apply_corrections_inner(
 
     save_corrections_and_render(&session, &corrections)?;
 
-    let learning_available = learning.is_some();
+    let learning_available = learning.is_some() || (known.is_some() && !needs_learning);
     let (mut learned, mut forgotten, mut skipped) = (0, 0, 0);
     let mut tidied = tidy::Summary::default();
     if let Some(learning) = learning.as_ref() {
@@ -800,6 +878,44 @@ fn normalize_hidden_sources(hidden: &[AudioSource]) -> Vec<AudioSource> {
         .collect()
 }
 
+/// The marked meeting; the whole recording when the session has no file.
+pub fn read_meeting_span(session: &Session) -> io::Result<MeetingSpan> {
+    let path = session.meeting_span_path();
+    let artifact: MeetingSpanFile = match read_json(&path) {
+        Ok(artifact) => artifact,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(MeetingSpan::default()),
+        Err(error) => return Err(error),
+    };
+    if artifact.format_version != MEETING_SPAN_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported meeting span format version {} in {}",
+                artifact.format_version,
+                path.display()
+            ),
+        ));
+    }
+    if !artifact.span.is_valid() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the meeting must start before it ends in {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(artifact.span)
+}
+
+/// The rendered lines that the meeting span leaves out of the transcript.
+pub fn read_outside_meeting(session: &Session) -> io::Result<Vec<Utterance>> {
+    match jsonl::read_all(&session.outside_meeting_path()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        result => result,
+    }
+}
+
 fn upsert_correction(
     artifact: &mut SpeakerCorrections,
     correction: SpeakerCorrection,
@@ -823,6 +939,48 @@ fn upsert_correction(
     }
     artifact.corrections.push(correction);
     replaced
+}
+
+/// The names a correction takes the line away from: locks it replaces and the
+/// cluster's first guess.
+fn previous_names(
+    request: &CorrectionRequest,
+    corrections: &SpeakerCorrections,
+    recognized: &HashMap<(AudioSource, u32), String>,
+    prior_utterances: &[Utterance],
+    segments: &[SpeakerSegment],
+) -> HashSet<String> {
+    let mut names = corrections
+        .corrections
+        .iter()
+        .filter(|correction| {
+            correction.source == request.source
+                && !correction.inferred
+                && locks_collide(
+                    correction.start_ms,
+                    correction.end_ms,
+                    request.start_ms,
+                    request.end_ms,
+                )
+        })
+        .map(|correction| correction.speaker.clone())
+        .collect::<HashSet<_>>();
+    if let Some(cluster) = cluster_for_request(request, prior_utterances, segments)
+        && let Some(name) = recognized.get(&(request.source, cluster))
+    {
+        names.insert(name.clone());
+    }
+    names.remove(&request.speaker);
+    names
+}
+
+/// Whether `name` holds any sample, set aside or not, that unlearning could
+/// remove.
+fn holds_samples(database: &SpeakerDatabase, name: &str) -> bool {
+    database
+        .speakers
+        .get(name)
+        .is_some_and(|record| !record.samples.is_empty() || !record.pruned.is_empty())
 }
 
 fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
@@ -976,7 +1134,6 @@ fn prepare_correction_learning(
     )?;
     Ok(Some(CorrectionLearning {
         chunks,
-        database,
         database_path: path,
         identity,
     }))
@@ -1020,6 +1177,9 @@ fn apply_correction_learning(
             for vector in &update.vectors {
                 forgotten += database.forget_matching(old_name, vector, SAME_VECTOR_SIMILARITY);
             }
+        }
+        if !update.learn {
+            continue;
         }
         let admitted = update
             .vectors
@@ -1749,6 +1909,18 @@ fn render_artifacts_with_segments_and_hook(
     let recognized = read_speaker_assignments(session)?;
     let corrections = read_speaker_corrections(session)?;
     let hidden = read_hidden_sources(session)?;
+    let span = read_meeting_span(session)?;
+    let recorded = recorded_duration_ms(session, manifest);
+    if recorded > 0 && !span.is_valid_within(recorded) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the meeting starts after the recording ends in {}",
+                session.meeting_span_path().display()
+            ),
+        )
+        .into());
+    }
     let audio = match AudioEnvelopes::read(
         &session.stored_audio_path(AudioSource::Mic),
         &session.stored_audio_path(AudioSource::System),
@@ -1773,17 +1945,22 @@ fn render_artifacts_with_segments_and_hook(
         DEFAULT_NEAREST_TOLERANCE_MS,
     );
     let all_utterance_count = all_utterances.len();
-    let utterances = all_utterances
+    let (utterances, outside): (Vec<_>, Vec<_>) = all_utterances
         .into_iter()
         .filter(|utterance| !hidden.contains(&utterance.source))
-        .collect::<Vec<_>>();
-    let hidden_utterances = all_utterance_count - utterances.len();
+        .partition(|utterance| span.contains(utterance.start_ms));
+    let hidden_utterances = all_utterance_count - utterances.len() - outside.len();
     before_write();
     jsonl::write_all_atomic(&session.echo_detections_path(), &detection.detections)?;
     match fs::remove_file(session.dir.join("leakage-suppressions.jsonl")) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
+    }
+    if span.is_whole() {
+        remove_if_present(&session.outside_meeting_path())?;
+    } else {
+        jsonl::write_all_atomic(&session.outside_meeting_path(), &outside)?;
     }
     jsonl::write_all_atomic(&session.transcript_path(), &utterances)?;
     write_transcript_text(&session.transcript_text_path(), &utterances)?;
@@ -1799,8 +1976,16 @@ fn render_artifacts_with_segments_and_hook(
             .join(", ");
         format!(", hid {hidden_utterances} utterance(s) of hidden sources ({sources})")
     };
+    let outside_summary = if span.is_whole() {
+        String::new()
+    } else {
+        format!(
+            ", left out {} utterance(s) outside the meeting",
+            outside.len()
+        )
+    };
     eprintln!(
-        "merge: {} utterance(s), {} echo utterance(s) from {} echo word(s) in {} region(s), in {:.1} s{hidden_summary}",
+        "merge: {} utterance(s), {} echo utterance(s) from {} echo word(s) in {} region(s), in {:.1} s{hidden_summary}{outside_summary}",
         utterances.len(),
         echo_utterances,
         echo_words,
@@ -2090,6 +2275,28 @@ pub fn rebase_audio_provenance(session: &Session, source: AudioSource, old: &str
     }
 }
 
+/// The longest enabled track, in milliseconds; 0 when none can be read.
+pub fn recorded_duration_ms(session: &Session, manifest: &Manifest) -> u64 {
+    [
+        (AudioSource::Mic, manifest.mic.enabled),
+        (AudioSource::System, manifest.system.enabled),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .filter_map(|(source, _)| stored_sample_count(&session.stored_audio_path(source)).ok())
+    .map(|samples| samples * 1000 / u64::from(SAMPLE_RATE))
+    .max()
+    .unwrap_or(0)
+}
+
+fn stored_sample_count(path: &Path) -> io::Result<u64> {
+    if archive::is_archived(path) {
+        archive::sample_count(path)
+    } else {
+        Ok(fs::metadata(path)?.len() / 4)
+    }
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let tmp = jsonl::tmp_path(path);
     {
@@ -2099,6 +2306,13 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
         file.sync_all()?;
     }
     fs::rename(tmp, path)
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 fn read_optional_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -2581,7 +2795,9 @@ fn format_timestamp(milliseconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::speaker::database::{EmbeddingModelIdentity, SpeakerRecord};
+    use crate::speaker::database::{
+        EmbeddingModelIdentity, PruneReason, PrunedSample, SpeakerRecord,
+    };
     use crate::types::{ScreenshotEntry, StreamInfo, TimelineEvent};
     use serde::{Serialize, de::DeserializeOwned};
 
@@ -3454,13 +3670,12 @@ mod tests {
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
-    #[test]
-    fn correction_resolves_existing_spelling_for_lock_and_learning() {
-        let Some(models) = std::env::var_os("SINGSTONE_TEST_MODELS") else {
-            return;
-        };
-        let (root, session) = assignment_fixture("correction-existing-spelling", None);
-        let model = PathBuf::from(models).join("nemo_en_titanet_small.onnx");
+    /// A session with one cached two-second system chunk and a database that
+    /// knows Laura; none without `SINGSTONE_TEST_MODELS`.
+    fn learning_fixture(label: &str) -> Option<(PathBuf, Session, ProcessArgs, PathBuf)> {
+        let (root, session) = assignment_fixture(label, None);
+        let model = PathBuf::from(std::env::var_os("SINGSTONE_TEST_MODELS")?)
+            .join("nemo_en_titanet_small.onnx");
         let extractor = EmbeddingExtractor::new(&model, 1).expect("open embedding model");
         let identity = database::identity(&model, extractor.dimension()).expect("model identity");
         let database_path = root.join("speakers.json");
@@ -3532,6 +3747,17 @@ mod tests {
         args.threads = Some(1);
         args.speakers_db = Some(database_path.clone());
 
+        Some((root, session, args, database_path))
+    }
+
+    #[test]
+    fn correction_resolves_existing_spelling_for_lock_and_learning() {
+        let Some((root, session, args, database_path)) =
+            learning_fixture("correction-existing-spelling")
+        else {
+            return;
+        };
+
         let outcome = correct_speaker(
             args,
             &CorrectionRequest {
@@ -3554,6 +3780,159 @@ mod tests {
         let database = SpeakerDatabase::load(&database_path).expect("read learned database");
         assert_eq!(database.speakers["Laura"].samples.len(), 1);
         assert!(!database.speakers.contains_key("laura"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn correction_outside_the_meeting_unlearns_without_learning() {
+        let Some((root, session, args, database_path)) =
+            learning_fixture("correction-outside-meeting")
+        else {
+            return;
+        };
+        let line = |speaker: &str| CorrectionRequest {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 2_000,
+            speaker: speaker.into(),
+        };
+        let mut first = stage_process_args(session.dir.clone());
+        first.embedding_model = args.embedding_model.clone();
+        first.allow_unverified_models = true;
+        first.threads = Some(1);
+        first.speakers_db = Some(database_path.clone());
+        let learned = correct_speaker(first, &line("Alice")).expect("name Alice");
+        assert_eq!(learned.learned, 1);
+        write_json_atomic(
+            &session.meeting_span_path(),
+            &MeetingSpanFile {
+                format_version: MEETING_SPAN_FORMAT_VERSION,
+                span: MeetingSpan {
+                    start_ms: Some(5_000),
+                    end_ms: None,
+                },
+            },
+        )
+        .expect("write meeting span");
+
+        let outcome = correct_speaker(args, &line("Laura")).expect("rename to Laura");
+
+        assert!(outcome.learning_available);
+        assert_eq!((outcome.learned, outcome.forgotten), (0, 1));
+        let outside: Vec<Utterance> =
+            jsonl::read_all(&session.outside_meeting_path()).expect("read outside lines");
+        assert_eq!(outside[0].speaker, "Laura");
+        assert!(outside[0].locked);
+        let database = SpeakerDatabase::load(&database_path).expect("read database");
+        assert!(database.speakers["Laura"].samples.is_empty());
+        assert!(
+            database
+                .speakers
+                .get("Alice")
+                .is_none_or(|alice| alice.samples.is_empty())
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// A line outside the meeting, locked as Alice, with `alice` stored for
+    /// her and a missing embedding model configured.
+    fn outside_correction_fixture(
+        label: &str,
+        alice: SpeakerRecord,
+    ) -> (PathBuf, Session, ProcessArgs, PathBuf) {
+        let (root, session) = assignment_fixture(label, None);
+        let database_path = root.join("speakers.json");
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "model".into(),
+            sha256: "hash".into(),
+            dimension: 2,
+        });
+        database.speakers.insert("Alice".into(), alice);
+        database.save(&database_path).expect("write database");
+        write_json_atomic(
+            &session.speaker_corrections_path(),
+            &SpeakerCorrections {
+                format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
+                corrections: vec![SpeakerCorrection {
+                    source: AudioSource::System,
+                    start_ms: 10,
+                    end_ms: 20,
+                    speaker: "Alice".into(),
+                    inferred: false,
+                }],
+            },
+        )
+        .expect("write corrections");
+        write_json_atomic(
+            &session.meeting_span_path(),
+            &MeetingSpanFile {
+                format_version: MEETING_SPAN_FORMAT_VERSION,
+                span: MeetingSpan {
+                    start_ms: Some(1_000),
+                    end_ms: None,
+                },
+            },
+        )
+        .expect("write meeting span");
+        let mut args = stage_process_args(session.dir.clone());
+        args.embedding_model = Some(root.join("missing-embedding.onnx"));
+        args.allow_unverified_models = true;
+        args.speakers_db = Some(database_path.clone());
+        (root, session, args, database_path)
+    }
+
+    fn rename_outside_line(
+        args: ProcessArgs,
+    ) -> Result<CorrectionOutcome, Box<dyn std::error::Error>> {
+        correct_speaker(
+            args,
+            &CorrectionRequest {
+                source: AudioSource::System,
+                start_ms: 10,
+                end_ms: 20,
+                speaker: "Carol".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn correction_outside_the_meeting_with_nothing_to_unlearn_needs_no_model() {
+        let (root, session, args, database_path) =
+            outside_correction_fixture("correction-outside-no-model", SpeakerRecord::default());
+        let previous_database = fs::read(&database_path).expect("read database");
+
+        let outcome = rename_outside_line(args).expect("rename without the model");
+
+        assert!(outcome.learning_available);
+        let outside: Vec<Utterance> =
+            jsonl::read_all(&session.outside_meeting_path()).expect("read outside lines");
+        assert_eq!(outside[0].speaker, "Carol");
+        assert!(outside[0].locked);
+        assert_eq!(
+            fs::read(&database_path).expect("reread database"),
+            previous_database
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn correction_outside_the_meeting_unlearns_set_aside_samples_too() {
+        let mut alice = SpeakerRecord::default();
+        alice.pruned.push(PrunedSample {
+            reason: PruneReason::User,
+            pruned_at: 2,
+            sample: Sample::learned(vec![1.0, 0.0], "elsewhere", AudioSource::System, 1),
+        });
+        let (root, session, args, _) =
+            outside_correction_fixture("correction-outside-pruned", alice);
+        let previous = fs::read(session.speaker_corrections_path()).expect("read corrections");
+
+        rename_outside_line(args).expect_err("cleanup needs the missing model");
+
+        assert_eq!(
+            fs::read(session.speaker_corrections_path()).expect("reread corrections"),
+            previous
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -3735,6 +4114,7 @@ mod tests {
             speaker: "Carol".into(),
             old_names: HashSet::new(),
             source: AudioSource::System,
+            learn: true,
             vectors: vec![vec![1.0, 0.0]],
         }];
 
@@ -4234,6 +4614,263 @@ mod tests {
             )
         );
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    fn meeting_span_fixture(label: &str) -> (PathBuf, Session) {
+        let (root, session) = hidden_sources_fixture(label);
+        let word = |source, start_ms: u64, text: &str| TimedWord {
+            source,
+            start_ms,
+            end_ms: start_ms + 200,
+            text: text.into(),
+        };
+        jsonl::write_all_atomic(
+            &session.words_path(),
+            &[
+                word(AudioSource::Mic, 100, "early"),
+                word(AudioSource::System, 2_000, "during"),
+                word(AudioSource::Mic, 4_000, "late"),
+            ],
+        )
+        .expect("write words");
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[
+                SpeakerSegment {
+                    source: AudioSource::Mic,
+                    start_ms: 0,
+                    end_ms: 5_000,
+                    cluster: 7,
+                },
+                SpeakerSegment {
+                    source: AudioSource::System,
+                    start_ms: 0,
+                    end_ms: 5_000,
+                    cluster: 3,
+                },
+            ],
+        )
+        .expect("write diarization");
+        (root, session)
+    }
+
+    #[test]
+    fn render_keeps_only_lines_inside_the_meeting() {
+        type Case = (
+            MeetingSpan,
+            &'static [AudioSource],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        let span = |start_ms, end_ms| MeetingSpan { start_ms, end_ms };
+        let cases: [Case; 5] = [
+            (
+                span(Some(1_000), None),
+                &[],
+                &["during", "late"],
+                &["early"],
+            ),
+            (
+                span(None, Some(3_000)),
+                &[],
+                &["early", "during"],
+                &["late"],
+            ),
+            (
+                span(Some(1_000), Some(3_000)),
+                &[],
+                &["during"],
+                &["early", "late"],
+            ),
+            (
+                span(Some(1_000), Some(3_000)),
+                &[AudioSource::Mic],
+                &["during"],
+                &[],
+            ),
+            (
+                span(Some(1_000), Some(3_000)),
+                &[AudioSource::System],
+                &[],
+                &["early", "late"],
+            ),
+        ];
+        for (span, hidden, inside, outside) in cases {
+            let (root, session) = meeting_span_fixture("meeting-span-render");
+            set_hidden_sources(&session.dir, hidden).expect("hide sources");
+            set_meeting_span(&session.dir, span).expect("set meeting span");
+
+            let texts = |path: &Path| {
+                jsonl::read_all::<Utterance>(path)
+                    .expect("read utterances")
+                    .into_iter()
+                    .map(|utterance| utterance.text)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                texts(&session.transcript_path()),
+                inside,
+                "{span:?} {hidden:?}"
+            );
+            assert_eq!(
+                texts(&session.outside_meeting_path()),
+                outside,
+                "{span:?} {hidden:?}"
+            );
+            let text =
+                fs::read_to_string(session.transcript_text_path()).expect("read transcript text");
+            assert_eq!(text.lines().count(), inside.len());
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn set_meeting_span_writes_open_bounds_and_clears() {
+        let (root, session) = meeting_span_fixture("meeting-span-round-trip");
+        let span = MeetingSpan {
+            start_ms: Some(1_000),
+            end_ms: None,
+        };
+        set_meeting_span(&session.dir, span).expect("set meeting span");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(session.meeting_span_path()).expect("read meeting span")
+            )
+            .expect("parse meeting span"),
+            serde_json::json!({"format_version": 1, "start_ms": 1000})
+        );
+        assert_eq!(read_meeting_span(&session).expect("reread span"), span);
+
+        set_meeting_span(&session.dir, MeetingSpan::default()).expect("clear meeting span");
+        assert!(!session.meeting_span_path().exists());
+        assert!(!session.outside_meeting_path().exists());
+        assert_eq!(
+            jsonl::read_all::<Utterance>(&session.transcript_path())
+                .expect("read transcript")
+                .len(),
+            3
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn empty_inverted_or_unsupported_meeting_spans_are_rejected() {
+        let (root, session) = meeting_span_fixture("meeting-span-invalid");
+        let span = |start_ms, end_ms| MeetingSpan { start_ms, end_ms };
+        for empty in [span(Some(3_000), Some(3_000)), span(None, Some(0))] {
+            set_meeting_span(&session.dir, empty).expect_err("empty span is rejected");
+            assert!(!session.meeting_span_path().exists());
+        }
+
+        let path = session.meeting_span_path();
+        for (bytes, message) in [
+            (
+                &br#"{"format_version":1,"start_ms":3000,"end_ms":1000}"#[..],
+                "the meeting must start before it ends in",
+            ),
+            (
+                br#"{"format_version":1,"end_ms":0}"#,
+                "the meeting must start before it ends in",
+            ),
+            (
+                br#"{"format_version":2}"#,
+                "unsupported meeting span format version 2 in",
+            ),
+        ] {
+            fs::write(&path, bytes).expect("write meeting span");
+            let error = run_render(RenderArgs {
+                session: session.dir.clone(),
+                diarize_mic: None,
+            })
+            .expect_err("invalid span fails render");
+            assert_eq!(error.to_string(), format!("{message} {}", path.display()));
+        }
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn meeting_cannot_start_once_the_recording_has_ended() {
+        let (root, session) = meeting_span_fixture("meeting-span-past-end");
+        let mut manifest = session.read_manifest().expect("read manifest");
+        manifest.system.enabled = true;
+        session.write_manifest(&manifest).expect("write manifest");
+        fs::create_dir_all(session.dir.join("audio")).expect("create audio dir");
+        fs::write(
+            session.audio_path(AudioSource::System),
+            vec![0; SAMPLE_RATE as usize * 4 * 3],
+        )
+        .expect("write three seconds of audio");
+        let at = |start_ms| MeetingSpan {
+            start_ms: Some(start_ms),
+            end_ms: None,
+        };
+
+        set_meeting_span(&session.dir, at(2_000)).expect("start inside the recording");
+        set_meeting_span(&session.dir, at(3_000)).expect_err("start at the end is rejected");
+        assert_eq!(read_meeting_span(&session).expect("read span"), at(2_000));
+
+        let path = session.meeting_span_path();
+        fs::write(&path, br#"{"format_version":1,"start_ms":3000}"#).expect("write span");
+        let error = run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect_err("start past the recording fails render");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the meeting starts after the recording ends in {}",
+                path.display()
+            )
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_render_restores_marks_sidecar_and_transcripts() {
+        let span = |start_ms, end_ms| MeetingSpan { start_ms, end_ms };
+        // Each change fails while writing the file named last, after the
+        // render has already replaced or deleted the ones before it.
+        let cases = [
+            (
+                span(Some(1_000), None),
+                span(None, Some(3_000)),
+                "transcript.jsonl",
+            ),
+            (
+                span(Some(1_000), None),
+                MeetingSpan::default(),
+                "transcript.jsonl",
+            ),
+            (
+                MeetingSpan::default(),
+                span(Some(1_000), None),
+                "transcript.txt",
+            ),
+        ];
+        for (before, after, failing) in cases {
+            let (root, session) = meeting_span_fixture("meeting-span-rollback");
+            set_meeting_span(&session.dir, before).expect("set first marks");
+            let files = [
+                session.meeting_span_path(),
+                session.outside_meeting_path(),
+                session.transcript_path(),
+                session.transcript_text_path(),
+            ];
+            let snapshot = || {
+                files
+                    .iter()
+                    .map(|path| fs::read_to_string(path).ok())
+                    .collect::<Vec<_>>()
+            };
+            let previous = snapshot();
+            fs::create_dir(jsonl::tmp_path(&session.dir.join(failing))).expect("block the write");
+
+            set_meeting_span(&session.dir, after).expect_err("render fails");
+
+            assert_eq!(snapshot(), previous, "{before:?} -> {after:?}");
+            fs::remove_dir_all(root).expect("remove fixture");
+        }
     }
 
     #[test]

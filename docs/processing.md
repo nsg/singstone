@@ -396,6 +396,16 @@ removed. With a configured model, learning preparation must succeed before the
 lock is saved; a rendering failure restores the previous corrections. The
 database is updated only after rendering succeeds. Without the model, the line
 is still locked and rendered, but learning and unlearning are skipped.
+A line outside the meeting marked in `meeting-span.json` (described under
+[Render](#4-render-intermediate-artifacts-to-the-final-transcript)) is locked
+and renamed, but nothing is learned from it, so talk before or after the
+meeting cannot teach a wrong voice. Its vectors are still removed from the old
+names, so a voice learned while the line was inside the meeting does not stay
+with the wrong person. The model and embeddings are prepared only when an old
+name (a replaced lock or the cluster's first guess) holds any samples, set
+aside ones included; otherwise such a correction needs neither the model nor the audio and leaves
+the database untouched. Later lines are not proposed from a line outside the
+meeting.
 Microphone corrections are stored and learned in the same way as system-track
 corrections.
 
@@ -476,10 +486,10 @@ singstone render SESSION
 **Input:** `manifest.json`, `words.jsonl`, `diarization.jsonl`, their metadata
 sidecars when present, optionally
 `speaker-assignments.json`, optionally `speaker-corrections.json`, optionally
-`hidden-sources.json`, and the audio tracks when both are available. Missing
-assignment, correction, and hidden-source data is allowed, but malformed or
-unsupported assignment, correction, hidden-source, or diarization metadata is
-an error. This stage uses no ML model and is fast.
+`hidden-sources.json`, optionally `meeting-span.json`, and the audio tracks
+when both are available. Missing assignment, correction, hidden-source, and
+meeting-span data is allowed, but malformed or unsupported assignment,
+correction, hidden-source, meeting-span, or diarization metadata is an error. This stage uses no ML model and is fast.
 
 When both audio tracks are available, `render` builds 10 ms RMS envelopes and
 examines every non-overlapping two-second system-audio window with enough
@@ -560,6 +570,40 @@ Hidden-source utterances are omitted from `transcript.jsonl` and
 or edit the file and run `singstone render SESSION`. Remove a source from
 `hidden`, or remove the file, and render again to bring its lines back.
 
+`meeting-span.json` marks where the meeting starts and ends when the recording
+runs longer than the meeting:
+
+```json
+{
+  "format_version": 1,
+  "start_ms": 72000,
+  "end_ms": 2790000
+}
+```
+
+Either bound may be left out, and the meeting then reaches that edge of the
+recording. The meeting must not be empty: `end_ms` must be above `start_ms`,
+or above 0 without a start, and when the recorded audio can be read, `start_ms`
+must be below its length. An
+utterance belongs to the meeting when its `start_ms` lies in
+`[start_ms, end_ms)`. Utterances outside it are omitted from
+`transcript.jsonl` and `transcript.txt` and written instead to
+`outside-meeting.jsonl`, in the same format, so the app can still show them;
+that file exists only while the session has a span. Timestamps stay relative to
+the start of the recording, and hidden sources are left out of both files. The
+span changes no other artifact: the audio, `screenshots.jsonl`, which is
+written while recording, and the transcription, diarization and recognition
+stages do not look at it. In the app, right-click a line or its time and choose
+**Meeting starts here** or **Meeting ends here**. A start mark is the start of
+that timeline row. An end mark is the latest end of the row's lines, cut back
+to the start of the next row when that row starts earlier, so the meeting ends
+right after the chosen row even when the next line overlaps it. Remove a bound
+from the file, or the whole file, and render again to widen the meeting; the
+app's ✕ on a mark and **Use the whole recording** do the same. When rendering
+after a change in the app fails, `meeting-span.json`, `outside-meeting.jsonl`,
+`transcript.jsonl` and `transcript.txt` are all put back as they were, so they
+keep agreeing; the same holds for changes to hidden sources and corrections.
+
 The stage replaces the canonical `transcript.jsonl` and readable
 `transcript.txt` atomically one file at a time:
 
@@ -595,16 +639,17 @@ changing any of those inputs.
 | Manually edited words | `render` |
 | Manually edited speaker segments | `recognize`, then `render`; or only `render` for anonymous names |
 | Leave out the microphone or system-audio lines | Use the app, or edit `hidden-sources.json`, then `render` |
+| Leave out talk before or after the meeting | Use the app, or edit `meeting-span.json`, then `render` |
 | Anonymous transcript with no speaker database | Skip `recognize`; run `render` |
 | Multiple people are listed in the room | Save meeting details, then `diarize`, `recognize`, and `render` |
 | Changed who was in the meeting | `recognize`, then `render` when candidate names changed; otherwise `render` |
 
 Changing attendee names also changes the recognition candidate set, so rerun
 `recognize` before `render` when those names should be matched automatically.
-Every rerun recipe preserves `speaker-corrections.json` and
-`hidden-sources.json`; `process` and the individual `transcribe`, `diarize`,
-`recognize`, `render`, `correct`, and `archive` stages never edit or delete
-either file.
+Every rerun recipe preserves `speaker-corrections.json`,
+`hidden-sources.json` and `meeting-span.json`; `process` and the individual
+`transcribe`, `diarize`, `recognize`, `render`, `correct`, and `archive` stages
+never edit or delete these files.
 A finished `process` run does remove the session's `done` marker, the empty
 file behind the app's **Done** label, because the new transcript has not been
 reviewed.

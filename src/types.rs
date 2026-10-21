@@ -120,6 +120,53 @@ pub struct HiddenSources {
     pub hidden: Vec<AudioSource>,
 }
 
+/// Where the meeting starts and ends in the recording; an open bound reaches
+/// the edge of the recording.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingSpan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<u64>,
+}
+
+impl MeetingSpan {
+    pub fn is_whole(self) -> bool {
+        self.start_ms.is_none() && self.end_ms.is_none()
+    }
+
+    /// Whether the meeting is not empty, counting an open start as 0 ms.
+    pub fn is_valid(self) -> bool {
+        self.end_ms
+            .is_none_or(|end| end > self.start_ms.unwrap_or(0))
+    }
+
+    /// Whether the meeting is not empty in a recording of `recorded_ms`.
+    pub fn is_valid_within(self, recorded_ms: u64) -> bool {
+        self.is_valid() && self.start_ms.is_none_or(|start| start < recorded_ms)
+    }
+
+    /// Whether a line starting at `start_ms` belongs to the meeting.
+    pub fn contains(self, start_ms: u64) -> bool {
+        self.start_ms.is_none_or(|start| start_ms >= start)
+            && self.end_ms.is_none_or(|end| start_ms < end)
+    }
+
+    pub fn length_ms(self, recorded_ms: u64) -> u64 {
+        self.end_ms
+            .unwrap_or(recorded_ms)
+            .min(recorded_ms)
+            .saturating_sub(self.start_ms.unwrap_or(0))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingSpanFile {
+    pub format_version: u32,
+    #[serde(flatten)]
+    pub span: MeetingSpan,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Utterance {
     pub start_ms: u64,

@@ -169,6 +169,12 @@ impl Session {
     pub fn hidden_sources_path(&self) -> PathBuf {
         self.dir.join("hidden-sources.json")
     }
+    pub fn meeting_span_path(&self) -> PathBuf {
+        self.dir.join("meeting-span.json")
+    }
+    pub fn outside_meeting_path(&self) -> PathBuf {
+        self.dir.join("outside-meeting.jsonl")
+    }
     pub fn meeting_path(&self) -> PathBuf {
         self.dir.join("meeting.json")
     }

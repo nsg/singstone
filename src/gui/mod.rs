@@ -1,5 +1,6 @@
 mod config;
 mod dictation;
+mod meeting_span;
 mod queue;
 mod remote;
 mod timeline_layout;
@@ -17,8 +18,8 @@ use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
 use crate::speaker::tidy;
 use crate::transcription::{self, TranscriptionProgress, backend};
 use crate::types::{
-    AudioSource, DEFAULT_SPEAKER_THRESHOLD, Manifest, SAMPLE_RATE, ScreenshotEntry, SessionState,
-    Utterance,
+    AudioSource, DEFAULT_SPEAKER_THRESHOLD, Manifest, MeetingSpan, SAMPLE_RATE, ScreenshotEntry,
+    SessionState, Utterance,
 };
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -39,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rustix::process::{Pid, Signal};
 
 use self::config::GuiConfig;
+use self::meeting_span::{Marks, SpanSetter};
 use self::queue::{
     JobState, Outcome as QueueOutcome, ProcessingQueue, finished_banner_text, ordinal,
 };
@@ -82,6 +84,16 @@ const CSS: &str = r#"
 .transcript-icon { min-width: 18px; min-height: 18px; padding: 0; }
 .transcript-card .pill { padding-left: 3px; padding-right: 3px; }
 .echo-row { opacity: 0.55; }
+.outside-line { opacity: 0.55; }
+.outside-meeting { border-radius: 12px; padding-bottom: 6px; background: repeating-linear-gradient(135deg, alpha(currentColor, 0.07) 0px, alpha(currentColor, 0.07) 8px, transparent 8px, transparent 16px); }
+.outside-meeting .timeline-time { opacity: 0.55; }
+.meeting-fold { border: 1px dashed @borders; border-radius: 999px; padding: 0 2px 0 12px; background: @window_bg_color; }
+.meeting-fold-toggle { min-height: 0; padding: 2px 8px; border-radius: 999px; color: @accent_color; font-weight: bold; }
+.meeting-flag-line { min-height: 2px; background: @accent_bg_color; }
+.meeting-flag { border-radius: 999px; padding: 2px 2px 2px 10px; color: @accent_fg_color; background: @accent_bg_color; font-weight: bold; }
+.meeting-flag button { min-width: 20px; min-height: 20px; padding: 0; color: @accent_fg_color; }
+.meeting-length { font-weight: bold; }
+.meeting-whole { padding: 0; min-height: 0; color: @accent_color; font-weight: bold; }
 .speaker-shortcut { border: 1px solid alpha(@accent_color, 0.28); border-radius: 999px; padding: 1px 7px; color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
 .queue-panel { border-top: 1px solid @borders; background: alpha(currentColor, 0.035); padding: 8px 10px 10px; }
 .queue-card { border: 1px solid @borders; border-radius: 10px; background: @card_bg_color; padding: 8px; }
@@ -136,6 +148,8 @@ struct SessionDetail {
     root: gtk::Box,
     title: gtk::Label,
     subtitle: gtk::Label,
+    meeting_length: gtk::Label,
+    recorded_length: gtk::Label,
     status: gtk::Label,
     process_button: gtk::Button,
     done_button: gtk::Button,
@@ -150,10 +164,13 @@ struct SessionDetail {
     transcript_panes: gtk::Box,
     transcript: gtk::Box,
     empty_state: Rc<RefCell<Option<gtk::Label>>>,
+    outside_expanded: Rc<Cell<(bool, bool)>>,
     screenshots: gtk::FlowBox,
     metadata: gtk::Box,
     files: gtk::Box,
     selected: Rc<RefCell<Option<PathBuf>>>,
+    sessions: gtk::ListBox,
+    session_paths: Rc<RefCell<Vec<PathBuf>>>,
     playback: PlaybackController,
     window: adw::ApplicationWindow,
     queue: Rc<RefCell<ProcessingQueue>>,
@@ -594,7 +611,7 @@ fn session_panel_info(path: &Path) -> (String, String) {
     let title = session_display_title(&session, path);
     let duration = session
         .read_manifest()
-        .map(|manifest| format_duration(session_duration_ms(&session, &manifest)))
+        .map(|manifest| format_duration(process::recorded_duration_ms(&session, &manifest)))
         .unwrap_or_default();
     (title, duration)
 }
@@ -723,6 +740,8 @@ fn build_window(app: &adw::Application) {
     let tidy_notice = tidy_notice();
     let detail = build_session_detail(
         &window,
+        &session_list,
+        &session_paths,
         &processing_queue,
         &cancel_requested,
         &foreground_busy,
@@ -1284,6 +1303,8 @@ fn meter_group(name: &str) -> gtk::Box {
 
 fn build_session_detail(
     window: &adw::ApplicationWindow,
+    sessions: &gtk::ListBox,
+    session_paths: &Rc<RefCell<Vec<PathBuf>>>,
     queue: &Rc<RefCell<ProcessingQueue>>,
     cancel_requested: &Rc<Cell<bool>>,
     busy: &Rc<Cell<bool>>,
@@ -1332,10 +1353,21 @@ fn build_session_detail(
     delete_button.set_visible(false);
     top.append(&delete_button);
     heading.append(&top);
+    let subtitle_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     let subtitle = gtk::Label::new(Some("Recorded meetings appear in the sidebar."));
     subtitle.set_xalign(0.0);
     subtitle.add_css_class("dim-label");
-    heading.append(&subtitle);
+    subtitle_row.append(&subtitle);
+    let meeting_length = gtk::Label::new(None);
+    meeting_length.add_css_class("accent");
+    meeting_length.add_css_class("meeting-length");
+    meeting_length.set_visible(false);
+    subtitle_row.append(&meeting_length);
+    let recorded_length = gtk::Label::new(None);
+    recorded_length.add_css_class("dim-label");
+    recorded_length.set_visible(false);
+    subtitle_row.append(&recorded_length);
+    heading.append(&subtitle_row);
     root.append(&heading);
     root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
@@ -1434,6 +1466,8 @@ fn build_session_detail(
         root,
         title,
         subtitle,
+        meeting_length,
+        recorded_length,
         status,
         process_button,
         done_button,
@@ -1448,10 +1482,13 @@ fn build_session_detail(
         transcript_panes,
         transcript,
         empty_state: Rc::new(RefCell::new(None)),
+        outside_expanded: Rc::new(Cell::new((false, false))),
         screenshots,
         metadata,
         files,
         selected: Rc::new(RefCell::new(None)),
+        sessions: sessions.clone(),
+        session_paths: session_paths.clone(),
         playback: PlaybackController::default(),
         window: window.clone(),
         queue: queue.clone(),
@@ -2272,12 +2309,13 @@ fn select_session_row(list: &gtk::ListBox, index: usize) {
     }
 }
 
-fn session_row_labels(row: &gtk::ListBoxRow) -> Option<(gtk::Label, gtk::Label)> {
+fn session_row_labels(row: &gtk::ListBoxRow) -> Option<(gtk::Label, gtk::Label, gtk::Label)> {
     let body = row.child()?.downcast::<gtk::Box>().ok()?;
     let top = body.first_child()?.downcast::<gtk::Box>().ok()?;
     let title = top.first_child()?.downcast::<gtk::Label>().ok()?;
     let status = top.last_child()?.downcast::<gtk::Label>().ok()?;
-    Some((title, status))
+    let meta = body.last_child()?.downcast::<gtk::Label>().ok()?;
+    Some((title, status, meta))
 }
 
 fn update_session_row(
@@ -2299,15 +2337,19 @@ fn update_session_row(
     else {
         return;
     };
-    let Some((title, status)) = session_row_labels(&row) else {
+    let Some((title, status, meta)) = session_row_labels(&row) else {
         return;
     };
     let (text, class) = session_path_status(path, queue);
     set_status(&status, text, class);
     if let Ok(session) = Session::open(path)
-        && session.read_manifest().is_ok()
+        && let Ok(manifest) = session.read_manifest()
     {
         title.set_label(&session_display_title(&session, path));
+        meta.set_label(&session_row_meta(
+            &manifest.started_wallclock,
+            listed_duration_ms(&session, &manifest),
+        ));
     }
 }
 
@@ -4558,15 +4600,29 @@ impl SessionDetail {
         self.playback.stop();
         let session = Session::open(path)?;
         let manifest = session.read_manifest()?;
+        if self.selected.borrow().as_deref() != Some(path) {
+            self.outside_expanded.set((false, false));
+        }
         *self.selected.borrow_mut() = Some(path.to_owned());
         let title = session_display_title(&session, path);
         self.title.set_label(&title);
-        let duration = session_duration_ms(&session, &manifest);
-        self.subtitle.set_label(&format!(
-            "{} · {}",
-            display_started(&manifest.started_wallclock),
-            format_duration(duration)
-        ));
+        let duration = process::recorded_duration_ms(&session, &manifest);
+        let span = process::read_meeting_span(&session).unwrap_or_default();
+        let started = display_started(&manifest.started_wallclock);
+        if span.is_whole() {
+            self.subtitle
+                .set_label(&format!("{started} · {}", format_duration(duration)));
+        } else {
+            self.subtitle.set_label(&format!("{started} ·"));
+            self.meeting_length.set_label(&format!(
+                "meeting {}",
+                format_duration(span.length_ms(duration))
+            ));
+            self.recorded_length
+                .set_label(&format!("of {}", format_duration(duration)));
+        }
+        self.meeting_length.set_visible(!span.is_whole());
+        self.recorded_length.set_visible(!span.is_whole());
         let processed = session.transcript_path().is_file();
         let queue_state = self.queue.borrow().state(path);
         self.apply_queue_state(&session, &manifest, processed, queue_state);
@@ -4588,7 +4644,17 @@ impl SessionDetail {
         clear_box(&self.transcript_panes);
         self.transcript_panes.set_visible(false);
         if processed {
-            let utterances: Vec<Utterance> = jsonl::read_all(&session.transcript_path())?;
+            let mut utterances: Vec<Utterance> = jsonl::read_all(&session.transcript_path())?;
+            utterances.extend(process::read_outside_meeting(&session).unwrap_or_default());
+            // A stale sidecar must not show a transcript line twice; the
+            // transcript's copy comes first and is kept.
+            let mut seen = std::collections::HashSet::new();
+            utterances.retain(|utterance| {
+                seen.insert((utterance.start_ms, utterance.end_ms, utterance.source))
+            });
+            utterances.sort_by_key(|utterance| {
+                (utterance.start_ms, utterance.source == AudioSource::System)
+            });
             if utterances.is_empty() {
                 append_empty(
                     &self.transcript,
@@ -4611,15 +4677,77 @@ impl SessionDetail {
                 let one_sided = !(has_mic && has_system);
                 populate_timeline_headers(&self.transcript_panes, has_mic, has_system, one_sided);
                 self.transcript_panes.set_visible(true);
-                for row in timeline_rows(&utterances) {
-                    self.transcript.append(&transcript_timeline_row(
-                        &row,
-                        &utterances,
-                        &learned,
-                        self,
-                        &session,
-                        &frequent,
-                        one_sided,
+                let rows = timeline_rows(&utterances);
+                let marks = Marks {
+                    span,
+                    recorded_ms: duration,
+                    set: self.span_setter(),
+                };
+                let set_span = marks.set.clone();
+                let row_widgets = |indexes: std::ops::Range<usize>| {
+                    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                    for index in indexes {
+                        container.append(&transcript_timeline_row(
+                            &rows,
+                            index,
+                            &utterances,
+                            &learned,
+                            self,
+                            &session,
+                            &frequent,
+                            one_sided,
+                            &marks,
+                        ));
+                    }
+                    container
+                };
+                let (first_inside, first_after) =
+                    meeting_span::fold_bounds(&rows, &utterances, span);
+                if first_inside > 0 {
+                    let expanded = self.outside_expanded.clone();
+                    self.transcript.append(&meeting_span::outside_fold(
+                        true,
+                        span.start_ms.unwrap_or(0),
+                        meeting_span::fold_lines(&rows[..first_inside]),
+                        row_widgets(0..first_inside),
+                        expanded.get().0,
+                        move |shown| expanded.set((shown, expanded.get().1)),
+                    ));
+                }
+                if let Some(start_ms) = span.start_ms {
+                    let set_span = set_span.clone();
+                    self.transcript.append(&meeting_span::meeting_flag(
+                        true,
+                        start_ms,
+                        move || {
+                            set_span(MeetingSpan {
+                                start_ms: None,
+                                ..span
+                            })
+                        },
+                    ));
+                }
+                self.transcript
+                    .append(&row_widgets(first_inside..first_after));
+                if let Some(end_ms) = span.end_ms {
+                    let set_span = set_span.clone();
+                    self.transcript
+                        .append(&meeting_span::meeting_flag(false, end_ms, move || {
+                            set_span(MeetingSpan {
+                                end_ms: None,
+                                ..span
+                            })
+                        }));
+                }
+                if first_after < rows.len() {
+                    let expanded = self.outside_expanded.clone();
+                    self.transcript.append(&meeting_span::outside_fold(
+                        false,
+                        duration.saturating_sub(span.end_ms.unwrap_or(duration)),
+                        meeting_span::fold_lines(&rows[first_after..]),
+                        row_widgets(first_after..rows.len()),
+                        expanded.get().1,
+                        move |shown| expanded.set((expanded.get().0, shown)),
                     ));
                 }
             }
@@ -4654,8 +4782,27 @@ impl SessionDetail {
         clear_box(&self.metadata);
         self.metadata
             .append(&property_row("Folder", &session.dir.display().to_string()));
-        self.metadata
-            .append(&property_row("Duration", &format_duration(duration)));
+        if span.is_whole() {
+            self.metadata
+                .append(&property_row("Duration", &format_duration(duration)));
+        } else {
+            self.metadata.append(&property_row(
+                "Duration",
+                &format!("{} recorded", format_duration(duration)),
+            ));
+            let meeting = property_row("Meeting", &meeting_span::span_summary(span, duration));
+            let whole = gtk::Button::with_label("Use the whole recording");
+            whole.add_css_class("flat");
+            whole.add_css_class("meeting-whole");
+            whole.set_halign(gtk::Align::Start);
+            whole.set_tooltip_text(Some(
+                "Remove both marks so that the whole recording is the meeting again",
+            ));
+            let set_span = self.span_setter();
+            whole.connect_clicked(move |_| set_span(MeetingSpan::default()));
+            meeting.append(&whole);
+            self.metadata.append(&meeting);
+        }
         let audio = match (manifest.mic.enabled, manifest.system.enabled) {
             (true, true) => "Microphone + system",
             (true, false) => "Microphone",
@@ -4705,6 +4852,11 @@ impl SessionDetail {
         open.connect_clicked(move |_| open_path(&folder));
         self.files.append(&open);
         Ok(())
+    }
+
+    fn span_setter(&self) -> SpanSetter {
+        let detail = self.clone();
+        Rc::new(move |span| start_meeting_span_update(&detail, span))
     }
 
     fn apply_queue_state(
@@ -4830,6 +4982,8 @@ impl SessionDetail {
         self.title.set_label("Select a session");
         self.subtitle
             .set_label("Recorded meetings appear in the sidebar.");
+        self.meeting_length.set_visible(false);
+        self.recorded_length.set_visible(false);
         self.body_stack.set_visible_child_name("transcript");
         for widget in [
             self.status.upcast_ref::<gtk::Widget>(),
@@ -4902,7 +5056,7 @@ fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {
                     .unwrap_or_else(|| session_title(&entry.path())),
                 duration_ms: manifest
                     .as_ref()
-                    .map(|manifest| session_duration_ms(&session, manifest))
+                    .map(|manifest| listed_duration_ms(&session, manifest))
                     .unwrap_or_default(),
                 path: entry.path(),
                 status,
@@ -4968,10 +5122,9 @@ fn session_row(summary: &SessionSummary) -> gtk::ListBoxRow {
     top.append(&title);
     top.append(&status_pill(summary.status, summary.status_class));
     body.append(&top);
-    let meta = gtk::Label::new(Some(&format!(
-        "{} · {}",
-        display_started(&summary.started),
-        format_duration(summary.duration_ms)
+    let meta = gtk::Label::new(Some(&session_row_meta(
+        &summary.started,
+        summary.duration_ms,
     )));
     meta.set_xalign(0.0);
     meta.add_css_class("dim-label");
@@ -5028,15 +5181,24 @@ fn timeline_pane_header(text: &str, icon_name: &str, align: gtk::Align) -> gtk::
     cell
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transcript_timeline_row(
-    timeline_row: &TimelineRow,
+    rows: &[TimelineRow],
+    index: usize,
     utterances: &[Utterance],
     learned: &[bool],
     detail: &SessionDetail,
     session: &Session,
     frequent: &Rc<Vec<String>>,
     one_sided: bool,
+    marks: &Marks,
 ) -> gtk::Box {
+    let timeline_row = &rows[index];
+    let span = marks.span;
+    let end_ms = meeting_span::row_end_ms(rows, utterances, index);
+    let markable = |widget: &gtk::Widget| {
+        meeting_span::attach_mark_menu(widget, timeline_row.start_ms, end_ms, marks);
+    };
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.set_layout_manager(Some(TimelineLayout::new(one_sided)));
 
@@ -5060,11 +5222,17 @@ fn transcript_timeline_row(
         } else {
             gtk::Align::End
         });
+        if !span.contains(utterance.start_ms) {
+            card.add_css_class("outside-line");
+        }
+        markable(card.upcast_ref());
         mic.append(&card);
     }
     row.append(&mic);
 
-    row.append(&timeline_marker(timeline_row.start_ms));
+    let marker = timeline_marker(timeline_row.start_ms);
+    markable(marker.upcast_ref());
+    row.append(&marker);
 
     let system = gtk::Box::new(gtk::Orientation::Vertical, 6);
     system.add_css_class("timeline-cell");
@@ -5082,6 +5250,10 @@ fn transcript_timeline_row(
                 != format_timeline_timestamp(timeline_row.start_ms),
         );
         card.set_halign(gtk::Align::Start);
+        if !span.contains(utterance.start_ms) {
+            card.add_css_class("outside-line");
+        }
+        markable(card.upcast_ref());
         system.append(&card);
     }
     row.append(&system);
@@ -5752,6 +5924,55 @@ fn start_hidden_sources_update(detail: &SessionDetail) {
     });
 }
 
+fn start_meeting_span_update(detail: &SessionDetail, span: MeetingSpan) {
+    if detail.busy.get() {
+        return;
+    }
+    let Some(session) = detail.selected.borrow().clone() else {
+        return;
+    };
+    if detail.queue.borrow().state(&session) == Some(JobState::Running) {
+        show_error(
+            &detail.window,
+            "Session is processing",
+            "Mark the meeting once processing has finished.",
+        );
+        return;
+    }
+    detail.busy.set(true);
+    let progress = progress_window(
+        &detail.window,
+        "Updating transcript",
+        "Updating transcript…",
+    );
+    let result = Arc::new(Mutex::new(None));
+    let thread_result = result.clone();
+    let path = session.clone();
+    std::thread::spawn(move || {
+        let value = process::set_meeting_span(&path, span).map_err(|error| error.to_string());
+        *thread_result.lock().expect("meeting span result mutex") = Some(value);
+    });
+    let detail = detail.clone();
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        let Some(result) = result.lock().expect("meeting span result mutex").take() else {
+            return glib::ControlFlow::Continue;
+        };
+        detail.busy.set(false);
+        progress.close();
+        reload_session(&detail);
+        update_session_row(
+            &detail.sessions,
+            &detail.session_paths,
+            &session,
+            &detail.queue.borrow(),
+        );
+        if let Err(error) = result {
+            show_error(&detail.window, "Could not mark the meeting", &error);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 fn reload_session(detail: &SessionDetail) {
     let selected = detail.selected.borrow().clone();
     if let Some(path) = selected {
@@ -5851,25 +6072,20 @@ fn session_title(path: &Path) -> String {
         .replace("session-", "Session ")
 }
 
-fn stored_sample_count(path: &Path) -> io::Result<u64> {
-    if archive::is_archived(path) {
-        archive::sample_count(path)
-    } else {
-        Ok(fs::metadata(path)?.len() / 4)
-    }
+/// The meeting's length when it is marked, otherwise the recording's.
+fn listed_duration_ms(session: &Session, manifest: &Manifest) -> u64 {
+    let recorded = process::recorded_duration_ms(session, manifest);
+    process::read_meeting_span(session)
+        .unwrap_or_default()
+        .length_ms(recorded)
 }
 
-fn session_duration_ms(session: &Session, manifest: &Manifest) -> u64 {
-    [
-        (AudioSource::Mic, manifest.mic.enabled),
-        (AudioSource::System, manifest.system.enabled),
-    ]
-    .into_iter()
-    .filter(|(_, enabled)| *enabled)
-    .filter_map(|(source, _)| stored_sample_count(&session.stored_audio_path(source)).ok())
-    .map(|samples| samples * 1000 / u64::from(SAMPLE_RATE))
-    .max()
-    .unwrap_or(0)
+fn session_row_meta(started: &str, duration_ms: u64) -> String {
+    format!(
+        "{} · {}",
+        display_started(started),
+        format_duration(duration_ms)
+    )
 }
 
 fn display_started(value: &str) -> String {

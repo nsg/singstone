@@ -4772,7 +4772,10 @@ impl SessionDetail {
             self.screenshots.insert(&empty, -1);
         } else {
             for screenshot in screenshots {
-                if let Some(file) = safe_session_path(&session.dir, &screenshot.file) {
+                // Loading a FIFO or device as a picture would block the window.
+                if let Some(file) = safe_session_path(&session.dir, &screenshot.file)
+                    .filter(|file| fs::metadata(file).is_ok_and(|metadata| metadata.is_file()))
+                {
                     self.screenshots
                         .insert(&screenshot_card(&file, screenshot.time_ms), -1);
                 }

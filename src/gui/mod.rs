@@ -1,6 +1,7 @@
 mod config;
 mod dictation;
 mod meeting_span;
+mod player;
 mod queue;
 mod remote;
 mod timeline_layout;
@@ -16,6 +17,7 @@ use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
 use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
 use crate::speaker::tidy;
+use crate::split;
 use crate::transcription::{self, TranscriptionProgress, backend};
 use crate::types::{
     AudioSource, DEFAULT_SPEAKER_THRESHOLD, Manifest, MeetingSpan, SAMPLE_RATE, ScreenshotEntry,
@@ -101,6 +103,13 @@ const CSS: &str = r#"
 .queue-compact-progress { min-height: 3px; }
 .queue-entry-button { padding: 0; font-weight: normal; }
 .queue-entry-button.heading { font-weight: bold; }
+.player-card { padding: 10px 12px; border: 1px solid @borders; border-radius: 12px; background: @card_bg_color; }
+.player-clock { font-feature-settings: "tnum"; }
+.player-chip:not(:checked) { opacity: 0.55; }
+.split-panel { padding: 10px 12px; border: 1px solid alpha(#e66100, 0.45); border-radius: 12px; background: alpha(#e66100, 0.06); }
+.split-part { padding: 8px 10px; border: 1px solid @borders; border-radius: 10px; background: @card_bg_color; }
+.split-part-1 { border-left: 4px solid #3584e4; }
+.split-part-2 { border-left: 4px solid #e66100; }
 "#;
 
 #[derive(Clone)]
@@ -132,7 +141,7 @@ struct ActivePlayback {
     row_id: u64,
     generation: u64,
     child: Child,
-    button: gtk::Button,
+    on_stop: Box<dyn Fn()>,
     writer_error: Arc<Mutex<Option<String>>>,
     stderr: Arc<Mutex<String>>,
 }
@@ -161,6 +170,9 @@ struct SessionDetail {
     hide_system: gtk::ToggleButton,
     loading_hidden_sources: Rc<Cell<bool>>,
     body_stack: gtk::Stack,
+    player: player::Player,
+    transcript_header: gtk::Box,
+    transcript_scroll: gtk::ScrolledWindow,
     transcript_panes: gtk::Box,
     transcript: gtk::Box,
     empty_state: Rc<RefCell<Option<gtk::Label>>>,
@@ -608,7 +620,7 @@ fn session_panel_info(path: &Path) -> (String, String) {
     let Ok(session) = Session::open(path) else {
         return (session_title(path), String::new());
     };
-    let title = session_display_title(&session, path);
+    let title = session.title();
     let duration = session
         .read_manifest()
         .map(|manifest| format_duration(process::recorded_duration_ms(&session, &manifest)))
@@ -1380,6 +1392,16 @@ fn build_session_detail(
     paned.set_shrink_end_child(false);
     let transcript_frame = gtk::Box::new(gtk::Orientation::Vertical, 6);
     transcript_frame.set_margin_top(12);
+    let playback = PlaybackController::default();
+    let player = player::Player::new(&playback, window);
+    player.root.set_visible(false);
+    transcript_frame.append(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .child(&player.root)
+            .build(),
+    );
     let transcript_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     transcript_header.set_margin_start(16);
     transcript_header.set_margin_end(16);
@@ -1479,6 +1501,9 @@ fn build_session_detail(
         hide_system,
         loading_hidden_sources: Rc::new(Cell::new(false)),
         body_stack,
+        player,
+        transcript_header,
+        transcript_scroll,
         transcript_panes,
         transcript,
         empty_state: Rc::new(RefCell::new(None)),
@@ -1489,7 +1514,7 @@ fn build_session_detail(
         selected: Rc::new(RefCell::new(None)),
         sessions: sessions.clone(),
         session_paths: session_paths.clone(),
-        playback: PlaybackController::default(),
+        playback,
         window: window.clone(),
         queue: queue.clone(),
         cancel_requested: cancel_requested.clone(),
@@ -2345,7 +2370,7 @@ fn update_session_row(
     if let Ok(session) = Session::open(path)
         && let Ok(manifest) = session.read_manifest()
     {
-        title.set_label(&session_display_title(&session, path));
+        title.set_label(&session.title());
         meta.set_label(&session_row_meta(
             &manifest.started_wallclock,
             listed_duration_ms(&session, &manifest),
@@ -3755,6 +3780,9 @@ fn wire_processing(
     wire_archiving(
         window, detail, banner, config, list, paths, search, busy, queue,
     );
+    wire_splitting(
+        window, detail, banner, config, list, paths, search, busy, queue,
+    );
     let controller = QueueController::new(
         app,
         window,
@@ -4094,6 +4122,116 @@ fn wire_archiving(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+fn wire_splitting(
+    window: &adw::ApplicationWindow,
+    detail: &SessionDetail,
+    banner: &adw::Banner,
+    config: &Rc<RefCell<GuiConfig>>,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    search: &gtk::SearchEntry,
+    busy: &Rc<Cell<bool>>,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+) {
+    let parent = window.clone();
+    let detail_for_split = detail.clone();
+    let banner = banner.clone();
+    let config = config.clone();
+    let list = list.clone();
+    let paths = paths.clone();
+    let search = search.clone();
+    let busy = busy.clone();
+    let queue = queue.clone();
+    detail
+        .player
+        .connect_split(Rc::new(move |session_path, at_ms, titles| {
+            if busy.get() {
+                show_error(
+                    &parent,
+                    "Could not split the session",
+                    "Wait for the current task to finish, then try again.",
+                );
+                return;
+            }
+            if let Some(reason) = split_blocked(
+                false,
+                queue.borrow().state(&session_path),
+                detail_for_split.cancel_requested.get(),
+            ) {
+                show_error(&parent, "Could not split the session", reason);
+                return;
+            }
+            detail_for_split.playback.stop();
+            busy.set(true);
+            let progress = progress_window(
+                &parent,
+                "Splitting the recording",
+                "Writing the two new sessions and archiving the original…",
+            );
+            let result = Arc::new(Mutex::new(None));
+            let thread_result = result.clone();
+            let split_path = session_path.clone();
+            std::thread::spawn(move || {
+                let value = Session::open(&split_path)
+                    .and_then(|session| {
+                        split::split_session(&session, at_ms, [&titles[0], &titles[1]])
+                    })
+                    .map_err(|error| error.to_string());
+                *thread_result.lock().expect("split result mutex") = Some(value);
+            });
+            let parent = parent.clone();
+            let detail = detail_for_split.clone();
+            let banner = banner.clone();
+            let config = config.clone();
+            let list = list.clone();
+            let paths = paths.clone();
+            let search = search.clone();
+            let busy = busy.clone();
+            let queue = queue.clone();
+            glib::timeout_add_local(Duration::from_millis(150), move || {
+                let Some(result) = result.lock().expect("split result mutex").take() else {
+                    return glib::ControlFlow::Continue;
+                };
+                busy.set(false);
+                progress.close();
+                populate_sessions(
+                    &list,
+                    &paths,
+                    &config.borrow().meetings_dir,
+                    &search.text(),
+                    &queue,
+                );
+                let show = match &result {
+                    Ok(outcome) => outcome.parts[1].clone(),
+                    Err(_) => session_path.clone(),
+                };
+                match paths.borrow().iter().position(|path| *path == show) {
+                    Some(index) => select_session_row(&list, index),
+                    None => {
+                        let _ = detail.load(&show);
+                    }
+                }
+                match result {
+                    Ok(outcome) => {
+                        let titles = outcome.parts.map(|part| {
+                            Session::open(&part)
+                                .map(|session| session.title())
+                                .unwrap_or_else(|_| session_title(&part))
+                        });
+                        banner.set_title(&format!(
+                            "Split into “{}” and “{}”. The original is archived as a backup.",
+                            titles[0], titles[1]
+                        ));
+                        banner.set_revealed(true);
+                    }
+                    Err(error) => show_error(&parent, "Could not split the session", &error),
+                }
+                glib::ControlFlow::Break
+            });
+        }));
+}
+
 #[derive(Debug, PartialEq)]
 enum ProcessingOutcome {
     Finished,
@@ -4353,22 +4491,50 @@ impl PlaybackController {
         }
         self.stop();
 
-        let generation = self.allocate_id();
-        match start_audio_playback(audio_path, start_ms, end_ms) {
-            Ok(spawned) => {
-                set_playback_button(button, true);
-                *self.active.borrow_mut() = Some(ActivePlayback {
-                    row_id,
-                    generation,
-                    child: spawned.child,
-                    button: button.clone(),
-                    writer_error: spawned.writer_error,
-                    stderr: spawned.stderr,
-                });
-                self.poll(generation, window.clone());
-            }
+        let started = audio_segment(audio_path, start_ms, end_ms).and_then(|segment| {
+            let button = button.clone();
+            self.play(
+                row_id,
+                segment,
+                window,
+                Box::new(move || set_playback_button(&button, false)),
+            )
+        });
+        match started {
+            Ok(()) => set_playback_button(button, true),
             Err(error) => show_error(window, "Could not play audio", &error.to_string()),
         }
+    }
+
+    /// Play `segment` (mono f32 samples at the recording rate) instead of
+    /// whatever plays now; `on_stop` runs once it ends or is stopped.
+    fn play(
+        &self,
+        row_id: u64,
+        segment: Box<dyn Read + Send>,
+        window: &adw::ApplicationWindow,
+        on_stop: Box<dyn Fn()>,
+    ) -> io::Result<()> {
+        self.stop();
+        let spawned = spawn_playback(segment)?;
+        let generation = self.allocate_id();
+        *self.active.borrow_mut() = Some(ActivePlayback {
+            row_id,
+            generation,
+            child: spawned.child,
+            on_stop,
+            writer_error: spawned.writer_error,
+            stderr: spawned.stderr,
+        });
+        self.poll(generation, window.clone());
+        Ok(())
+    }
+
+    fn is_playing(&self, row_id: u64) -> bool {
+        self.active
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active.row_id == row_id)
     }
 
     fn poll(&self, generation: u64, window: adw::ApplicationWindow) {
@@ -4395,7 +4561,7 @@ impl PlaybackController {
             let Some(active) = controller.active.borrow_mut().take() else {
                 return glib::ControlFlow::Break;
             };
-            set_playback_button(&active.button, false);
+            (active.on_stop)();
             let writer_error = active
                 .writer_error
                 .lock()
@@ -4433,16 +4599,16 @@ impl PlaybackController {
             let _ = active.child.kill();
         }
         let _ = active.child.wait();
-        set_playback_button(&active.button, false);
+        (active.on_stop)();
     }
 }
 
-fn start_audio_playback(
+fn audio_segment(
     audio_path: &Path,
     start_ms: u64,
     end_ms: u64,
-) -> io::Result<SpawnedPlayback> {
-    let mut segment: Box<dyn Read + Send> = if archive::is_archived(audio_path) {
+) -> io::Result<Box<dyn Read + Send>> {
+    Ok(if archive::is_archived(audio_path) {
         let stored_bytes = archive::sample_count(audio_path)?.saturating_mul(4);
         let (offset, byte_count) = audio_byte_range(start_ms, end_ms, stored_bytes)?;
         let samples = archive::read_range(audio_path, offset / 4, (offset + byte_count) / 4)?;
@@ -4457,8 +4623,10 @@ fn start_audio_playback(
         let (offset, byte_count) = audio_byte_range(start_ms, end_ms, audio.metadata()?.len())?;
         audio.seek(SeekFrom::Start(offset))?;
         Box::new(audio.take(byte_count))
-    };
+    })
+}
 
+fn spawn_playback(mut segment: Box<dyn Read + Send>) -> io::Result<SpawnedPlayback> {
     let executable = pw_play_executable();
     let mut child = pw_play_command(&executable)
         .arg("-")
@@ -4604,7 +4772,7 @@ impl SessionDetail {
             self.outside_expanded.set((false, false));
         }
         *self.selected.borrow_mut() = Some(path.to_owned());
-        let title = session_display_title(&session, path);
+        let title = session.title();
         self.title.set_label(&title);
         let duration = process::recorded_duration_ms(&session, &manifest);
         let span = process::read_meeting_span(&session).unwrap_or_default();
@@ -4638,6 +4806,25 @@ impl SessionDetail {
             .set_visible(can_hide_sources && manifest.mic.enabled);
         self.hide_system
             .set_visible(can_hide_sources && manifest.system.enabled);
+
+        let screenshots: Vec<ScreenshotEntry> =
+            jsonl::read_all(&session.screenshots_index_path()).unwrap_or_default();
+        let recording = manifest.state == SessionState::Recording;
+        let has_audio = [AudioSource::Mic, AudioSource::System]
+            .into_iter()
+            .any(|source| session.stored_audio_path(source).is_file());
+        self.player.root.set_visible(!recording && has_audio);
+        if !recording && has_audio {
+            self.player.load(
+                &session,
+                &manifest.started_wallclock,
+                duration,
+                screenshots.iter().map(|entry| entry.time_ms).collect(),
+            );
+        }
+        let shows_transcript = processed || recording || !has_audio;
+        self.transcript_header.set_visible(shows_transcript);
+        self.transcript_scroll.set_visible(shows_transcript);
 
         clear_box(&self.transcript);
         *self.empty_state.borrow_mut() = None;
@@ -4751,7 +4938,7 @@ impl SessionDetail {
                     ));
                 }
             }
-        } else {
+        } else if recording || !has_audio {
             let empty = append_empty(
                 &self.transcript,
                 if matches!(queue_state, Some(JobState::Waiting { .. })) {
@@ -4764,8 +4951,6 @@ impl SessionDetail {
         }
 
         clear_flow(&self.screenshots);
-        let screenshots: Vec<ScreenshotEntry> =
-            jsonl::read_all(&session.screenshots_index_path()).unwrap_or_default();
         if screenshots.is_empty() {
             let empty = gtk::Label::new(Some("No screenshots"));
             empty.add_css_class("dim-label");
@@ -4828,6 +5013,40 @@ impl SessionDetail {
                     if raw { "raw float" } else { "FLAC" }
                 ),
             ));
+        }
+
+        if let Ok(Some(from)) = split::read_split_from(&session) {
+            self.metadata.append(&property_row(
+                "Split from",
+                &format!(
+                    "{}, at {}",
+                    from.title,
+                    format_timeline_timestamp(from.at_ms)
+                ),
+            ));
+        }
+        if let Ok(Some(into)) = split::read_split_into(&session) {
+            let root = session.dir.parent().unwrap_or(Path::new("."));
+            for record in &into.splits {
+                let parts = record
+                    .parts
+                    .iter()
+                    .map(|name| {
+                        Session::open(root.join(name))
+                            .map(|part| part.title())
+                            .unwrap_or_else(|_| format!("{name} (deleted)"))
+                    })
+                    .collect::<Vec<_>>();
+                self.metadata.append(&property_row(
+                    "Split into",
+                    &format!(
+                        "“{}” and “{}”, at {}. This session is kept as a backup.",
+                        parts[0],
+                        parts[1],
+                        format_timeline_timestamp(record.at_ms)
+                    ),
+                ));
+            }
         }
 
         clear_box(&self.files);
@@ -4951,6 +5170,11 @@ impl SessionDetail {
         }));
         self.hide_mic.set_sensitive(!running);
         self.hide_system.set_sensitive(!running);
+        self.player.set_split_blocked(split_blocked(
+            processed,
+            queue_state,
+            self.cancel_requested.get(),
+        ));
     }
 
     fn refresh_queue_state(&self) {
@@ -4981,6 +5205,10 @@ impl SessionDetail {
     /// Back to the empty state shown before any session is selected.
     fn clear(&self) {
         self.playback.stop();
+        self.player.clear();
+        self.player.root.set_visible(false);
+        self.transcript_header.set_visible(true);
+        self.transcript_scroll.set_visible(true);
         *self.selected.borrow_mut() = None;
         self.title.set_label("Select a session");
         self.subtitle
@@ -5052,7 +5280,7 @@ fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {
             let manifest = session.read_manifest().ok();
             let (status, status_class) = session_path_status(&entry.path(), queue);
             Some(SessionSummary {
-                title: session_display_title(&session, &entry.path()),
+                title: session.title(),
                 started: manifest
                     .as_ref()
                     .map(|manifest| manifest.started_wallclock.clone())
@@ -5071,22 +5299,32 @@ fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {
     sessions
 }
 
-fn session_display_title(session: &Session, path: &Path) -> String {
-    meeting::read_details(&session.meeting_path())
-        .ok()
-        .flatten()
-        .map(|details| details.title)
-        .filter(|title| !title.is_empty())
-        .unwrap_or_else(|| session_title(path))
+/// Why the player cannot split the session now, or `None` when it can.
+fn split_blocked(
+    processed: bool,
+    queue_state: Option<JobState>,
+    cancelling: bool,
+) -> Option<&'static str> {
+    if processed {
+        Some(
+            "Splitting would discard the transcript. Splitting is for recordings that have not been processed yet.",
+        )
+    } else if matches!(queue_state, Some(JobState::Running)) || cancelling {
+        Some("The session is being processed")
+    } else if queue_state.is_some() {
+        Some("Remove the session from the processing queue before splitting it")
+    } else {
+        None
+    }
 }
 
 fn session_status(session: &Session, manifest: &Manifest) -> (&'static str, &'static str) {
     if manifest.state == SessionState::Recording {
         ("Recording", "busy")
-    } else if !session.transcript_path().is_file() {
-        ("Recorded", "idle")
     } else if session.is_archived() {
         ("Archived", "archived")
+    } else if !session.transcript_path().is_file() {
+        ("Recorded", "idle")
     } else if session.is_done() {
         ("Done", "done")
     } else {
@@ -6069,10 +6307,7 @@ fn selected_target(row: &adw::ComboRow, values: &Rc<RefCell<Vec<String>>>) -> St
 }
 
 fn session_title(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Session")
-        .replace("session-", "Session ")
+    crate::session::default_title(path)
 }
 
 /// The meeting's length when it is marked, otherwise the recording's.

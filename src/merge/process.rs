@@ -36,7 +36,7 @@ const STAGE_METADATA_FORMAT_VERSION: u32 = 1;
 const EMBEDDINGS_FORMAT_VERSION: u32 = 1;
 const SPEAKER_CORRECTIONS_FORMAT_VERSION: u32 = 1;
 const HIDDEN_SOURCES_FORMAT_VERSION: u32 = 1;
-const MEETING_SPAN_FORMAT_VERSION: u32 = 1;
+pub(crate) const MEETING_SPAN_FORMAT_VERSION: u32 = 1;
 const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
 const PROPOSAL_MARGIN: f32 = 0.05;
@@ -2289,7 +2289,7 @@ pub fn recorded_duration_ms(session: &Session, manifest: &Manifest) -> u64 {
     .unwrap_or(0)
 }
 
-fn stored_sample_count(path: &Path) -> io::Result<u64> {
+pub(crate) fn stored_sample_count(path: &Path) -> io::Result<u64> {
     if archive::is_archived(path) {
         archive::sample_count(path)
     } else {
@@ -2297,7 +2297,7 @@ fn stored_sample_count(path: &Path) -> io::Result<u64> {
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     let tmp = jsonl::tmp_path(path);
     {
         let mut file = crate::session::create_private_file(&tmp)?;
@@ -2345,7 +2345,7 @@ fn restore_file(path: &Path, previous: Option<&[u8]>) -> io::Result<()> {
     fs::rename(tmp, path)
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
+pub(crate) fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
     let bytes = fs::read(path)?;
     serde_json::from_slice(&bytes).map_err(|error| {
         io::Error::new(

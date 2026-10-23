@@ -12,6 +12,7 @@ mod models;
 mod screenshot;
 mod session;
 mod speaker;
+mod split;
 mod transcription;
 mod types;
 
@@ -57,6 +58,7 @@ fn main() -> ExitCode {
         cli::Command::Correct(args) => merge::process::run_correct(args),
         cli::Command::Render(args) => merge::process::run_render(args),
         cli::Command::Archive(args) => audio::archive::run(args),
+        cli::Command::Split(args) => split::run(args),
         cli::Command::Speakers(args) => speaker::speakers::run(args),
     };
     match result {

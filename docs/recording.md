@@ -36,6 +36,19 @@ session with a verified 16-bit `audio/*.flac` copy. The manifest keeps
 describing the capture format; readers use whichever file exists and prefer
 the raw one.
 
+`singstone split SESSION --at TIME` cuts a session that has not been processed
+into two new sessions next to it, named after their start times. The tracks
+are cut at the same sample; screenshots and timeline events go to the part
+they fall in, with their times rebased to it (a screenshot entry whose file is
+missing, a symlink, or outside `screenshots/` is left out), and a track that ends before the
+second part starts is left out of that part and marked disabled in its
+manifest. Each part gets a `split-from.json` naming the original folder, its
+title, the cut in milliseconds, and the part number. Only after both parts are
+written in a staging folder, moved into place, and their sample counts checked
+against the original is the original archived; its `split-into.json` lists
+every split made from it. Any failure removes the parts and leaves the
+original as it was.
+
 ## Audio capture
 
 Both streams share one monotonic start time. Each PipeWire callback validates

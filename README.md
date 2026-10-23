@@ -17,13 +17,21 @@ weights download on first use and remain in a persistent per-user cache.
 
 ## Application
 
+Once recording stops, a session opens with a player: both tracks drawn as
+waveforms on one time axis, with the screenshots marked where they were taken.
+Click or drag to scrub, hover to read the time, press Space to play or pause
+and ←/→ to jump 5 seconds; the clock also shows the wall-clock time at the
+playhead. The **Microphone** and **System** buttons mute a track while
+listening. A recording that has not been processed yet can be cut in two, see
+[Split a recording](#split-a-recording).
+
 Browse processed meetings and review speaker-attributed transcripts from the
-session view. Microphone lines sit to the left of a shared timeline and system
-audio lines to the right; speech that overlaps shares a row. Loudspeaker sound
-picked up by the microphone stays visible, dimmed and marked **Echo**, beside
-the remote line it repeats. Confirm individual names so they stay locked across
-reprocessing, use quick speaker shortcuts on anonymous lines, or change a named
-line.
+session view, below the player. Microphone lines sit to the left of a shared
+timeline and system audio lines to the right; speech that overlaps shares a
+row. Loudspeaker sound picked up by the microphone stays visible, dimmed and
+marked **Echo**, beside the remote line it repeats. Confirm individual names so
+they stay locked across reprocessing, use quick speaker shortcuts on anonymous
+lines, or change a named line.
 Use **Hide microphone** or **Hide system** to leave that source out of
 both transcript files without deleting anything. Hiding the microphone is
 useful when you only listened and it recorded nothing but leaked speaker audio.
@@ -134,6 +142,10 @@ a session can be archived with or without it.
 - Names speakers from the transcript: one-click shortcuts for people already
   in the meeting, and line-specific correction when a voice was matched to the
   wrong person. Confirmed lines remain locked across reprocessing.
+- Plays a whole recording from a waveform timeline, with scrubbing and a
+  mute per track.
+- Splits a recording that has not been processed yet into two sessions at a
+  chosen point, keeping the original as an archived backup.
 - Renames sessions and deletes them, after a confirmation, from the session view.
 - Flags a processed session as done, to tell reviewed sessions from those that
   still need attention.
@@ -332,6 +344,46 @@ For command-line processing, `--meeting FILE` validates and copies a
 `meeting.json`-shaped file into the session. The context file is not used on
 the command line, since placing attendees needs a person to answer.
 
+## Split a recording
+
+When one recording holds two meetings, cut it in two before processing. Put
+the playhead where the second meeting starts and press **Split here…**. An
+orange cut line appears, with the two parts tinted and summarized below the
+player: start time, length, and how many screenshots go with each. Drag the
+line, nudge it by a second, or press **Snap to quiet** to move it into the
+nearest stretch where both tracks are near silence; such stretches are faintly
+hatched, and a warning says when the cut falls where someone is talking.
+**Hear the cut** plays from 4 seconds before the line to 4 seconds after it.
+Give each part a title, then **Split…** and confirm.
+
+Splitting writes two new sessions and leaves the original alone until both
+are complete. Both tracks are cut at the same sample; the second part starts
+at the original start time plus the cut, and its folder is named after that
+time. Screenshots, capture timing events, hidden sources and meeting marks go
+with the part they belong to, shifted to its clock, and meeting details are
+copied to both with the titles you chose. A new session's Session panel says
+**Split from** the original and where. Only then is the original archived as
+FLAC and kept in the session list as **Archived**, labelled **Split into** its
+two parts, as a backup in case something is wrong with them. Splitting it
+again, for example after deleting two parts cut at the wrong place, works the
+same way. Old archives are deleted like any other once **Delete old archives**
+is on.
+
+Processed sessions also get the player, but **Split here…** is disabled: the
+transcript and speaker work would not carry over. A session waiting in or
+going through the processing queue cannot be split either.
+
+The same works from a terminal; `--at` takes seconds, `M:SS` or `H:MM:SS`:
+
+```bash
+singstone split ~/Meetings/session-20260914-103000 --at 41:12 \
+  --first-title "Weekly sync" --second-title "Design review"
+```
+
+Without titles, the parts are called after the original, the second with
+" (2)" appended. Splitting checks for enough free disk space first and needs
+the `flac` program to archive the original.
+
 ## Archive audio
 
 Recordings are raw 32-bit float audio, about 230 MB per hour and track.
@@ -343,9 +395,12 @@ singstone archive ~/Meetings/session-20260914-103000
 ```
 
 Archiving is a manual, one-way step. Rounding to 16 bits is the only loss; it
-stays far below microphone noise. The raw file is deleted only after its FLAC
-copy has been written to disk and decoded back to the same samples. Archived
+stays far below microphone noise. The raw files are deleted only after every
+track's FLAC copy has been written to disk and decoded back to the same
+samples; if any track fails, all raw files stay as they were. Archived
 sessions show an **Archived** label and still play, render and reprocess.
+Unprocessed sessions are only archived as the backup of a
+[split](#split-a-recording).
 
 The Snap bundles the `flac` program for this. Outside the Snap, install it
 from your distribution, or point `SINGSTONE_FLAC` at the executable.
@@ -405,7 +460,7 @@ exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the
 downloaded artifacts and final files, then publishes them atomically under
 `$SNAP_USER_COMMON/models`—normally `~/snap/singstone/common/models`.
 
-`devices`, `record`, `render`, `archive`, and `speakers` never start the
+`devices`, `record`, `render`, `archive`, `split`, and `speakers` never start the
 download service.
 `process`, `transcribe`, `diarize`, `recognize`, `correct`, and `dictate` wait for setup
 when they use a missing default Snap model. Interrupted downloads resume on the
@@ -435,10 +490,11 @@ snap logs -n=100 singstone.model-download
 | `correct` | Lock one transcript line to a name, learn it, and print forward proposals |
 | `render` | Build transcripts from persistent intermediate artifacts |
 | `archive` | Convert a processed session's raw audio to 16-bit FLAC |
+| `split` | Cut an unprocessed session into two new sessions, keeping the original as an archived backup |
 | `speakers` | List learned speakers; `speakers tidy --dry-run` shows what tidying would remove and why |
 
 Run `singstone COMMAND --help` for command-specific flags. Use `process` for the
-normal path; use the split processing commands when tuning or debugging one
+normal path; use the individual stage commands when tuning or debugging one
 stage without repeating the others. `process` and `diarize` diarize an enabled
 microphone by default; pass `--diarize-mic=false` to opt out. See
 [Processing stages](docs/processing.md) for correction artifacts and the CLI.

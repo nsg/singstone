@@ -41,30 +41,20 @@ impl Session {
             .recursive(true)
             .mode(0o700)
             .create(parent)?;
-        let mut suffix = 0u64;
-        let dir = loop {
-            let mut candidate = requested.clone();
-            if suffix > 0 {
-                let name = requested.file_name().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "session path has no file name")
-                })?;
-                let mut suffixed = name.to_os_string();
-                suffixed.push(format!("-{suffix}"));
-                candidate.set_file_name(suffixed);
-            }
-            match create_private_dir(&candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    suffix = suffix.checked_add(1).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::AlreadyExists, "too many session collisions")
-                    })?;
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let dir = reserve_dir(&requested)?;
         create_private_dir(&dir.join("audio"))?;
         create_private_dir(&dir.join("screenshots"))?;
         Ok(Self { dir })
+    }
+
+    /// The meeting title when one is set, otherwise a name derived from the folder.
+    pub fn title(&self) -> String {
+        crate::meeting::read_details(&self.meeting_path())
+            .ok()
+            .flatten()
+            .map(|details| details.title)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| default_title(&self.dir))
     }
 
     /// Permanently remove the session directory and everything in it.
@@ -178,6 +168,12 @@ impl Session {
     pub fn meeting_path(&self) -> PathBuf {
         self.dir.join("meeting.json")
     }
+    pub fn split_from_path(&self) -> PathBuf {
+        self.dir.join("split-from.json")
+    }
+    pub fn split_into_path(&self) -> PathBuf {
+        self.dir.join("split-into.json")
+    }
     pub fn echo_detections_path(&self) -> PathBuf {
         self.dir.join("echo-detections.jsonl")
     }
@@ -227,6 +223,98 @@ pub fn session_dir_name(local: &LocalTime) -> String {
         "session-{:04}{:02}{:02}-{:02}{:02}{:02}",
         local.year, local.month, local.day, local.hour, local.minute, local.second
     )
+}
+
+/// Create a new private (0700) directory at `requested`, or at the first free
+/// `requested-N` when that name is taken.
+pub fn reserve_dir(requested: &Path) -> io::Result<PathBuf> {
+    let mut suffix = 0u64;
+    loop {
+        let mut candidate = requested.to_path_buf();
+        if suffix > 0 {
+            let name = requested.file_name().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "session path has no file name")
+            })?;
+            let mut suffixed = name.to_os_string();
+            suffixed.push(format!("-{suffix}"));
+            candidate.set_file_name(suffixed);
+        }
+        match create_private_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                suffix = suffix.checked_add(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::AlreadyExists, "too many session collisions")
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The name a session goes by without a meeting title: `Session 20260914-103000`.
+pub fn default_title(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Session")
+        .replace("session-", "Session ")
+}
+
+/// A local time to the millisecond.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallClock {
+    pub time: LocalTime,
+    pub millis: u32,
+}
+
+impl WallClock {
+    /// RFC 3339, with milliseconds only when there are any.
+    pub fn rfc3339(&self) -> String {
+        let whole = self.time.rfc3339();
+        if self.millis == 0 {
+            return whole;
+        }
+        let (seconds, offset) = whole.split_at(19);
+        format!("{seconds}.{:03}{offset}", self.millis)
+    }
+}
+
+/// The wall-clock time `offset_ms` after an RFC 3339 `started` time, in
+/// `started`'s own UTC offset, to the millisecond.
+pub fn wallclock_after(started: &str, offset_ms: u64) -> Option<WallClock> {
+    let unix = crate::meeting::parse_rfc3339(started).ok()?;
+    let offset_minutes = match started.as_bytes().last()? {
+        b'Z' | b'z' => 0,
+        _ => {
+            let tail = started.get(started.len().checked_sub(6)?..)?;
+            let sign = match tail.as_bytes()[0] {
+                b'+' => 1,
+                b'-' => -1,
+                _ => return None,
+            };
+            let hours: i32 = tail.get(1..3)?.parse().ok()?;
+            let minutes: i32 = tail.get(4..6)?.parse().ok()?;
+            sign * (hours * 60 + minutes)
+        }
+    };
+    let fraction = started
+        .get(19..)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .map(|rest| {
+            rest.bytes()
+                .take_while(u8::is_ascii_digit)
+                .chain(std::iter::repeat(b'0'))
+                .take(3)
+                .fold(0u64, |value, digit| value * 10 + u64::from(digit - b'0'))
+        })
+        .unwrap_or(0);
+    let total_ms = offset_ms.checked_add(fraction)?;
+    let seconds = unix
+        .checked_add(i64::try_from(total_ms / 1000).ok()?)?
+        .checked_add(i64::from(offset_minutes) * 60)?;
+    Some(WallClock {
+        time: broken_down_time(seconds, offset_minutes),
+        millis: (total_ms % 1000) as u32,
+    })
 }
 
 /// Broken-down local time with UTC offset, derived without a time-zone crate.
@@ -454,6 +542,19 @@ mod tests {
         session.set_done(false).expect("clear flag");
         assert!(!session.is_done());
         fs::remove_dir_all(root).expect("remove sessions");
+    }
+
+    #[test]
+    fn wallclock_after_keeps_the_start_offset() {
+        let later = wallclock_after("2026-09-14T23:30:00+02:00", 41 * 60_000 + 12_500)
+            .expect("valid start");
+        assert_eq!(later.rfc3339(), "2026-09-15T00:11:12.500+02:00");
+        assert_eq!(
+            wallclock_after("2026-09-14T10:30:00.75Z", 1_250)
+                .expect("utc start")
+                .rfc3339(),
+            "2026-09-14T10:30:02+00:00"
+        );
     }
 
     #[test]

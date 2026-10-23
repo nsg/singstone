@@ -65,6 +65,12 @@ pub fn archive_session(session: &Session) -> io::Result<ArchiveSummary> {
     archive_tracks(session)
 }
 
+/// Archive the original of a split, which is kept unprocessed as a backup of
+/// the two sessions made from it.
+pub(crate) fn archive_split_backup(session: &Session) -> io::Result<ArchiveSummary> {
+    archive_tracks(session)
+}
+
 /// All or nothing: every raw track is encoded and verified first, and only
 /// then are the copies moved in and the raw files deleted. On failure the raw
 /// tracks are left as they were.
@@ -265,6 +271,90 @@ pub fn decode_each(
         samples.extend(pcm_samples(chunk));
         sink(&samples);
     })
+}
+
+/// Decoded samples of an archived track from `start` to its end, read on
+/// demand. Dropping it stops the decoder.
+pub struct SampleStream {
+    flac: Option<Flac>,
+    stdout: Option<std::process::ChildStdout>,
+    expected: u64,
+    decoded: u64,
+    pcm: Vec<u8>,
+}
+
+pub fn stream(path: &Path, start: u64) -> io::Result<SampleStream> {
+    let stored = sample_count(path)?;
+    if start >= stored {
+        return Ok(SampleStream {
+            flac: None,
+            stdout: None,
+            expected: 0,
+            decoded: 0,
+            pcm: Vec::new(),
+        });
+    }
+    let mut command = flac_command();
+    command
+        .args(RAW_PCM)
+        .args(["--decode", "--stdout"])
+        .arg(format!("--skip={start}"));
+    let mut flac = spawn(
+        command
+            .arg(std::path::absolute(path)?)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped()),
+    )?;
+    let stdout = flac.child.stdout.take();
+    Ok(SampleStream {
+        flac: Some(flac),
+        stdout,
+        expected: stored - start,
+        decoded: 0,
+        pcm: Vec::new(),
+    })
+}
+
+impl SampleStream {
+    /// Replace `out` with up to `max` next samples; empty at the end.
+    pub fn read(&mut self, out: &mut Vec<f32>, max: usize) -> io::Result<()> {
+        out.clear();
+        let wanted = (max as u64).min(self.expected - self.decoded) as usize;
+        if wanted == 0 {
+            if let Some(flac) = self.flac.take() {
+                flac.finish()?;
+            }
+            return Ok(());
+        }
+        self.pcm.resize(wanted * 2, 0);
+        let stdout = self.stdout.as_mut().expect("piped flac output");
+        let filled = read_full(stdout, &mut self.pcm)?;
+        if filled < self.pcm.len() {
+            let failure = self.flac.take().map(Flac::finish).transpose().err();
+            return Err(failure.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "archived audio decoded to {} of {} samples",
+                        self.decoded + filled as u64 / 2,
+                        self.expected
+                    ),
+                )
+            }));
+        }
+        out.extend(pcm_samples(&self.pcm));
+        self.decoded += wanted as u64;
+        Ok(())
+    }
+}
+
+impl Drop for SampleStream {
+    fn drop(&mut self) {
+        if let Some(mut flac) = self.flac.take() {
+            let _ = flac.child.kill();
+            let _ = flac.child.wait();
+        }
+    }
 }
 
 pub fn format_size(bytes: u64) -> String {
@@ -601,6 +691,16 @@ mod tests {
             expected[100..17_000]
         );
         assert_eq!(sample_count(&archived).expect("count"), 40_000);
+        let mut tail = Vec::new();
+        let mut from = stream(&archived, 39_990).expect("stream the tail");
+        from.read(&mut tail, 100).expect("read the tail");
+        assert_eq!(tail, expected[39_990..]);
+        from.read(&mut tail, 100).expect("read the end");
+        assert!(tail.is_empty());
+        stream(&archived, 40_000)
+            .and_then(|mut past_end| past_end.read(&mut tail, 100))
+            .expect("stream from the end");
+        assert!(tail.is_empty());
 
         let metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(session.words_metadata_path()).expect("metadata"))

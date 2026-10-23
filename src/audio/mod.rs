@@ -7,4 +7,5 @@ pub mod dictate;
 pub mod pipewire;
 pub mod record;
 pub mod timing;
+pub mod track;
 pub mod writer;

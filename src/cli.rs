@@ -45,6 +45,9 @@ pub enum Command {
     Render(RenderArgs),
     /// Convert a processed session's raw audio to 16-bit FLAC to save disk space.
     Archive(ArchiveArgs),
+    /// Cut an unprocessed recording into two new sessions; the original is
+    /// kept as an archived backup.
+    Split(SplitArgs),
     /// List learned speakers, or tidy their voice samples.
     Speakers(SpeakersArgs),
 }
@@ -392,6 +395,21 @@ pub struct RenderArgs {
 pub struct ArchiveArgs {
     /// Session directory.
     pub session: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub struct SplitArgs {
+    /// Session directory.
+    pub session: PathBuf,
+    /// Where to cut: seconds, M:SS or H:MM:SS into the recording.
+    #[arg(long)]
+    pub at: String,
+    /// Title of the part before the cut (default: the session's title).
+    #[arg(long)]
+    pub first_title: Option<String>,
+    /// Title of the part after the cut (default: the session's title with " (2)").
+    #[arg(long)]
+    pub second_title: Option<String>,
 }
 
 #[derive(Args, Debug)]

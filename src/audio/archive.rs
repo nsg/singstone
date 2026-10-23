@@ -55,58 +55,132 @@ pub fn run(args: ArchiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Replace each raw track of a processed session with a verified FLAC copy.
-/// The raw file is deleted only after its copy decodes to the same samples.
 pub fn archive_session(session: &Session) -> io::Result<ArchiveSummary> {
-    if session.read_manifest()?.state == SessionState::Recording {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the session is still being recorded",
-        ));
-    }
     if !session.transcript_path().is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "process the session before archiving its audio",
         ));
     }
-    let mut summary = ArchiveSummary::default();
-    for source in [AudioSource::Mic, AudioSource::System] {
-        let raw = session.audio_path(source);
-        if !raw.is_file() {
-            continue;
-        }
-        let archived = session.archived_audio_path(source);
-        let temporary = jsonl::tmp_path(&archived);
-        if let Err(error) = encode_verified(&raw, &temporary) {
-            let _ = fs::remove_file(&temporary);
-            return Err(io::Error::new(
-                error.kind(),
-                format!("cannot archive {source} audio: {error}"),
-            ));
-        }
-        let raw_sha256 = models::sha256_file(&raw)?;
-        summary.bytes_before += fs::metadata(&raw)?.len();
-        summary.bytes_after += fs::metadata(&temporary)?.len();
-        fs::rename(&temporary, &archived)?;
-        if let Some(directory) = archived.parent() {
-            File::open(directory)?.sync_all()?;
-        }
-        process::rebase_audio_provenance(
-            session,
-            source,
-            &raw_sha256,
-            &models::sha256_file(&archived)?,
-        );
-        fs::remove_file(&raw)?;
-        summary.tracks.push(source);
-    }
-    if summary.tracks.is_empty() && !session.is_archived() {
+    archive_tracks(session)
+}
+
+/// All or nothing: every raw track is encoded and verified first, and only
+/// then are the copies moved in and the raw files deleted. On failure the raw
+/// tracks are left as they were.
+fn archive_tracks(session: &Session) -> io::Result<ArchiveSummary> {
+    if session.read_manifest()?.state == SessionState::Recording {
         return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "the session has no recorded audio",
+            io::ErrorKind::InvalidInput,
+            "the session is still being recorded",
         ));
     }
+    let tracks = [AudioSource::Mic, AudioSource::System]
+        .into_iter()
+        .filter(|source| session.audio_path(*source).is_file())
+        .map(|source| {
+            let archived = session.archived_audio_path(source);
+            (source, jsonl::tmp_path(&archived), archived)
+        })
+        .collect::<Vec<_>>();
+    if tracks.is_empty() {
+        return if session.is_archived() {
+            Ok(ArchiveSummary::default())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "the session has no recorded audio",
+            ))
+        };
+    }
+    let remove_temporaries = || {
+        for (_, temporary, _) in &tracks {
+            let _ = fs::remove_file(temporary);
+        }
+    };
+    let mut summary = ArchiveSummary::default();
+    let mut hashes = Vec::new();
+    for (source, temporary, _) in &tracks {
+        let raw = session.audio_path(*source);
+        let encoded = encode_verified(&raw, temporary)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("cannot archive {source} audio: {error}"),
+                )
+            })
+            .and_then(|()| {
+                summary.bytes_before += fs::metadata(&raw)?.len();
+                summary.bytes_after += fs::metadata(temporary)?.len();
+                Ok((models::sha256_file(&raw)?, models::sha256_file(temporary)?))
+            });
+        match encoded {
+            Ok(hash) => hashes.push(hash),
+            Err(error) => {
+                remove_temporaries();
+                return Err(error);
+            }
+        }
+    }
+    // Until the audio folder is synced with the copies in place, every step
+    // can be undone: the raw tracks are only renamed aside.
+    let raws = tracks
+        .iter()
+        .map(|(source, _, _)| session.audio_path(*source))
+        .collect::<Vec<_>>();
+    let mut set_aside = 0;
+    let mut installed = 0;
+    let committed = (|| {
+        for raw in &raws {
+            fs::rename(raw, backup_path(raw))?;
+            set_aside += 1;
+        }
+        for (source, temporary, archived) in &tracks {
+            fs::rename(temporary, archived).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot archive {source} audio: {}: {error}",
+                        archived.display()
+                    ),
+                )
+            })?;
+            installed += 1;
+        }
+        File::open(session.dir.join("audio"))?.sync_all()
+    })();
+    if let Err(error) = committed {
+        for (_, _, archived) in tracks[..installed].iter().rev() {
+            let _ = fs::remove_file(archived);
+        }
+        for raw in raws[..set_aside].iter().rev() {
+            let _ = fs::rename(backup_path(raw), raw);
+        }
+        remove_temporaries();
+        return Err(error);
+    }
+    for ((source, _, _), (raw_sha256, archived_sha256)) in tracks.iter().zip(hashes) {
+        process::rebase_audio_provenance(session, *source, &raw_sha256, &archived_sha256);
+        summary.tracks.push(*source);
+    }
+    for raw in &raws {
+        let backup = backup_path(raw);
+        if let Err(error) = fs::remove_file(&backup) {
+            eprintln!(
+                "warning: could not remove {} after archiving: {error}",
+                backup.display()
+            );
+        }
+    }
     Ok(summary)
+}
+
+/// Where a raw track waits while its archived copy is moved in. Nothing reads
+/// it: a leftover one only takes space until the session is deleted.
+fn backup_path(raw: &Path) -> PathBuf {
+    let mut path = raw.as_os_str().to_owned();
+    path.push(".bak");
+    path.into()
 }
 
 /// Session folders under `root` whose audio was archived longer than `keep`
@@ -581,6 +655,32 @@ mod tests {
         fs::remove_file(session.transcript_path()).expect("remove transcript");
         assert!(archive_session(&session).is_err());
         assert!(session.audio_path(AudioSource::Mic).is_file());
+        assert!(!session.archived_audio_path(AudioSource::Mic).exists());
+        remove(session);
+    }
+
+    #[test]
+    fn a_failing_track_leaves_every_raw_track_in_place() {
+        let session = processed_session("partial", &speech_like(1_000));
+        fs::write(
+            session.audio_path(AudioSource::System),
+            speech_like(1_000)
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .expect("write system audio");
+        let raw = |source| fs::read(session.audio_path(source)).expect("raw audio");
+        let before = [raw(AudioSource::Mic), raw(AudioSource::System)];
+        // Fails installing the system copy, after both raw tracks were set
+        // aside and the microphone copy was moved in.
+        fs::create_dir(session.archived_audio_path(AudioSource::System)).expect("block system");
+        assert!(archive_session(&session).is_err());
+        assert_eq!([raw(AudioSource::Mic), raw(AudioSource::System)], before);
+        for source in [AudioSource::Mic, AudioSource::System] {
+            assert!(!jsonl::tmp_path(&session.archived_audio_path(source)).exists());
+            assert!(!backup_path(&session.audio_path(source)).exists());
+        }
         assert!(!session.archived_audio_path(AudioSource::Mic).exists());
         remove(session);
     }

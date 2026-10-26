@@ -12,16 +12,17 @@ use crate::models;
 use crate::session::Session;
 use crate::speaker::database::{
     self, EmbeddingModelIdentity, SAME_VECTOR_SIMILARITY, Sample, SpeakerDatabase,
+    canonical_name_key,
 };
 use crate::speaker::embedding::{self, ClusterCandidate, EmbeddingExtractor};
 use crate::speaker::tidy;
 use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
-    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, HiddenSources, Manifest, MeetingSpan,
-    MeetingSpanFile, SAMPLE_RATE, SessionState, SpeakerAssignment, SpeakerAssignmentProvenance,
-    SpeakerAssignments, SpeakerCorrection, SpeakerCorrections, SpeakerSegment, TimedWord,
-    Utterance,
+    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, HIDDEN_SOURCES_FORMAT_VERSION,
+    HiddenSources, KeptRange, Manifest, MeetingSpan, MeetingSpanFile, SAMPLE_RATE, SessionState,
+    SpeakerAssignment, SpeakerAssignmentProvenance, SpeakerAssignments, SpeakerCorrection,
+    SpeakerCorrections, SpeakerSegment, TimedWord, Utterance,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -35,7 +36,6 @@ const SPEAKER_ASSIGNMENTS_FORMAT_VERSION: u32 = 1;
 const STAGE_METADATA_FORMAT_VERSION: u32 = 1;
 const EMBEDDINGS_FORMAT_VERSION: u32 = 1;
 const SPEAKER_CORRECTIONS_FORMAT_VERSION: u32 = 1;
-const HIDDEN_SOURCES_FORMAT_VERSION: u32 = 1;
 pub(crate) const MEETING_SPAN_FORMAT_VERSION: u32 = 1;
 const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
@@ -514,6 +514,7 @@ fn write_render_input_and_render(
     let paths = [
         path.to_owned(),
         session.outside_meeting_path(),
+        session.hidden_lines_path(),
         session.transcript_path(),
         session.transcript_text_path(),
     ];
@@ -547,18 +548,152 @@ fn write_render_input_and_render(
     Ok(())
 }
 
+/// Hides these sources and no others; what they keep stays on file.
 pub fn set_hidden_sources(
     session: &Path,
     hidden: &[AudioSource],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let session = Session::open(session.to_owned())?;
-    let artifact = HiddenSources {
-        format_version: HIDDEN_SOURCES_FORMAT_VERSION,
-        hidden: normalize_hidden_sources(hidden),
-    };
+    let hidden = hidden.to_vec();
+    update_hidden_sources(session, |artifact, _| artifact.hidden = hidden)
+}
+
+impl HiddenSources {
+    /// The kept speaker names, the local speaker's first, one per spelling;
+    /// each one is a single chip whose ✕ drops every rule for that name.
+    pub fn kept_speakers(&self, local_speaker: &str) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        let local = self
+            .keep_local_speaker
+            .then(|| local_speaker.trim().to_owned());
+        for name in local.into_iter().chain(self.keep_speakers.iter().cloned()) {
+            let key = canonical_name_key(&name);
+            if !key.is_empty() && !names.iter().any(|kept| canonical_name_key(kept) == key) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// Whether a speaker rule keeps this line of a hidden source. Echo is
+    /// leaked remote sound whatever its name, so no speaker rule keeps it.
+    /// The local speaker's rule needs a voice that was told apart: a
+    /// diarized line or one named by hand, not the name every microphone line
+    /// gets when microphone diarization is off.
+    pub fn keeps_speaker_of(&self, local_speaker: &str, line: &Utterance) -> bool {
+        if !self.hidden.contains(&line.source) || line.echo {
+            return false;
+        }
+        let key = canonical_name_key(&line.speaker);
+        let identified = line.speaker_id != "local" || line.locked;
+        (self.keep_local_speaker
+            && identified
+            && !key.is_empty()
+            && key == canonical_name_key(local_speaker))
+            || self
+                .keep_speakers
+                .iter()
+                .any(|name| canonical_name_key(name) == key)
+    }
+}
+
+/// A change to the lines a hidden source keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepChange {
+    Line(KeptRange),
+    HideLine(KeptRange),
+    Speaker(String),
+    HideSpeaker(String),
+}
+
+impl KeepChange {
+    fn apply(self, artifact: &mut HiddenSources, local_speaker: &str) {
+        let is_local = |name: &str| {
+            let key = canonical_name_key(name);
+            !key.is_empty() && key == canonical_name_key(local_speaker)
+        };
+        match self {
+            KeepChange::Line(range) => artifact.keep.push(range),
+            KeepChange::HideLine(line) => {
+                artifact.keep = std::mem::take(&mut artifact.keep)
+                    .into_iter()
+                    .flat_map(|range| subtract_range(range, line))
+                    .collect();
+            }
+            // A name chosen by hand keeps by name, the local speaker's too.
+            KeepChange::Speaker(name) => artifact.keep_speakers.push(name),
+            KeepChange::HideSpeaker(name) => {
+                let key = canonical_name_key(&name);
+                if is_local(&name) {
+                    artifact.keep_local_speaker = false;
+                }
+                artifact
+                    .keep_speakers
+                    .retain(|kept| canonical_name_key(kept) != key);
+            }
+        }
+    }
+}
+
+/// What is left of `range` once `line` no longer counts as kept.
+fn subtract_range(range: KeptRange, line: KeptRange) -> Vec<KeptRange> {
+    if range.source != line.source || line.end_ms < range.start_ms || range.end_ms < line.start_ms {
+        return vec![range];
+    }
+    let mut left = Vec::new();
+    if let Some(end_ms) = line.start_ms.checked_sub(1)
+        && range.start_ms <= end_ms
+    {
+        left.push(KeptRange { end_ms, ..range });
+    }
+    if line.end_ms < range.end_ms {
+        left.push(KeptRange {
+            start_ms: line.end_ms + 1,
+            ..range
+        });
+    }
+    left
+}
+
+pub fn change_kept_lines(
+    session: &Path,
+    change: KeepChange,
+) -> Result<(), Box<dyn std::error::Error>> {
+    update_hidden_sources(session, |artifact, local_speaker| {
+        change.apply(artifact, local_speaker)
+    })
+}
+
+/// Renders again with the same selection, upgraded to the current format;
+/// sessions rendered before `hidden-lines.jsonl` existed lack it.
+pub fn render_hidden_lines(session: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    update_hidden_sources(session, |_, _| {})
+}
+
+fn update_hidden_sources(
+    session: &Path,
+    change: impl FnOnce(&mut HiddenSources, &str),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (session, manifest) = open_session(session)?;
+    let mut artifact = read_hidden_sources(&session)?;
+    change(&mut artifact, &manifest.local_speaker);
+    if let Some(range) = artifact
+        .keep
+        .iter()
+        .find(|range| range.start_ms > range.end_ms)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "a kept range must not end before it starts: {} to {} ms",
+                range.start_ms, range.end_ms
+            ),
+        )
+        .into());
+    }
+    let artifact = normalize_hidden_sources(artifact);
     let path = session.hidden_sources_path();
     write_render_input_and_render(&session, &path, |path| {
-        if artifact.hidden.is_empty() {
+        if artifact.is_default() {
             remove_if_present(path)
         } else {
             write_json_atomic(path, &artifact)
@@ -603,11 +738,7 @@ fn correct_speaker_resolved(
     let session = Session::open(args.session.clone())?;
     let segments: Vec<SpeakerSegment> =
         read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
-    let prior_utterances = match read_jsonl_artifact(&session.transcript_path(), "transcript") {
-        Ok(utterances) => utterances,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
+    let prior_utterances = read_correctable_lines(&session)?;
     let proposal_cluster = cluster_for_request(&request, &prior_utterances, &segments);
     let learning_configured = args.embedding_model.is_some();
     let database_path = args
@@ -653,11 +784,7 @@ fn apply_corrections_inner(
     let segments: Vec<SpeakerSegment> =
         read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
     let recognized = read_speaker_assignments(&session)?;
-    let prior_utterances = match read_jsonl_artifact(&session.transcript_path(), "transcript") {
-        Ok(utterances) => utterances,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
+    let prior_utterances = read_correctable_lines(&session)?;
     let mut corrections = read_speaker_corrections(&session)?;
     let span = read_meeting_span(&session)?;
     let database_path = args
@@ -850,32 +977,87 @@ fn read_speaker_corrections(session: &Session) -> io::Result<SpeakerCorrections>
     Ok(artifact)
 }
 
-/// The sources left out of the transcript; none when the session has no file.
-pub fn read_hidden_sources(session: &Session) -> io::Result<Vec<AudioSource>> {
+/// The sources left out of the transcript and what they keep; nothing hidden
+/// when the session has no file. Version 1 hid whole sources, so it reads as
+/// keeping nothing.
+pub fn read_hidden_sources(session: &Session) -> io::Result<HiddenSources> {
     let path = session.hidden_sources_path();
-    let artifact: HiddenSources = match read_json(&path) {
+    let mut artifact: HiddenSources = match read_json(&path) {
         Ok(artifact) => artifact,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(HiddenSources::default());
+        }
         Err(error) => return Err(error),
     };
-    if artifact.format_version != HIDDEN_SOURCES_FORMAT_VERSION {
+    match artifact.format_version {
+        1 => {
+            artifact.keep_local_speaker = false;
+            artifact.keep_speakers.clear();
+            artifact.keep.clear();
+        }
+        HIDDEN_SOURCES_FORMAT_VERSION => {}
+        version => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported hidden sources format version {version} in {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if artifact
+        .keep
+        .iter()
+        .any(|range| range.start_ms > range.end_ms)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "unsupported hidden sources format version {} in {}",
-                artifact.format_version,
-                path.display()
-            ),
+            format!("a kept range ends before it starts in {}", path.display()),
         ));
     }
-    Ok(normalize_hidden_sources(&artifact.hidden))
+    Ok(normalize_hidden_sources(artifact))
 }
 
-fn normalize_hidden_sources(hidden: &[AudioSource]) -> Vec<AudioSource> {
-    [AudioSource::Mic, AudioSource::System]
+/// Sorts the sources and ranges, merges overlapping ranges and drops blank or
+/// repeated speaker names.
+pub(crate) fn normalize_hidden_sources(artifact: HiddenSources) -> HiddenSources {
+    let hidden = [AudioSource::Mic, AudioSource::System]
         .into_iter()
-        .filter(|source| hidden.contains(source))
-        .collect()
+        .filter(|source| artifact.hidden.contains(source))
+        .collect();
+    let mut keep_speakers: Vec<String> = Vec::new();
+    for name in &artifact.keep_speakers {
+        let key = canonical_name_key(name);
+        if !key.is_empty()
+            && !keep_speakers
+                .iter()
+                .any(|kept| canonical_name_key(kept) == key)
+        {
+            keep_speakers.push(name.trim().to_owned());
+        }
+    }
+    let mut ranges = artifact.keep;
+    ranges.sort_by_key(|range| (source_order(range.source), range.start_ms, range.end_ms));
+    let mut keep: Vec<KeptRange> = Vec::new();
+    for range in ranges {
+        match keep.last_mut() {
+            Some(last)
+                if last.source == range.source
+                    && range.start_ms <= last.end_ms.saturating_add(1) =>
+            {
+                last.end_ms = last.end_ms.max(range.end_ms);
+            }
+            _ => keep.push(range),
+        }
+    }
+    HiddenSources {
+        format_version: HIDDEN_SOURCES_FORMAT_VERSION,
+        hidden,
+        keep_local_speaker: artifact.keep_local_speaker,
+        keep_speakers,
+        keep,
+    }
 }
 
 /// The marked meeting; the whole recording when the session has no file.
@@ -910,7 +1092,28 @@ pub fn read_meeting_span(session: &Session) -> io::Result<MeetingSpan> {
 
 /// The rendered lines that the meeting span leaves out of the transcript.
 pub fn read_outside_meeting(session: &Session) -> io::Result<Vec<Utterance>> {
-    match jsonl::read_all(&session.outside_meeting_path()) {
+    read_optional_lines(&session.outside_meeting_path())
+}
+
+/// The rendered lines of hidden sources that nothing keeps.
+pub fn read_hidden_lines(session: &Session) -> io::Result<Vec<Utterance>> {
+    read_optional_lines(&session.hidden_lines_path())
+}
+
+/// The transcript and the lines of hidden sources, which can be named too so
+/// that a speaker rule can keep them.
+fn read_correctable_lines(session: &Session) -> io::Result<Vec<Utterance>> {
+    let mut lines = match read_jsonl_artifact(&session.transcript_path(), "transcript") {
+        Ok(lines) => lines,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    lines.extend(read_hidden_lines(session)?);
+    Ok(lines)
+}
+
+fn read_optional_lines(path: &Path) -> io::Result<Vec<Utterance>> {
+    match jsonl::read_all(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         result => result,
     }
@@ -1045,7 +1248,7 @@ fn build_proposals(
     database: &SpeakerDatabase,
     threshold: f32,
 ) -> Result<Vec<Proposal>, Box<dyn std::error::Error>> {
-    let utterances: Vec<Utterance> = read_jsonl_artifact(&session.transcript_path(), "transcript")?;
+    let utterances = read_correctable_lines(session)?;
     let mut proposals = utterances
         .into_iter()
         .filter_map(|utterance| {
@@ -1934,22 +2137,41 @@ fn render_artifacts_with_segments_and_hook(
         }
     };
     let detection = leakage::detect_leaked_mic_words(&words, audio.as_ref());
-    let all_utterances = utterances::build_utterances(
+    let kept_ranges = hidden
+        .keep
+        .iter()
+        .copied()
+        .filter(|range| hidden.hidden.contains(&range.source))
+        .collect::<Vec<_>>();
+    let all_utterances = utterances::build_kept_utterances(
         &words,
         &detection.echo,
         &segments,
         &recognized,
         &corrections.corrections,
+        &kept_ranges,
         &manifest.local_speaker,
         diarize_mic,
         DEFAULT_NEAREST_TOLERANCE_MS,
     );
-    let all_utterance_count = all_utterances.len();
-    let (utterances, outside): (Vec<_>, Vec<_>) = all_utterances
+    let (shown, hidden_lines): (Vec<_>, Vec<_>) =
+        all_utterances.into_iter().partition(|(utterance, kept)| {
+            !hidden.hidden.contains(&utterance.source)
+                || *kept
+                || hidden.keeps_speaker_of(&manifest.local_speaker, utterance)
+        });
+    let kept_utterances = shown
+        .iter()
+        .filter(|(utterance, _)| hidden.hidden.contains(&utterance.source))
+        .count();
+    let hidden_lines = hidden_lines
         .into_iter()
-        .filter(|utterance| !hidden.contains(&utterance.source))
+        .map(|(utterance, _)| utterance)
+        .collect::<Vec<_>>();
+    let (utterances, outside): (Vec<_>, Vec<_>) = shown
+        .into_iter()
+        .map(|(utterance, _)| utterance)
         .partition(|utterance| span.contains(utterance.start_ms));
-    let hidden_utterances = all_utterance_count - utterances.len() - outside.len();
     before_write();
     jsonl::write_all_atomic(&session.echo_detections_path(), &detection.detections)?;
     match fs::remove_file(session.dir.join("leakage-suppressions.jsonl")) {
@@ -1962,19 +2184,28 @@ fn render_artifacts_with_segments_and_hook(
     } else {
         jsonl::write_all_atomic(&session.outside_meeting_path(), &outside)?;
     }
+    if hidden.hidden.is_empty() {
+        remove_if_present(&session.hidden_lines_path())?;
+    } else {
+        jsonl::write_all_atomic(&session.hidden_lines_path(), &hidden_lines)?;
+    }
     jsonl::write_all_atomic(&session.transcript_path(), &utterances)?;
     write_transcript_text(&session.transcript_text_path(), &utterances)?;
     let echo_words = detection.echo.iter().filter(|&&echo| echo).count();
     let echo_utterances = utterances.iter().filter(|utterance| utterance.echo).count();
-    let hidden_summary = if hidden.is_empty() {
+    let hidden_summary = if hidden.hidden.is_empty() {
         String::new()
     } else {
         let sources = hidden
+            .hidden
             .iter()
             .map(|source| source.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        format!(", hid {hidden_utterances} utterance(s) of hidden sources ({sources})")
+        format!(
+            ", hid {} utterance(s) of hidden sources ({sources}) and kept {kept_utterances}",
+            hidden_lines.len()
+        )
     };
     let outside_summary = if span.is_whole() {
         String::new()
@@ -4517,14 +4748,18 @@ mod tests {
             .into_iter()
             .filter(|utterance| utterance.source == AudioSource::System)
             .collect::<Vec<_>>();
-        write_json_atomic(
-            &session.hidden_sources_path(),
-            &HiddenSources {
-                format_version: HIDDEN_SOURCES_FORMAT_VERSION,
-                hidden: vec![AudioSource::Mic],
-            },
+        // Version 1 hid whole sources, so it keeps nothing, not even the
+        // local speaker's lines.
+        fs::write(
+            session.hidden_sources_path(),
+            br#"{"format_version":1,"hidden":["mic"]}"#,
         )
-        .expect("write hidden sources");
+        .expect("write version 1 hidden sources");
+        assert!(
+            !read_hidden_sources(&session)
+                .expect("read version 1")
+                .keep_local_speaker
+        );
 
         run_render(RenderArgs {
             session: session.dir.clone(),
@@ -4612,6 +4847,406 @@ mod tests {
                 "unsupported hidden sources format version 999 in {}",
                 path.display()
             )
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// Mic diarization is off, so every mic line is "Me" with speaker ID
+    /// `local`: "yes", an echo of the system line, and "hello there"; a
+    /// correction names "anna says" Anna.
+    fn keep_fixture(label: &str) -> (PathBuf, Session) {
+        let (root, session) = hidden_sources_fixture(label);
+        let word = |source, start_ms: u64, text: &str| TimedWord {
+            source,
+            start_ms,
+            end_ms: start_ms + 300,
+            text: text.into(),
+        };
+        let mut words = vec![word(AudioSource::Mic, 670, "yes")];
+        for (index, text) in ["we", "should", "release", "Friday"].iter().enumerate() {
+            let at = index as u64 * 350;
+            words.push(word(AudioSource::System, 1_000 + at, text));
+            words.push(word(AudioSource::Mic, 1_120 + at, text));
+        }
+        words.extend([
+            word(AudioSource::Mic, 5_000, "hello"),
+            word(AudioSource::Mic, 5_400, "there"),
+            word(AudioSource::Mic, 8_000, "anna"),
+            word(AudioSource::Mic, 8_400, "says"),
+        ]);
+        jsonl::write_all_atomic(&session.words_path(), &words).expect("write words");
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 900,
+                end_ms: 2_500,
+                cluster: 0,
+            }],
+        )
+        .expect("write diarization");
+        write_corrections(&session, &[(AudioSource::Mic, 8_000, 8_700, "Anna")]);
+        (root, session)
+    }
+
+    fn write_corrections(session: &Session, ranges: &[(AudioSource, u64, u64, &str)]) {
+        write_json_atomic(
+            &session.speaker_corrections_path(),
+            &SpeakerCorrections {
+                format_version: SPEAKER_CORRECTIONS_FORMAT_VERSION,
+                corrections: ranges
+                    .iter()
+                    .map(|&(source, start_ms, end_ms, speaker)| SpeakerCorrection {
+                        source,
+                        start_ms,
+                        end_ms,
+                        speaker: speaker.into(),
+                        inferred: false,
+                    })
+                    .collect(),
+            },
+        )
+        .expect("write corrections");
+    }
+
+    fn line_texts(path: &Path) -> Vec<String> {
+        jsonl::read_all::<Utterance>(path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|utterance| format!("{}: {}", utterance.speaker, utterance.text))
+            .collect()
+    }
+
+    #[test]
+    fn speaker_rules_keep_named_mic_lines_but_never_echo() {
+        let (root, session) = keep_fixture("keep-speakers");
+        // Naming the echo does not make it the speaker's own voice.
+        write_corrections(
+            &session,
+            &[
+                (AudioSource::Mic, 1_100, 2_600, "Craig"),
+                (AudioSource::Mic, 8_000, 8_700, "Anna"),
+            ],
+        );
+        set_hidden_sources(&session.dir, &[AudioSource::Mic]).expect("hide microphone");
+        for name in [" anna ", "Craig"] {
+            change_kept_lines(&session.dir, KeepChange::Speaker(name.into())).expect("keep");
+        }
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["SPEAKER_00: we should release Friday", "Anna: anna says"]
+        );
+        assert_eq!(
+            line_texts(&session.hidden_lines_path()),
+            [
+                "Me: yes",
+                "Craig: we should release Friday",
+                "Me: hello there"
+            ]
+        );
+        assert_eq!(
+            read_hidden_sources(&session)
+                .expect("read rules")
+                .keep_speakers,
+            ["anna", "Craig"]
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn local_speaker_rule_needs_a_voice_told_apart() {
+        let (root, session) = keep_fixture("keep-local-speaker");
+        set_hidden_sources(&session.dir, &[AudioSource::Mic]).expect("hide microphone");
+        // With microphone diarization off every line is "Me" by default, and
+        // none of them is kept for it.
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["SPEAKER_00: we should release Friday"]
+        );
+
+        // A line named by hand is the user's own voice.
+        write_corrections(
+            &session,
+            &[
+                (AudioSource::Mic, 8_000, 8_700, "Anna"),
+                (AudioSource::Mic, 5_000, 5_700, "me"),
+            ],
+        );
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect("render the named line");
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["SPEAKER_00: we should release Friday", "me: hello there"]
+        );
+
+        let rules = read_hidden_sources(&session).expect("read rules");
+        let line = |speaker_id: &str, echo| Utterance {
+            start_ms: 0,
+            end_ms: 100,
+            source: AudioSource::Mic,
+            speaker_id: speaker_id.into(),
+            speaker: "Me".into(),
+            text: "hi".into(),
+            locked: false,
+            echo,
+        };
+        assert!(rules.keeps_speaker_of("Me", &line("mic_2", false)));
+        assert!(!rules.keeps_speaker_of("Me", &line("mic_2", true)));
+        assert!(!rules.keeps_speaker_of("Me", &line("local", false)));
+        let named = HiddenSources {
+            keep_speakers: vec!["me".into()],
+            ..rules
+        };
+        assert!(named.keeps_speaker_of("Me", &line("local", false)));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn keeping_the_local_speaker_by_hand_keeps_by_name() {
+        let (root, session) = keep_fixture("keep-local-by-hand");
+        set_hidden_sources(&session.dir, &[AudioSource::Mic]).expect("hide microphone");
+        // Diarization is off, so the automatic rule keeps none of these lines,
+        // but choosing the name does.
+        change_kept_lines(&session.dir, KeepChange::Speaker("Me".into())).expect("keep Me");
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            [
+                "Me: yes",
+                "SPEAKER_00: we should release Friday",
+                "Me: hello there"
+            ]
+        );
+
+        change_kept_lines(&session.dir, KeepChange::HideSpeaker("me".into()))
+            .expect("stop keeping Me");
+        let rules = read_hidden_sources(&session).expect("read rules");
+        assert!(rules.keep_speakers.is_empty());
+        assert!(!rules.keep_local_speaker);
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["SPEAKER_00: we should release Friday"]
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn rendering_hidden_lines_keeps_a_version_1_selection() {
+        let (root, session) = keep_fixture("keep-version-1");
+        fs::write(
+            session.hidden_sources_path(),
+            br#"{"format_version":1,"hidden":["mic"]}"#,
+        )
+        .expect("write version 1 hidden sources");
+        // A correction names a line "Me", which version 2 would keep by default.
+        write_corrections(&session, &[(AudioSource::Mic, 5_000, 5_700, "Me")]);
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect("render");
+        let transcript = fs::read(session.transcript_path()).expect("read transcript");
+        fs::remove_file(session.hidden_lines_path()).expect("drop the sidecar");
+
+        render_hidden_lines(&session.dir).expect("render hidden lines");
+
+        assert_eq!(line_texts(&session.hidden_lines_path()).len(), 4);
+        assert_eq!(
+            fs::read(session.transcript_path()).expect("reread transcript"),
+            transcript
+        );
+        let rules = read_hidden_sources(&session).expect("read rules");
+        assert_eq!(rules.format_version, HIDDEN_SOURCES_FORMAT_VERSION);
+        assert!(!rules.keep_local_speaker);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn kept_ranges_follow_words_when_lines_regroup() {
+        let (root, session) = keep_fixture("keep-ranges");
+        set_hidden_sources(&session.dir, &[AudioSource::Mic]).expect("hide microphone");
+        let hello = KeptRange {
+            source: AudioSource::Mic,
+            start_ms: 5_000,
+            end_ms: 5_300,
+        };
+        change_kept_lines(&session.dir, KeepChange::Line(hello)).expect("keep hello");
+        // The kept word leaves its old line.
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["SPEAKER_00: we should release Friday", "Me: hello"]
+        );
+        assert!(line_texts(&session.hidden_lines_path()).contains(&"Me: there".to_owned()));
+
+        // A correction that renames part of a kept range regroups it, and
+        // both parts stay kept.
+        change_kept_lines(
+            &session.dir,
+            KeepChange::Line(KeptRange {
+                end_ms: 5_700,
+                ..hello
+            }),
+        )
+        .expect("keep hello there");
+        write_corrections(
+            &session,
+            &[
+                (AudioSource::Mic, 8_000, 8_700, "Anna"),
+                (AudioSource::Mic, 5_400, 5_700, "Bob"),
+            ],
+        );
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect("render regrouped lines");
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            [
+                "SPEAKER_00: we should release Friday",
+                "Me: hello",
+                "Bob: there"
+            ]
+        );
+
+        change_kept_lines(&session.dir, KeepChange::HideLine(hello)).expect("hide hello");
+        assert_eq!(
+            read_hidden_sources(&session).expect("read rules").keep,
+            [KeptRange {
+                start_ms: 5_301,
+                end_ms: 5_700,
+                ..hello
+            }]
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn kept_lines_outside_the_meeting_stay_out_of_the_transcript() {
+        let (root, session) = keep_fixture("keep-outside-meeting");
+        set_hidden_sources(&session.dir, &[AudioSource::Mic]).expect("hide microphone");
+        change_kept_lines(
+            &session.dir,
+            KeepChange::Line(KeptRange {
+                source: AudioSource::Mic,
+                start_ms: 670,
+                end_ms: 970,
+            }),
+        )
+        .expect("keep yes");
+        set_meeting_span(
+            &session.dir,
+            MeetingSpan {
+                start_ms: Some(1_000),
+                end_ms: Some(5_000),
+            },
+        )
+        .expect("mark the meeting");
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["SPEAKER_00: we should release Friday"]
+        );
+        assert_eq!(line_texts(&session.outside_meeting_path()), ["Me: yes"]);
+        // Every hidden line, inside the meeting or not, is in one place.
+        assert_eq!(
+            line_texts(&session.hidden_lines_path()),
+            [
+                "Me: we should release Friday",
+                "Me: hello there",
+                "Anna: anna says"
+            ]
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn keep_rules_stay_on_file_while_nothing_is_hidden() {
+        let (root, session) = keep_fixture("keep-round-trip");
+        let range = |start_ms, end_ms| KeptRange {
+            source: AudioSource::Mic,
+            start_ms,
+            end_ms,
+        };
+        set_hidden_sources(&session.dir, &[AudioSource::Mic]).expect("hide microphone");
+        for change in [
+            KeepChange::Line(range(8_000, 8_300)),
+            KeepChange::Line(range(8_200, 8_700)),
+            KeepChange::Speaker("Anna".into()),
+            KeepChange::Speaker("ANNA".into()),
+        ] {
+            change_kept_lines(&session.dir, change).expect("keep");
+        }
+        set_hidden_sources(&session.dir, &[]).expect("show microphone");
+        assert!(!session.hidden_lines_path().exists());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(session.hidden_sources_path()).expect("read file")
+            )
+            .expect("parse file"),
+            serde_json::json!({
+                "format_version": 2,
+                "hidden": [],
+                "keep_local_speaker": true,
+                "keep_speakers": ["Anna"],
+                "keep": [{"source": "mic", "start_ms": 8000, "end_ms": 8700}]
+            })
+        );
+
+        change_kept_lines(&session.dir, KeepChange::HideSpeaker("anna".into()))
+            .expect("forget Anna");
+        change_kept_lines(&session.dir, KeepChange::HideLine(range(8_000, 8_700)))
+            .expect("forget the line");
+        assert!(!session.hidden_sources_path().exists());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn failed_keep_render_restores_rules_and_hidden_lines() {
+        let (root, session) = keep_fixture("keep-rollback");
+        set_hidden_sources(&session.dir, &[AudioSource::Mic]).expect("hide microphone");
+        let paths = [
+            session.hidden_sources_path(),
+            session.hidden_lines_path(),
+            session.transcript_path(),
+        ];
+        let before = paths
+            .iter()
+            .map(|path| fs::read(path).expect("read before"))
+            .collect::<Vec<_>>();
+        fs::write(
+            session.diarization_metadata_path(),
+            br#"{"format_version":999}"#,
+        )
+        .expect("write invalid metadata version");
+
+        change_kept_lines(&session.dir, KeepChange::Speaker("Anna".into()))
+            .expect_err("render fails");
+
+        for (path, before) in paths.iter().zip(before) {
+            assert_eq!(fs::read(path).expect("read after"), before, "{path:?}");
+        }
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn inverted_kept_range_is_rejected() {
+        let (root, session) = keep_fixture("keep-invalid");
+        let path = session.hidden_sources_path();
+        fs::write(
+            &path,
+            br#"{"format_version":2,"hidden":["mic"],"keep":[{"source":"mic","start_ms":9,"end_ms":8}]}"#,
+        )
+        .expect("write inverted range");
+        let error = run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect_err("inverted range fails render");
+        assert_eq!(
+            error.to_string(),
+            format!("a kept range ends before it starts in {}", path.display())
         );
         fs::remove_dir_all(root).expect("remove fixture");
     }

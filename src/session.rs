@@ -165,6 +165,9 @@ impl Session {
     pub fn outside_meeting_path(&self) -> PathBuf {
         self.dir.join("outside-meeting.jsonl")
     }
+    pub fn hidden_lines_path(&self) -> PathBuf {
+        self.dir.join("hidden-lines.jsonl")
+    }
     pub fn meeting_path(&self) -> PathBuf {
         self.dir.join("meeting.json")
     }

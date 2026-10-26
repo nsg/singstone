@@ -1,4 +1,6 @@
-use crate::types::{AudioSource, SpeakerCorrection, SpeakerSegment, TimedWord, Utterance};
+use crate::types::{
+    AudioSource, KeptRange, SpeakerCorrection, SpeakerSegment, TimedWord, Utterance,
+};
 use std::collections::HashMap;
 
 pub const DEFAULT_NEAREST_TOLERANCE_MS: u64 = 500;
@@ -39,6 +41,7 @@ pub fn assign_cluster(
         .map(|item| item.2)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn build_utterances(
     words: &[TimedWord],
@@ -50,6 +53,37 @@ pub fn build_utterances(
     diarize_mic: bool,
     tolerance_ms: u64,
 ) -> Vec<Utterance> {
+    build_kept_utterances(
+        words,
+        echo,
+        segments,
+        recognized,
+        corrections,
+        &[],
+        local_speaker,
+        diarize_mic,
+        tolerance_ms,
+    )
+    .into_iter()
+    .map(|(utterance, _)| utterance)
+    .collect()
+}
+
+/// Builds the utterances and tells which consist of words kept by `kept`,
+/// each word by its midpoint; a kept stretch never shares a line with words
+/// outside it.
+#[allow(clippy::too_many_arguments)]
+pub fn build_kept_utterances(
+    words: &[TimedWord],
+    echo: &[bool],
+    segments: &[SpeakerSegment],
+    recognized: &HashMap<(AudioSource, u32), String>,
+    corrections: &[SpeakerCorrection],
+    kept: &[KeptRange],
+    local_speaker: &str,
+    diarize_mic: bool,
+    tolerance_ms: u64,
+) -> Vec<(Utterance, bool)> {
     assert_eq!(words.len(), echo.len(), "echo flags must match words");
     let mut anonymous = HashMap::new();
     let mut next_anonymous = 0usize;
@@ -80,9 +114,12 @@ pub fn build_utterances(
             .filter(|(_, word)| word.source == source)
             .collect::<Vec<_>>();
         source_words.sort_by_key(|(_, word)| (word.start_ms, word.end_ms));
-        let mut current: Option<Utterance> = None;
+        let mut current: Option<(Utterance, bool)> = None;
         for (index, word) in source_words {
             let word_echo = source == AudioSource::Mic && echo[index];
+            let word_kept = kept
+                .iter()
+                .any(|range| range.contains(source, midpoint(word)));
             let (speaker_id, speaker, locked) = word_speaker(
                 word,
                 segments,
@@ -93,8 +130,9 @@ pub fn build_utterances(
                 diarize_mic,
                 tolerance_ms,
             );
-            let split = current.as_ref().is_some_and(|utterance| {
-                utterance.speaker_id != speaker_id
+            let split = current.as_ref().is_some_and(|(utterance, kept)| {
+                *kept != word_kept
+                    || utterance.speaker_id != speaker_id
                     || utterance.speaker != speaker
                     || utterance.locked != locked
                     || utterance.echo != word_echo
@@ -105,29 +143,37 @@ pub fn build_utterances(
             if split && let Some(utterance) = current.take() {
                 output.push(utterance);
             }
-            if let Some(utterance) = current.as_mut() {
+            if let Some((utterance, _)) = current.as_mut() {
                 utterance.end_ms = utterance.end_ms.max(word.end_ms);
                 append_word(&mut utterance.text, &word.text);
             } else {
-                current = Some(Utterance {
-                    start_ms: word.start_ms,
-                    end_ms: word.end_ms,
-                    source,
-                    speaker_id,
-                    speaker,
-                    text: clean_text(&word.text),
-                    locked,
-                    echo: word_echo,
-                });
+                current = Some((
+                    Utterance {
+                        start_ms: word.start_ms,
+                        end_ms: word.end_ms,
+                        source,
+                        speaker_id,
+                        speaker,
+                        text: clean_text(&word.text),
+                        locked,
+                        echo: word_echo,
+                    },
+                    word_kept,
+                ));
             }
         }
         if let Some(utterance) = current {
             output.push(utterance);
         }
     }
-    output.retain(|utterance| !utterance.text.is_empty());
-    output.sort_by_key(|utterance| (utterance.start_ms, source_order(utterance.source)));
+    output.retain(|(utterance, _)| !utterance.text.is_empty());
+    output.sort_by_key(|(utterance, _)| (utterance.start_ms, source_order(utterance.source)));
     output
+}
+
+fn midpoint(word: &TimedWord) -> u64 {
+    word.start_ms
+        .saturating_add(word.end_ms.saturating_sub(word.start_ms) / 2)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -161,9 +207,7 @@ fn word_speaker(
             None => ("unknown".to_string(), "unknown".to_string()),
         }
     };
-    let midpoint = word
-        .start_ms
-        .saturating_add(word.end_ms.saturating_sub(word.start_ms) / 2);
+    let midpoint = midpoint(word);
     let correction = corrections
         .iter()
         .rev()

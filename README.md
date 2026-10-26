@@ -34,7 +34,12 @@ they stay locked across reprocessing, use quick speaker shortcuts on anonymous
 lines, or change a named line.
 Use **Hide microphone** or **Hide system** to leave that source out of
 both transcript files without deleting anything. Hiding the microphone is
-useful when you only listened and it recorded nothing but leaked speaker audio.
+useful when you mostly listened and it recorded leaked speaker audio: lines
+recognized as your voice, or named by you as **Your name in the transcript**,
+stay in, echo excepted.
+Show the hidden lines to right-click one and keep just that line or every line
+of its speaker. What is kept is listed next to the toggles, where ✕ stops
+keeping a speaker, yourself included.
 When a recording starts before the meeting or runs on after it, right-click a
 line or its time and choose **Meeting starts here** or **Meeting ends here**.
 Lines outside the meeting fold away and are left out of both transcript files;
@@ -129,7 +134,8 @@ a session can be archived with or without it.
 - Uses per-meeting attendee details to guide speaker counts and recognition.
 - Marks loudspeaker sound picked up by the microphone as echo by comparing the
   two recordings, without deleting it.
-- Hides either audio source from a session's transcript without deleting it.
+- Hides either audio source from a session's transcript without deleting it,
+  keeping your own lines or any lines you pick.
 - Marks where the meeting starts and ends in a longer recording, leaving the
   lines outside it out of the transcript and out of voice learning.
 - Dictates short text from the microphone, such as a message or a prompt,

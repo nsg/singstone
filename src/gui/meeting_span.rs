@@ -1,5 +1,6 @@
 use super::timeline_layout::TimelineRow;
 use super::{format_duration, format_timeline_timestamp};
+use crate::merge::process::KeepChange;
 use crate::types::{MeetingSpan, Utterance};
 use gtk::{gdk, gio, glib, prelude::*};
 use gtk4 as gtk;
@@ -7,15 +8,20 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 pub(super) type SpanSetter = Rc<dyn Fn(MeetingSpan)>;
+pub(super) type KeepSetter = Rc<dyn Fn(KeepChange)>;
 
-/// The session's marks, the recording's length (0 when unknown), and how to
-/// change the marks.
+/// The session's marks, the recording's length (0 when unknown), how to
+/// change the marks, and how to change the lines a hidden source keeps.
 #[derive(Clone)]
 pub(super) struct Marks {
     pub span: MeetingSpan,
     pub recorded_ms: u64,
     pub set: SpanSetter,
+    pub keep: KeepSetter,
 }
+
+/// Menu items for one line, after the marks.
+pub(super) type LineItems = Rc<Vec<(String, KeepChange)>>;
 
 /// Whether choosing `marked` changes the marks to a meeting that is not empty.
 pub(super) fn can_mark(span: MeetingSpan, recorded_ms: u64, marked: MeetingSpan) -> bool {
@@ -95,12 +101,19 @@ pub(super) fn span_summary(span: MeetingSpan, recorded_ms: u64) -> String {
 
 /// Opens the mark menu on a right-click, Shift+F10 or the Menu key. A
 /// right-click on selected text keeps the text's own menu.
-pub(super) fn attach_mark_menu(widget: &gtk::Widget, start_ms: u64, end_ms: u64, marks: &Marks) {
+pub(super) fn attach_mark_menu(
+    widget: &gtk::Widget,
+    start_ms: u64,
+    end_ms: u64,
+    marks: &Marks,
+    items: LineItems,
+) {
     let click = gtk::GestureClick::builder()
         .button(gdk::BUTTON_SECONDARY)
         .propagation_phase(gtk::PropagationPhase::Capture)
         .build();
     let marks_for_click = marks.clone();
+    let items_for_click = items.clone();
     click.connect_pressed(move |gesture, _, x, y| {
         let Some(widget) = gesture.widget() else {
             return;
@@ -113,7 +126,13 @@ pub(super) fn attach_mark_menu(widget: &gtk::Widget, start_ms: u64, end_ms: u64,
             return;
         }
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        open_mark_menu(&widget, x, y, start_ms, end_ms, &marks_for_click);
+        open_mark_menu(
+            &widget,
+            (x, y),
+            (start_ms, end_ms),
+            &marks_for_click,
+            &items_for_click,
+        );
     });
     widget.add_controller(click);
 
@@ -124,14 +143,20 @@ pub(super) fn attach_mark_menu(widget: &gtk::Widget, start_ms: u64, end_ms: u64,
         Some(gtk::CallbackAction::new(move |widget, _| {
             let x = f64::from(widget.width()) / 2.0;
             let y = f64::from(widget.height()) / 2.0;
-            open_mark_menu(widget, x, y, start_ms, end_ms, &marks);
+            open_mark_menu(widget, (x, y), (start_ms, end_ms), &marks, &items);
             glib::Propagation::Stop
         })),
     ));
     widget.add_controller(keys);
 }
 
-fn open_mark_menu(widget: &gtk::Widget, x: f64, y: f64, start_ms: u64, end_ms: u64, marks: &Marks) {
+fn open_mark_menu(
+    widget: &gtk::Widget,
+    (x, y): (f64, f64),
+    (start_ms, end_ms): (u64, u64),
+    marks: &Marks,
+    line: &[(String, KeepChange)],
+) {
     let span = marks.span;
     let actions = gio::SimpleActionGroup::new();
     for (name, marked) in [
@@ -165,6 +190,20 @@ fn open_mark_menu(widget: &gtk::Widget, x: f64, y: f64, start_ms: u64, end_ms: u
         Some(&format!("At {}", format_timeline_timestamp(start_ms))),
         &items,
     );
+    let line_actions = gio::SimpleActionGroup::new();
+    let line_items = gio::Menu::new();
+    for (index, (label, change)) in line.iter().enumerate() {
+        let action = gio::SimpleAction::new(&format!("keep{index}"), None);
+        let keep = marks.keep.clone();
+        let change = change.clone();
+        action.connect_activate(move |_, _| keep(change.clone()));
+        line_actions.add_action(&action);
+        line_items.append(Some(label), Some(&format!("line.keep{index}")));
+    }
+    widget.insert_action_group("line", Some(&line_actions));
+    if line_items.n_items() > 0 {
+        model.append_section(None, &line_items);
+    }
     let menu = gtk::PopoverMenu::from_model(Some(&model));
     menu.set_has_arrow(false);
     menu.set_halign(gtk::Align::Start);

@@ -114,10 +114,62 @@ pub struct SpeakerCorrections {
     pub corrections: Vec<SpeakerCorrection>,
 }
 
+pub const HIDDEN_SOURCES_FORMAT_VERSION: u32 = 2;
+
+/// `hidden-sources.json`: the sources left out of the transcript and the lines
+/// of them that stay in it anyway.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HiddenSources {
     pub format_version: u32,
     pub hidden: Vec<AudioSource>,
+    /// Keeps the lines named after `manifest.local_speaker`.
+    #[serde(default = "default_true")]
+    pub keep_local_speaker: bool,
+    #[serde(default)]
+    pub keep_speakers: Vec<String>,
+    #[serde(default)]
+    pub keep: Vec<KeptRange>,
+}
+
+/// A kept stretch of a hidden source; a word is kept when its midpoint is in
+/// `[start_ms, end_ms]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptRange {
+    pub source: AudioSource,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+impl KeptRange {
+    pub fn contains(self, source: AudioSource, at_ms: u64) -> bool {
+        self.source == source && (self.start_ms..=self.end_ms).contains(&at_ms)
+    }
+}
+
+impl Default for HiddenSources {
+    fn default() -> Self {
+        Self {
+            format_version: HIDDEN_SOURCES_FORMAT_VERSION,
+            hidden: Vec::new(),
+            keep_local_speaker: true,
+            keep_speakers: Vec::new(),
+            keep: Vec::new(),
+        }
+    }
+}
+
+impl HiddenSources {
+    /// Whether the file has nothing to say beyond the defaults.
+    pub fn is_default(&self) -> bool {
+        self.hidden.is_empty()
+            && self.keep_local_speaker
+            && self.keep_speakers.is_empty()
+            && self.keep.is_empty()
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Where the meeting starts and ends in the recording; an open bound reaches

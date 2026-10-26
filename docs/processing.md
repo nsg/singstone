@@ -556,19 +556,61 @@ words exceeds one second, or an utterance has reached 15 seconds and ends with
 sentence punctuation. Whitespace and punctuation spacing are normalized, and
 utterances from both sources are sorted on the common meeting timeline.
 
-`hidden-sources.json` can leave one or both sources out of the final transcript:
+`hidden-sources.json` can leave one or both sources out of the final
+transcript, except for the lines it keeps:
 
 ```json
 {
-  "format_version": 1,
-  "hidden": ["mic"]
+  "format_version": 2,
+  "hidden": ["mic"],
+  "keep_local_speaker": true,
+  "keep_speakers": ["Anna"],
+  "keep": [{"source": "mic", "start_ms": 1834200, "end_ms": 1839900}]
 }
 ```
 
-Hidden-source utterances are omitted from `transcript.jsonl` and
-`transcript.txt`; no other artifact changes. Use the app to toggle a source,
-or edit the file and run `singstone render SESSION`. Remove a source from
-`hidden`, or remove the file, and render again to bring its lines back.
+Utterances of a hidden source are omitted from `transcript.jsonl` and
+`transcript.txt` unless a keep rule applies:
+
+- `keep_local_speaker` keeps lines named after `local_speaker` in
+  `manifest.json`, the app's **Your name in the transcript**, whose voice was
+  told apart: lines of a diarized cluster that recognition named so, and lines
+  you named so yourself. It does not match the
+  `local` speaker ID that every microphone line gets when microphone
+  diarization is off, so that hiding the microphone still hides it. It defaults
+  to true, so hiding the microphone keeps your own lines. It is a flag rather
+  than a copy of the name, so it follows the manifest.
+- `keep_speakers` keeps every line of the listed names, on either source,
+  anonymous `SPEAKER_NN` names included, by name alone. The app's **Keep all
+  of X's lines** adds X here, your own name too, so it keeps your lines even
+  with microphone diarization off; the ✕ on a name's chip removes the name and,
+  for your own name, turns `keep_local_speaker` off as well.
+- Names match ignoring case and repeated whitespace. A line marked echo is never
+  kept by a speaker rule, because it is leaked loudspeaker sound whatever name
+  diarization gave it.
+- `keep` keeps stretches of a source the way corrections name them: a word is
+  kept when its midpoint lies in `[start_ms, end_ms]`, and grouping starts a
+  new utterance when that changes, so a kept range survives regrouping and
+  reprocessing. A kept range keeps echo too.
+
+A speaker rule follows the rendered name, so naming a hidden line yourself
+(see [Manual assignment and correction](#manual-assignment-and-correction))
+lets your rule keep it, and the later lines of that voice you accept. Hidden
+lines can be named, and later hidden lines are proposed like transcript lines.
+
+Every utterance of a hidden source that nothing keeps is written to
+`hidden-lines.jsonl`, in the transcript's format and whether it is inside the
+meeting or not, so the app can still show it; that file exists only while a
+source is hidden. Rules for a source that is not hidden have no effect but
+stay on file, so hiding it again keeps the same lines. The file is removed when
+it hides nothing and holds only defaults. Version 1 files, which have only
+`hidden`, still open and keep nothing, so their transcripts stay as they were.
+A session rendered before `hidden-lines.jsonl` existed has none; the app
+renders it when you ask to show the hidden lines, writing the same selection in
+version 2.
+Use the app to toggle a source and keep lines, or edit the file and run
+`singstone render SESSION`. Remove a source from `hidden`, or remove the file,
+and render again to bring its lines back.
 
 `meeting-span.json` marks where the meeting starts and ends when the recording
 runs longer than the meeting:
@@ -590,7 +632,10 @@ utterance belongs to the meeting when its `start_ms` lies in
 `transcript.jsonl` and `transcript.txt` and written instead to
 `outside-meeting.jsonl`, in the same format, so the app can still show them;
 that file exists only while the session has a span. Timestamps stay relative to
-the start of the recording, and hidden sources are left out of both files. The
+the start of the recording. The span wins over keep rules: a kept line outside
+the meeting goes to `outside-meeting.jsonl`, and lines of hidden sources that
+nothing keeps go to `hidden-lines.jsonl` instead, so each line is in exactly
+one of the three files. The
 span changes no other artifact: the audio, `screenshots.jsonl`, which is
 written while recording, and the transcription, diarization and recognition
 stages do not look at it. In the app, right-click a line or its time and choose
@@ -601,8 +646,9 @@ right after the chosen row even when the next line overlaps it. Remove a bound
 from the file, or the whole file, and render again to widen the meeting; the
 app's ✕ on a mark and **Use the whole recording** do the same. When rendering
 after a change in the app fails, `meeting-span.json`, `outside-meeting.jsonl`,
-`transcript.jsonl` and `transcript.txt` are all put back as they were, so they
-keep agreeing; the same holds for changes to hidden sources and corrections.
+`hidden-lines.jsonl`, `transcript.jsonl` and `transcript.txt` are all put back
+as they were, so they keep agreeing; the same holds for changes to hidden
+sources, kept lines and corrections.
 
 The stage replaces the canonical `transcript.jsonl` and readable
 `transcript.txt` atomically one file at a time:
@@ -639,6 +685,7 @@ changing any of those inputs.
 | Manually edited words | `render` |
 | Manually edited speaker segments | `recognize`, then `render`; or only `render` for anonymous names |
 | Leave out the microphone or system-audio lines | Use the app, or edit `hidden-sources.json`, then `render` |
+| Keep some lines of a hidden source | Use the app, or edit `keep_speakers` or `keep` in `hidden-sources.json`, then `render` |
 | Leave out talk before or after the meeting | Use the app, or edit `meeting-span.json`, then `render` |
 | Anonymous transcript with no speaker database | Skip `recognize`; run `render` |
 | Multiple people are listed in the room | Save meeting details, then `diarize`, `recognize`, and `render` |

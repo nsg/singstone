@@ -1,5 +1,6 @@
 mod config;
 mod dictation;
+mod keep;
 mod meeting_span;
 mod player;
 mod queue;
@@ -42,7 +43,8 @@ use std::time::{Duration, Instant, SystemTime};
 use rustix::process::{Pid, Signal};
 
 use self::config::GuiConfig;
-use self::meeting_span::{Marks, SpanSetter};
+use self::keep::LineKeep;
+use self::meeting_span::{KeepSetter, Marks, SpanSetter};
 use self::queue::{
     JobState, Outcome as QueueOutcome, ProcessingQueue, finished_banner_text, ordinal,
 };
@@ -87,6 +89,10 @@ const CSS: &str = r#"
 .transcript-card .pill { padding-left: 3px; padding-right: 3px; }
 .echo-row { opacity: 0.55; }
 .outside-line { opacity: 0.55; }
+.keep-bar { margin-top: 2px; }
+.keep-chip { border: 1px solid alpha(@accent_color, 0.28); border-radius: 999px; padding: 0 0 0 8px; color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
+.keep-chip button { min-width: 18px; min-height: 18px; padding: 0; color: @accent_color; }
+.kept-marker { border: 1px solid @borders; border-radius: 999px; padding: 0 5px; }
 .outside-meeting { border-radius: 12px; padding-bottom: 6px; background: repeating-linear-gradient(135deg, alpha(currentColor, 0.07) 0px, alpha(currentColor, 0.07) 8px, transparent 8px, transparent 16px); }
 .outside-meeting .timeline-time { opacity: 0.55; }
 .meeting-fold { border: 1px dashed @borders; border-radius: 999px; padding: 0 2px 0 12px; background: @window_bg_color; }
@@ -169,6 +175,8 @@ struct SessionDetail {
     hide_mic: gtk::ToggleButton,
     hide_system: gtk::ToggleButton,
     loading_hidden_sources: Rc<Cell<bool>>,
+    keep_bar: gtk::Box,
+    hidden_shown: Rc<Cell<bool>>,
     body_stack: gtk::Stack,
     player: player::Player,
     transcript_header: gtk::Box,
@@ -1415,17 +1423,24 @@ fn build_session_detail(
     transcript_header.append(&transcript_toggles);
     let hide_mic = gtk::ToggleButton::with_label("Hide microphone");
     hide_mic.set_tooltip_text(Some(
-        "Leave microphone lines out of transcript.jsonl and transcript.txt. Nothing is deleted.",
+        "Leave microphone lines out of transcript.jsonl and transcript.txt, except the lines you keep. Nothing is deleted.",
     ));
     hide_mic.set_visible(false);
     transcript_toggles.append(&hide_mic);
     let hide_system = gtk::ToggleButton::with_label("Hide system");
     hide_system.set_tooltip_text(Some(
-        "Leave system audio lines out of transcript.jsonl and transcript.txt. Nothing is deleted.",
+        "Leave system audio lines out of transcript.jsonl and transcript.txt, except the lines you keep. Nothing is deleted.",
     ));
     hide_system.set_visible(false);
     transcript_toggles.append(&hide_system);
     transcript_frame.append(&transcript_header);
+    let keep_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    keep_bar.set_layout_manager(Some(WrapLayout::new(6, 4)));
+    keep_bar.add_css_class("keep-bar");
+    keep_bar.set_margin_start(16);
+    keep_bar.set_margin_end(16);
+    keep_bar.set_visible(false);
+    transcript_frame.append(&keep_bar);
     let transcript_panes = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     transcript_panes.add_css_class("timeline-pane-headers");
     transcript_panes.set_visible(false);
@@ -1500,6 +1515,8 @@ fn build_session_detail(
         hide_mic,
         hide_system,
         loading_hidden_sources: Rc::new(Cell::new(false)),
+        keep_bar,
+        hidden_shown: Rc::new(Cell::new(false)),
         body_stack,
         player,
         transcript_header,
@@ -4770,6 +4787,7 @@ impl SessionDetail {
         let manifest = session.read_manifest()?;
         if self.selected.borrow().as_deref() != Some(path) {
             self.outside_expanded.set((false, false));
+            self.hidden_shown.set(false);
         }
         *self.selected.borrow_mut() = Some(path.to_owned());
         let title = session.title();
@@ -4794,9 +4812,9 @@ impl SessionDetail {
         let processed = session.transcript_path().is_file();
         let queue_state = self.queue.borrow().state(path);
         self.apply_queue_state(&session, &manifest, processed, queue_state);
-        let hidden = process::read_hidden_sources(&session).unwrap_or_default();
-        let mic_hidden = hidden.contains(&AudioSource::Mic);
-        let system_hidden = hidden.contains(&AudioSource::System);
+        let rules = process::read_hidden_sources(&session).unwrap_or_default();
+        let mic_hidden = rules.hidden.contains(&AudioSource::Mic);
+        let system_hidden = rules.hidden.contains(&AudioSource::System);
         self.loading_hidden_sources.set(true);
         self.hide_mic.set_active(mic_hidden);
         self.hide_system.set_active(system_hidden);
@@ -4806,6 +4824,8 @@ impl SessionDetail {
             .set_visible(can_hide_sources && manifest.mic.enabled);
         self.hide_system
             .set_visible(can_hide_sources && manifest.system.enabled);
+        self.keep_bar
+            .set_visible(can_hide_sources && !rules.hidden.is_empty());
 
         let screenshots: Vec<ScreenshotEntry> =
             jsonl::read_all(&session.screenshots_index_path()).unwrap_or_default();
@@ -4833,20 +4853,75 @@ impl SessionDetail {
         if processed {
             let mut utterances: Vec<Utterance> = jsonl::read_all(&session.transcript_path())?;
             utterances.extend(process::read_outside_meeting(&session).unwrap_or_default());
+            // Sessions rendered before hidden lines were kept apart have no
+            // sidecar; showing them renders it.
+            let hidden_lines_missing =
+                !rules.hidden.is_empty() && !session.hidden_lines_path().exists();
+            let hidden_lines = if rules.hidden.is_empty() {
+                Vec::new()
+            } else {
+                process::read_hidden_lines(&session).unwrap_or_default()
+            };
+            let hidden_count = hidden_lines.len();
+            let shown_count = utterances.len();
+            if self.hidden_shown.get() {
+                utterances.extend(hidden_lines);
+            }
             // A stale sidecar must not show a transcript line twice; the
             // transcript's copy comes first and is kept.
             let mut seen = std::collections::HashSet::new();
-            utterances.retain(|utterance| {
-                seen.insert((utterance.start_ms, utterance.end_ms, utterance.source))
-            });
-            utterances.sort_by_key(|utterance| {
+            let mut lines = utterances
+                .into_iter()
+                .enumerate()
+                .filter(|(_, utterance)| {
+                    seen.insert((utterance.start_ms, utterance.end_ms, utterance.source))
+                })
+                .collect::<Vec<_>>();
+            lines.sort_by_key(|(_, utterance)| {
                 (utterance.start_ms, utterance.source == AudioSource::System)
             });
+            let (states, utterances): (Vec<_>, Vec<_>) = lines
+                .into_iter()
+                .map(|(index, utterance)| {
+                    let hidden_line = index >= shown_count;
+                    (
+                        keep::line_keep(&rules, &manifest.local_speaker, &utterance, hidden_line),
+                        utterance,
+                    )
+                })
+                .unzip();
+            if can_hide_sources && !rules.hidden.is_empty() {
+                let detail = self.clone();
+                let shown = self.hidden_shown.clone();
+                let reload = self.clone();
+                keep::keep_bar(
+                    &self.keep_bar,
+                    &rules.hidden,
+                    keep::KeepSummary {
+                        kept_speakers: keep::speaker_chips(&rules, &manifest.local_speaker),
+                        kept_lines: states
+                            .iter()
+                            .filter(|state| matches!(state, LineKeep::Kept { .. }))
+                            .count(),
+                        hidden_lines: (!hidden_lines_missing).then_some(hidden_count),
+                        hidden_shown: self.hidden_shown.get(),
+                    },
+                    move |name| start_keep_update(&detail, process::KeepChange::HideSpeaker(name)),
+                    move |show| {
+                        shown.set(show);
+                        if hidden_lines_missing {
+                            update_hidden_sources(&reload, process::render_hidden_lines);
+                        } else {
+                            reload_session(&reload);
+                        }
+                    },
+                );
+            }
             if utterances.is_empty() {
                 append_empty(
                     &self.transcript,
                     if mic_hidden || system_hidden {
-                        "Every line of this transcript is hidden."
+                        "Every line of this transcript is hidden. Show the hidden lines to keep some of them."
                     } else {
                         "The transcript is empty."
                     },
@@ -4869,6 +4944,7 @@ impl SessionDetail {
                     span,
                     recorded_ms: duration,
                     set: self.span_setter(),
+                    keep: self.keep_setter(),
                 };
                 let set_span = marks.set.clone();
                 let row_widgets = |indexes: std::ops::Range<usize>| {
@@ -4878,6 +4954,7 @@ impl SessionDetail {
                             &rows,
                             index,
                             &utterances,
+                            &states,
                             &learned,
                             self,
                             &session,
@@ -5081,6 +5158,11 @@ impl SessionDetail {
         Rc::new(move |span| start_meeting_span_update(&detail, span))
     }
 
+    fn keep_setter(&self) -> KeepSetter {
+        let detail = self.clone();
+        Rc::new(move |change| start_keep_update(&detail, change))
+    }
+
     fn apply_queue_state(
         &self,
         session: &Session,
@@ -5226,6 +5308,7 @@ impl SessionDetail {
             self.delete_button.upcast_ref(),
             self.hide_mic.upcast_ref(),
             self.hide_system.upcast_ref(),
+            self.keep_bar.upcast_ref(),
         ] {
             widget.set_visible(false);
         }
@@ -5427,6 +5510,7 @@ fn transcript_timeline_row(
     rows: &[TimelineRow],
     index: usize,
     utterances: &[Utterance],
+    states: &[LineKeep],
     learned: &[bool],
     detail: &SessionDetail,
     session: &Session,
@@ -5437,8 +5521,14 @@ fn transcript_timeline_row(
     let timeline_row = &rows[index];
     let span = marks.span;
     let end_ms = meeting_span::row_end_ms(rows, utterances, index);
-    let markable = |widget: &gtk::Widget| {
-        meeting_span::attach_mark_menu(widget, timeline_row.start_ms, end_ms, marks);
+    let markable = |widget: &gtk::Widget, items: Vec<(String, process::KeepChange)>| {
+        meeting_span::attach_mark_menu(
+            widget,
+            timeline_row.start_ms,
+            end_ms,
+            marks,
+            Rc::new(items),
+        );
     };
     let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     row.set_layout_manager(Some(TimelineLayout::new(one_sided)));
@@ -5457,22 +5547,26 @@ fn transcript_timeline_row(
             !one_sided,
             format_timeline_timestamp(utterance.start_ms)
                 != format_timeline_timestamp(timeline_row.start_ms),
+            states[index],
         );
         card.set_halign(if one_sided {
             gtk::Align::Start
         } else {
             gtk::Align::End
         });
-        if !span.contains(utterance.start_ms) {
+        if !span.contains(utterance.start_ms) || states[index] == LineKeep::Hidden {
             card.add_css_class("outside-line");
         }
-        markable(card.upcast_ref());
+        markable(
+            card.upcast_ref(),
+            keep::line_actions(states[index], utterance),
+        );
         mic.append(&card);
     }
     row.append(&mic);
 
     let marker = timeline_marker(timeline_row.start_ms);
-    markable(marker.upcast_ref());
+    markable(marker.upcast_ref(), Vec::new());
     row.append(&marker);
 
     let system = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -5489,12 +5583,16 @@ fn transcript_timeline_row(
             false,
             format_timeline_timestamp(utterance.start_ms)
                 != format_timeline_timestamp(timeline_row.start_ms),
+            states[index],
         );
         card.set_halign(gtk::Align::Start);
-        if !span.contains(utterance.start_ms) {
+        if !span.contains(utterance.start_ms) || states[index] == LineKeep::Hidden {
             card.add_css_class("outside-line");
         }
-        markable(card.upcast_ref());
+        markable(
+            card.upcast_ref(),
+            keep::line_actions(states[index], utterance),
+        );
         system.append(&card);
     }
     row.append(&system);
@@ -5519,6 +5617,7 @@ fn timeline_marker(start_ms: u64) -> gtk::Overlay {
     marker
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transcript_card(
     utterance: &Utterance,
     learned: bool,
@@ -5527,6 +5626,7 @@ fn transcript_card(
     frequent: &Rc<Vec<String>>,
     mirrored: bool,
     show_timestamp: bool,
+    keep_state: LineKeep,
 ) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
     card.add_css_class("transcript-card");
@@ -5601,6 +5701,13 @@ fn transcript_card(
         timestamp.add_css_class("dim-label");
         timestamp.add_css_class("caption");
         head.append(&timestamp);
+    }
+    if let LineKeep::Kept { by_speaker, .. } = keep_state {
+        head.append(&keep::kept_marker(
+            by_speaker,
+            &utterance.speaker,
+            utterance.source,
+        ));
     }
     if utterance.echo {
         let echo = status_pill("Echo", "idle");
@@ -6124,13 +6231,6 @@ fn progress_window(parent: &adw::ApplicationWindow, title: &str, text: &str) -> 
 }
 
 fn start_hidden_sources_update(detail: &SessionDetail) {
-    if detail.busy.get() {
-        return;
-    }
-    let Some(session) = detail.selected.borrow().clone() else {
-        return;
-    };
-    detail.busy.set(true);
     let hidden = [
         (AudioSource::Mic, detail.hide_mic.is_active()),
         (AudioSource::System, detail.hide_system.is_active()),
@@ -6138,6 +6238,36 @@ fn start_hidden_sources_update(detail: &SessionDetail) {
     .into_iter()
     .filter_map(|(source, hidden)| hidden.then_some(source))
     .collect::<Vec<_>>();
+    update_hidden_sources(detail, move |session| {
+        process::set_hidden_sources(session, &hidden)
+    });
+}
+
+fn start_keep_update(detail: &SessionDetail, change: process::KeepChange) {
+    update_hidden_sources(detail, move |session| {
+        process::change_kept_lines(session, change)
+    });
+}
+
+fn update_hidden_sources(
+    detail: &SessionDetail,
+    update: impl FnOnce(&Path) -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
+) {
+    if detail.busy.get() {
+        return;
+    }
+    let Some(session) = detail.selected.borrow().clone() else {
+        return;
+    };
+    if detail.queue.borrow().state(&session) == Some(JobState::Running) {
+        show_error(
+            &detail.window,
+            "Session is processing",
+            "Change hidden lines once processing has finished.",
+        );
+        return;
+    }
+    detail.busy.set(true);
     let progress = progress_window(
         &detail.window,
         "Updating transcript",
@@ -6146,8 +6276,7 @@ fn start_hidden_sources_update(detail: &SessionDetail) {
     let result = Arc::new(Mutex::new(None));
     let thread_result = result.clone();
     std::thread::spawn(move || {
-        let value =
-            process::set_hidden_sources(&session, &hidden).map_err(|error| error.to_string());
+        let value = update(&session).map_err(|error| error.to_string());
         *thread_result.lock().expect("hidden sources result mutex") = Some(value);
     });
     let detail = detail.clone();

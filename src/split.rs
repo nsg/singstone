@@ -10,8 +10,8 @@ use crate::merge::process;
 use crate::screenshot::inotify::screenshot_file_name;
 use crate::session::{self, Session};
 use crate::types::{
-    AudioSource, Manifest, MeetingSpan, MeetingSpanFile, SAMPLE_RATE, ScreenshotEntry,
-    SessionState, StreamInfo, TimelineEvent, samples_to_ms,
+    AudioSource, HiddenSources, KeptRange, Manifest, MeetingSpan, MeetingSpanFile, SAMPLE_RATE,
+    ScreenshotEntry, SessionState, StreamInfo, TimelineEvent, samples_to_ms,
 };
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -292,6 +292,7 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
     let details = meeting::read_details(&session.meeting_path())?;
     let span = process::read_meeting_span(session).unwrap_or_default();
     let spans = split_span(span, at_ms);
+    let hidden = split_hidden_sources(process::read_hidden_sources(session)?, at_ms);
     let original_title = session.title();
     for (index, part) in parts.iter().enumerate() {
         let title = titles[index].trim();
@@ -310,11 +311,8 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
         if let Some(part_details) = part_details {
             meeting::write_details_atomic(&part.meeting_path(), &part_details)?;
         }
-        if session.hidden_sources_path().is_file() {
-            copy_private(
-                &mut File::open(session.hidden_sources_path())?,
-                &part.hidden_sources_path(),
-            )?;
+        if !hidden[index].is_default() {
+            process::write_json_atomic(&part.hidden_sources_path(), &hidden[index])?;
         }
         if !spans[index].is_whole() {
             process::write_json_atomic(
@@ -701,6 +699,36 @@ fn split_span(span: MeetingSpan, at_ms: u64) -> [MeetingSpan; 2] {
     })
 }
 
+/// The hidden sources as seen from each part: the kept ranges move to the
+/// part's clock, cut at the split and dropped from a part they miss.
+fn split_hidden_sources(hidden: HiddenSources, at_ms: u64) -> [HiddenSources; 2] {
+    let first = hidden
+        .keep
+        .iter()
+        .filter(|range| range.start_ms < at_ms)
+        .map(|range| KeptRange {
+            end_ms: range.end_ms.min(at_ms - 1),
+            ..*range
+        })
+        .collect();
+    let second = hidden
+        .keep
+        .iter()
+        .filter(|range| range.end_ms >= at_ms)
+        .map(|range| KeptRange {
+            start_ms: range.start_ms.saturating_sub(at_ms),
+            end_ms: range.end_ms - at_ms,
+            ..*range
+        })
+        .collect();
+    [first, second].map(|keep| {
+        process::normalize_hidden_sources(HiddenSources {
+            keep,
+            ..hidden.clone()
+        })
+    })
+}
+
 fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
@@ -1053,6 +1081,34 @@ mod tests {
             split_span(span(None, Some(5_000)), 5_000),
             [span(None, None), span(None, None)]
         );
+    }
+
+    #[test]
+    fn kept_ranges_move_to_each_part_clock() {
+        let range = |start_ms, end_ms| KeptRange {
+            source: AudioSource::Mic,
+            start_ms,
+            end_ms,
+        };
+        let hidden = HiddenSources {
+            hidden: vec![AudioSource::Mic],
+            keep_local_speaker: false,
+            keep_speakers: vec!["Anna".into()],
+            keep: vec![
+                range(1_000, 2_000),
+                range(4_000, 6_000),
+                range(7_000, 8_000),
+            ],
+            ..HiddenSources::default()
+        };
+        let [first, second] = split_hidden_sources(hidden.clone(), 5_000);
+        assert_eq!(first.keep, [range(1_000, 2_000), range(4_000, 4_999)]);
+        assert_eq!(second.keep, [range(0, 1_000), range(2_000, 3_000)]);
+        for part in [first, second] {
+            assert_eq!(part.hidden, hidden.hidden);
+            assert_eq!(part.keep_speakers, hidden.keep_speakers);
+            assert!(!part.keep_local_speaker);
+        }
     }
 
     #[test]

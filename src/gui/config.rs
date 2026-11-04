@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub struct GuiConfig {
     pub meetings_dir: PathBuf,
     pub screenshots_dir: PathBuf,
+    /// Where diarization test cases labeled from transcript lines are saved.
+    pub test_cases_dir: PathBuf,
     pub local_speaker: String,
     #[serde(alias = "context_dir", skip_serializing_if = "Option::is_none")]
     pub context_file: Option<PathBuf>,
@@ -34,6 +36,9 @@ impl Default for GuiConfig {
             screenshots_dir: std::env::var_os("SINGSTONE_SCREENSHOTS_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| home.join("Pictures/Screenshots")),
+            test_cases_dir: std::env::var_os("SINGSTONE_TEST_CASES_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("Diarization test cases")),
             local_speaker: "Me".into(),
             context_file: std::env::var_os("SINGSTONE_CONTEXT_FILE")
                 .or_else(|| std::env::var_os("SINGSTONE_CONTEXT_DIR"))

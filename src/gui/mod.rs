@@ -2,6 +2,7 @@ mod config;
 mod cut;
 mod dictation;
 mod keep;
+mod label;
 mod meeting_span;
 mod player;
 mod queue;
@@ -20,6 +21,7 @@ use crate::session::Session;
 use crate::speaker::database::{self, SpeakerDatabase, canonical_name_key};
 use crate::speaker::tidy;
 use crate::split;
+use crate::testcase::LineRef;
 use crate::transcription::{self, TranscriptionProgress, backend};
 use crate::types::{
     AudioSource, DEFAULT_SPEAKER_THRESHOLD, Manifest, MeetingSpan, SAMPLE_RATE, ScreenshotEntry,
@@ -143,6 +145,21 @@ const CSS: &str = r#"
 button.turn-who { min-height: 0; padding: 1px 8px 1px 1px; border-radius: 999px; font-weight: bold; }
 button.turn-who-none { min-height: 0; padding: 1px 9px; border: 1px dashed @borders; border-radius: 999px; font-weight: 600; color: alpha(currentColor, 0.7); }
 .turn-time { font-feature-settings: "tnum"; }
+.label-key { font-family: monospace; font-size: 10px; font-weight: 600; border: 1px solid @borders; border-radius: 4px; padding: 0 4px; color: alpha(currentColor, 0.6); }
+.lane-dot { min-width: 12px; min-height: 12px; border-radius: 4px; }
+.lane-1 { background: #1a5fb4; }
+.lane-2 { background: #613583; }
+.lane-3 { background: #26a269; }
+.lane-4 { background: #c64600; }
+.lane-5 { background: #a51d2d; }
+.lane-6 { background: #1c7f91; }
+.lane-7 { background: #986a44; }
+.lane-8 { background: #865e3c; }
+.lane-9 { background: #5e5c64; }
+.lane-unsure { background: repeating-linear-gradient(135deg, alpha(currentColor, 0.6) 0px, alpha(currentColor, 0.6) 2px, transparent 2px, transparent 4px); }
+button.add-speaker { min-height: 0; padding: 2px 8px; border: 1px dashed alpha(@accent_color, 0.5); color: @accent_color; background: none; font-weight: 600; }
+button.add-speaker:hover { background: alpha(@accent_color, 0.08); }
+.label-footer { padding: 8px 14px; border-top: 1px solid @borders; }
 "#;
 
 #[derive(Clone)]
@@ -225,6 +242,8 @@ struct SessionDetail {
     busy: Rc<Cell<bool>>,
     processing: ProcessingView,
     tidy_notice: adw::Banner,
+    config: Rc<RefCell<GuiConfig>>,
+    toasts: adw::ToastOverlay,
 }
 
 #[derive(Clone)]
@@ -785,6 +804,7 @@ fn build_window(app: &adw::Application) {
     let sidebar = build_sidebar(&search, &session_list, &queue_panel);
 
     let tidy_notice = tidy_notice();
+    let toasts = adw::ToastOverlay::new();
     let detail = build_session_detail(
         &window,
         &session_list,
@@ -793,6 +813,8 @@ fn build_window(app: &adw::Application) {
         &cancel_requested,
         &foreground_busy,
         &tidy_notice,
+        &config,
+        &toasts,
     );
     let recording_page = build_recording_page(&config.borrow());
     let speakers_page = build_speakers_page(&window, &tidy_notice);
@@ -844,7 +866,8 @@ fn build_window(app: &adw::Application) {
     split.set_sidebar_width_fraction(0.31);
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar, "Sessions")));
     split.set_content(Some(&adw::NavigationPage::new(&content_toolbar, "Session")));
-    toolbar.set_content(Some(&split));
+    toasts.set_child(Some(&split));
+    toolbar.set_content(Some(&toasts));
     window.set_content(Some(&toolbar));
 
     wire_archive_cleanup(
@@ -1348,6 +1371,7 @@ fn meter_group(name: &str) -> gtk::Box {
     group
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_session_detail(
     window: &adw::ApplicationWindow,
     sessions: &gtk::ListBox,
@@ -1356,6 +1380,8 @@ fn build_session_detail(
     cancel_requested: &Rc<Cell<bool>>,
     busy: &Rc<Cell<bool>>,
     tidy_notice: &adw::Banner,
+    config: &Rc<RefCell<GuiConfig>>,
+    toasts: &adw::ToastOverlay,
 ) -> SessionDetail {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let heading = gtk::Box::new(gtk::Orientation::Vertical, 4);
@@ -1565,6 +1591,8 @@ fn build_session_detail(
         busy: busy.clone(),
         processing,
         tidy_notice: tidy_notice.clone(),
+        config: config.clone(),
+        toasts: toasts.clone(),
     };
     for button in [&detail.hide_mic, &detail.hide_system] {
         let detail_for_toggle = detail.clone();
@@ -1784,10 +1812,12 @@ struct SettingsPage {
     root: gtk::Box,
     meetings: adw::ActionRow,
     screenshots: adw::ActionRow,
+    test_cases: adw::ActionRow,
     context: adw::ActionRow,
     swedish_transcription: gtk::Switch,
     meetings_change: gtk::Button,
     screenshots_change: gtk::Button,
+    test_cases_change: gtk::Button,
     context_change: gtk::Button,
     context_clear: gtk::Button,
     delete_old_archives: adw::SwitchRow,
@@ -1824,6 +1854,18 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
     screenshots_change.set_valign(gtk::Align::Center);
     shots.add_suffix(&screenshots_change);
     storage.add(&shots);
+    let test_cases = adw::ActionRow::builder()
+        .title("Test cases folder")
+        .subtitle(config.test_cases_dir.display().to_string())
+        .tooltip_text(
+            "Where speaker labels saved from a transcript line go, as diarization test cases",
+        )
+        .build();
+    test_cases.add_prefix(&gtk::Image::from_icon_name("bookmark-new-symbolic"));
+    let test_cases_change = gtk::Button::with_label("Change…");
+    test_cases_change.set_valign(gtk::Align::Center);
+    test_cases.add_suffix(&test_cases_change);
+    storage.add(&test_cases);
     let context = adw::ActionRow::builder()
         .title("Meeting context file")
         .subtitle(
@@ -1944,10 +1986,12 @@ fn build_settings_page(config: &GuiConfig) -> SettingsPage {
         root,
         meetings,
         screenshots: shots,
+        test_cases,
         context,
         swedish_transcription,
         meetings_change,
         screenshots_change,
+        test_cases_change,
         context_change,
         context_clear,
         delete_old_archives,
@@ -1992,6 +2036,14 @@ fn wire_settings(
         chooser.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
             let Ok(folder) = result else { return };
             let Some(path) = folder.path() else { return };
+            if folders_nest(&path, &config.borrow().test_cases_dir) {
+                show_error(
+                    &parent_for_result,
+                    "Choose another meetings folder",
+                    "The meetings folder and the test cases folder must not be the same or inside one another: every folder in the meetings folder is listed as a session.",
+                );
+                return;
+            }
             let updated = {
                 let mut updated = config.borrow().clone();
                 updated.meetings_dir = path.clone();
@@ -2049,6 +2101,46 @@ fn wire_settings(
             *config.borrow_mut() = updated;
             row.set_subtitle(&path.display().to_string());
             recording_shots.set_subtitle(&path.display().to_string());
+        });
+    });
+
+    let parent = window.clone();
+    let config_for_cases = config.clone();
+    let row_for_cases = page.test_cases.clone();
+    page.test_cases_change.connect_clicked(move |_| {
+        let chooser = gtk::FileDialog::builder()
+            .title("Choose test cases folder")
+            .accept_label("Use folder")
+            .modal(true)
+            .build();
+        let parent_for_result = parent.clone();
+        let config = config_for_cases.clone();
+        let row = row_for_cases.clone();
+        chooser.select_folder(Some(&parent), None::<&gio::Cancellable>, move |result| {
+            let Ok(folder) = result else { return };
+            let Some(path) = folder.path() else { return };
+            if folders_nest(&path, &config.borrow().meetings_dir) {
+                show_error(
+                    &parent_for_result,
+                    "Choose another test cases folder",
+                    "The test cases folder and the meetings folder must not be the same or inside one another: every folder in the meetings folder is listed as a session.",
+                );
+                return;
+            }
+            let updated = GuiConfig {
+                test_cases_dir: path.clone(),
+                ..config.borrow().clone()
+            };
+            if let Err(error) = updated.save() {
+                show_error(
+                    &parent_for_result,
+                    "Could not save settings",
+                    &error.to_string(),
+                );
+                return;
+            }
+            *config.borrow_mut() = updated;
+            row.set_subtitle(&path.display().to_string());
         });
     });
 
@@ -4962,6 +5054,7 @@ impl SessionDetail {
                 turns,
                 groups,
                 colors,
+                labeled: label::saved_cases(&session),
             };
             if utterances.is_empty() {
                 append_empty(
@@ -5646,12 +5739,13 @@ fn transcript_timeline_row(
     row
 }
 
-/// The turns of every shown line, the cut lines on file by group id, and each
-/// person's colour on the transcript.
+/// The turns of every shown line, the cut lines on file by group id, each
+/// person's colour on the transcript, and the lines saved as test cases.
 struct CutLines {
     turns: Vec<Vec<(Utterance, LineKeep)>>,
     groups: std::collections::HashMap<String, crate::types::TurnGroup>,
     colors: Rc<std::collections::HashMap<String, usize>>,
+    labeled: label::SavedCases,
 }
 
 impl CutLines {
@@ -5687,6 +5781,7 @@ impl CutLines {
                 audio_path,
                 frequent,
                 &self.colors,
+                &self.labeled,
                 menu,
             );
         }
@@ -5700,6 +5795,7 @@ impl CutLines {
             show_timestamp,
             keep_state,
             &self.colors,
+            &self.labeled,
         );
         menu(card.upcast_ref(), keep::line_actions(keep_state, utterance));
         card
@@ -5735,6 +5831,7 @@ fn transcript_card(
     show_timestamp: bool,
     keep_state: LineKeep,
     colors: &Rc<std::collections::HashMap<String, usize>>,
+    labeled: &label::SavedCases,
 ) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
     card.add_css_class("transcript-card");
@@ -5905,6 +6002,16 @@ fn transcript_card(
         }
     });
     head.append(&scissors);
+    head.append(&label::label_button(
+        detail,
+        LineRef {
+            source: utterance.source,
+            start_ms: utterance.start_ms,
+            end_ms: utterance.end_ms,
+        },
+        utterance.speaker.clone(),
+        labeled,
+    ));
     if has_assignable_id(utterance) && is_anonymous_speaker(utterance) && !utterance.echo {
         for name in frequent.iter() {
             let shortcut = shortcut_button(name);
@@ -6729,6 +6836,14 @@ fn append_empty(container: &gtk::Box, text: &str) -> gtk::Label {
     label
 }
 
+/// Whether one folder is the other or inside it, following links where the
+/// folders exist.
+fn folders_nest(a: &Path, b: &Path) -> bool {
+    let resolve = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let (a, b) = (resolve(a), resolve(b));
+    a.starts_with(&b) || b.starts_with(&a)
+}
+
 fn open_path(path: &Path) {
     let file = gio::File::for_path(path);
     let _ = gio::AppInfo::launch_default_for_uri(&file.uri(), None::<&gio::AppLaunchContext>);
@@ -6758,6 +6873,21 @@ fn show_about(parent: &adw::ApplicationWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cases_and_meetings_folders_must_not_nest() {
+        let home = Path::new("/home/ada");
+        assert!(folders_nest(&home.join("Meetings"), &home.join("Meetings")));
+        assert!(folders_nest(
+            &home.join("Meetings/cases"),
+            &home.join("Meetings")
+        ));
+        assert!(folders_nest(home, &home.join("Meetings")));
+        assert!(!folders_nest(
+            &home.join("Meetings 2"),
+            &home.join("Meetings")
+        ));
+    }
 
     fn utterance(speaker: &str, speaker_id: &str, start_ms: u64, end_ms: u64) -> Utterance {
         Utterance {

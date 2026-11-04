@@ -1243,11 +1243,12 @@ impl Player {
     }
 }
 
-fn rgb(cr: &cairo::Context, (red, green, blue): Rgb, alpha: f64) {
+pub(super) fn rgb(cr: &cairo::Context, (red, green, blue): Rgb, alpha: f64) {
     cr.set_source_rgba(red, green, blue, alpha);
 }
 
-fn rounded(cr: &cairo::Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+pub(super) fn rounded(cr: &cairo::Context, x: f64, y: f64, width: f64, height: f64, radius: f64) {
+    let radius = radius.min(width / 2.0).min(height / 2.0).max(0.0);
     cr.new_sub_path();
     cr.arc(x + width - radius, y + radius, radius, -PI / 2.0, 0.0);
     cr.arc(
@@ -1288,7 +1289,7 @@ fn ruler_step(length_ms: u64, span: f64) -> u64 {
 
 /// The level drawn full height: nearly the loudest, so that one click does
 /// not flatten everything else.
-fn display_norm(levels: &[track::Level]) -> f32 {
+pub(super) fn display_norm(levels: &[track::Level]) -> f32 {
     let mut peaks = levels.iter().map(|level| level.peak).collect::<Vec<_>>();
     if peaks.is_empty() {
         return 1.0;

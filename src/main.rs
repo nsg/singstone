@@ -13,6 +13,7 @@ mod screenshot;
 mod session;
 mod speaker;
 mod split;
+mod testcase;
 mod transcription;
 mod types;
 

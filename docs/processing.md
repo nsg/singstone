@@ -498,6 +498,86 @@ is dropped the next time the cuts are saved; when that empties the first
 turn, the first turn takes the speaker of the turn that now holds the line's
 first words, so removing every cut shown leaves one line with that speaker.
 
+### Diarization test cases
+
+A line's audio can be labeled by hand and saved as a test case for the
+diarization, without changing the transcript or any processing input. Each
+case is a private folder (`0700`, files `0600`) in the app's test cases folder,
+named `<session folder>_<m>m<ss>s` after the clip start, with `-mic` or `-both`
+when the clip is not the line's own track and `-2`, `-3`… when another line's
+case has the name:
+
+- `clip.wav`: 16 kHz mono 16-bit PCM of exactly the labeled clip, the line
+  with up to 5 s of context on each side within the recording. **Both** sums
+  the two tracks and clips to [-1, 1]. Archived sessions are read from FLAC.
+- `truth.json`: the labels on the clip's time axis, in seconds rounded to
+  10 ms, the shape `score.py`-style scorers read:
+
+```json
+{
+  "format_version": 1,
+  "id": "ami-3min_0m37s",
+  "source": {"session": "ami-3min", "session_started": "2026-09-14T10:30:00+02:00",
+             "track": "system", "offset_s": 37.68,
+             "duration_s": 8.59,
+             "line": {"start_s": 38.68, "end_s": 45.27, "speaker": "Laura"}},
+  "language": "en",
+  "speakers": {"P1": "Speaker 1", "P2": "Speaker 2"},
+  "segments": [[1.02, 3.8, "P1"], [2.88, 5.43, "P2"]],
+  "exclude": [[6.69, 7.11]],
+  "app": {"version": "0.1.0", "segments": [[0.0, 7.6, "Laura"]]},
+  "notes": [],
+  "labeled_at": "2026-11-04T19:19:46+00:00",
+  "editor": {"line": {"source": "system", "start_ms": 38680, "end_ms": 45270},
+             "track": "system", "context_ms": 1000, "lanes": 2,
+             "bars": [[1, 38697, 41481], [2, 40560, 43110], [0, 44370, 44791]]}
+}
+```
+
+  `session` and `session_started` (the manifest's start) name the recording
+  the case belongs to; a folder name alone does not, since two recordings
+  can have folders of the same name.
+  `segments` are the speaker bars, `[start, end, "P<lane>"]` sorted by start;
+  bars of one lane that touch are joined, and segments that share time are
+  overlap. `speakers` lists the labels used, `exclude` holds the *Not sure*
+  bars, and `language` comes from `words.meta.json` when it names one.
+  `app.segments` is the session's `diarization.jsonl` for the clip's track or
+  tracks, cut to the clip; each segment is named like the transcript line of
+  its track that it overlaps most, or `spk_N` / `mic_N` by cluster when it
+  overlaps none. `editor` keeps the bars in recording milliseconds (`[lane,
+  start_ms, end_ms]`, lane 0 for *Not sure*) with the context, track and lane
+  count, so the case opens again as it was saved.
+- `words.jsonl`: the words whose middle lies in the clip, as
+  `{"start", "end", "text"}` on the clip's axis, plus `"source"` for **Both**.
+  A word too short to last 10 ms after rounding, such as punctuation, lasts
+  10 ms.
+
+`test-cases.json` in the session folder maps each saved line (source, start
+and end) to its folder. A line counts as labeled only while its folder is a
+real directory whose `truth.json` names this recording and this line; a
+folder that is gone, or now holds another case, leaves the line unlabeled. An
+unreadable index stops a save with an error rather than being overwritten.
+
+A save never leaves a line without a case it can reach:
+
+1. The case is written to a hidden `.<name>.saving` folder beside its place.
+2. It moves in whole. A new name is a plain rename. The line's own earlier
+   case of the same name is swapped with it in one step
+   (`renameat2(RENAME_EXCHANGE)`); where the file system cannot swap, the
+   old case stays and the new one takes the next free name instead.
+3. The index is written. If that fails, the swap is undone or the new folder
+   removed, so the index still points to the old case. If the swap cannot be
+   undone, the old case is kept as `<name>.previous` and the error says so.
+4. Only once the index is on disk is the superseded folder removed, as a
+   best effort.
+
+Only folders directly in the test cases folder that hold this recording's case
+of the line are ever replaced or removed; index entries elsewhere are only
+read. A `.<name>.saving` folder left by an interrupted save is removed by the
+next save of that same case; other hidden folders are left alone. Processing, rendering and archiving do not read or change the
+index. A split never meets it, since only unprocessed recordings can be split.
+Deleting a session leaves its test cases where they are.
+
 ### Tidying learned voices
 
 A tidy pass runs when the app starts and after every correction that changed

@@ -70,6 +70,25 @@ lines or learning a voice, since the audio holds more than one. When every turn
 ends up with the same person, the cuts go and the line is named after them.
 Each turn is its own line in both transcript files.
 
+To help improve diarization, turn such a line into a test case instead: its
+bookmark button, **Label speakers for a test case**, opens the line's audio
+with a second of context on each side (0–5 s), its words, and one lane per
+anonymous speaker. Drag on a lane to mark when that person talks, drag a bar's
+edges or middle to adjust it, and use the **Not sure** lane for stretches to
+leave out of scoring; bars on different lanes at the same time are overlap.
+Or press play and hold **1**–**9** (and **0** for *Not sure*) while someone
+talks, several keys at once for crosstalk. **Speed ½×** slows playback without
+changing the pitch, and **System**, **Mic** and **Both** pick the track.
+**Save test case** writes a private folder with `clip.wav` (16 kHz mono),
+`truth.json` (the labels, and what the app's diarization said about the clip)
+and `words.jsonl` to the **Test cases folder** in Settings, by default
+`~/Diarization test cases` (`SINGSTONE_TEST_CASES_DIR` overrides it), which
+must not be the meetings folder or inside it. The
+transcript is not changed. The button turns blue once a line is saved, and
+opens the saved labels for editing; saving again replaces the folder. See
+[Diarization test cases](docs/processing.md#diarization-test-cases) for the
+file format.
+
 Open Speakers to inspect the locally learned voices and the number of voice
 samples stored for each person.
 
@@ -160,6 +179,8 @@ a session can be archived with or without it.
   wrong person. Confirmed lines remain locked across reprocessing.
 - Cuts a line where diarization merged several people into speaker turns,
   each named on its own.
+- Labels who speaks when in a line's audio, overlap included, and saves it as
+  a diarization test case with the clip and the app's own answer.
 - Plays a whole recording from a waveform timeline, with scrubbing and a
   mute per track.
 - Splits a recording that has not been processed yet into two sessions at a

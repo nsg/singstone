@@ -654,6 +654,7 @@ pub(super) fn group_card(
     audio_path: PathBuf,
     frequent: &Rc<Vec<String>>,
     colors: &Rc<HashMap<String, usize>>,
+    labeled: &super::label::SavedCases,
     menu: LineMenu,
 ) -> gtk::Box {
     let group = group.cloned().unwrap_or_else(|| TurnGroup {
@@ -751,6 +752,22 @@ pub(super) fn group_card(
         }
     });
     head.append(&scissors);
+    let mut speakers: Vec<String> = Vec::new();
+    for name in names.iter().filter_map(TurnName::label) {
+        if !speakers.iter().any(|seen| seen == name) {
+            speakers.push(name.to_owned());
+        }
+    }
+    head.append(&super::label::label_button(
+        detail,
+        crate::testcase::LineRef {
+            source: group.source,
+            start_ms,
+            end_ms,
+        },
+        speakers.join(", "),
+        labeled,
+    ));
     menu(head.upcast_ref(), Vec::new());
     card.append(&head);
     let whole_line = |turn: &Utterance| Utterance {

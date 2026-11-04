@@ -183,6 +183,10 @@ impl Session {
     pub fn echo_detections_path(&self) -> PathBuf {
         self.dir.join("echo-detections.jsonl")
     }
+    /// The diarization test cases saved from this session's lines.
+    pub fn test_cases_path(&self) -> PathBuf {
+        self.dir.join("test-cases.json")
+    }
     pub fn transcript_path(&self) -> PathBuf {
         self.dir.join("transcript.jsonl")
     }

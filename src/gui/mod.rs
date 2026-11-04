@@ -1,4 +1,5 @@
 mod config;
+mod cut;
 mod dictation;
 mod keep;
 mod meeting_span;
@@ -116,6 +117,32 @@ const CSS: &str = r#"
 .split-part { padding: 8px 10px; border: 1px solid @borders; border-radius: 10px; background: @card_bg_color; }
 .split-part-1 { border-left: 4px solid #3584e4; }
 .split-part-2 { border-left: 4px solid #e66100; }
+.transcript-card.cut-editing { border-color: @accent_color; box-shadow: 0 0 0 3px alpha(@accent_color, 0.2); }
+.turn-count { border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 600; background: alpha(currentColor, 0.08); }
+.cut-turn { border-left: 3px solid alpha(currentColor, 0.3); border-radius: 4px; padding: 4px 8px 4px 10px; background: alpha(currentColor, 0.03); }
+.cut-turn.turn-0 { border-left-color: #1a5fb4; background: alpha(#1a5fb4, 0.08); }
+.cut-turn.turn-1 { border-left-color: #613583; background: alpha(#613583, 0.08); }
+.cut-turn.turn-2 { border-left-color: #26a269; background: alpha(#26a269, 0.08); }
+.cut-turn.turn-unknown { border-left-color: #e5a50a; background: alpha(#e5a50a, 0.08); }
+.cut-gap { min-width: 7px; min-height: 18px; padding: 0; margin: 0; border-radius: 2px; background: none; box-shadow: none; }
+.cut-gap:hover, .cut-gap:focus-visible { background: linear-gradient(to right, transparent 2px, @accent_color 2px, @accent_color 4px, transparent 4px); }
+.cut-divider { min-height: 18px; padding: 0 2px; color: @accent_color; font-size: 12px; }
+.cut-divider.removing { color: @error_color; }
+.cut-dash { min-height: 0; border-top: 1px dashed alpha(currentColor, 0.6); }
+.cut-bar { margin-top: 4px; padding-top: 8px; border-top: 1px solid @borders; }
+.turn { padding: 4px 0; }
+.turn-follows { border-top: 1px dashed @borders; padding-top: 6px; }
+.turn-stripe { min-width: 3px; border-radius: 3px; background: alpha(currentColor, 0.3); }
+.turn-stripe.turn-0, .turn-avatar.turn-0 { background: #1a5fb4; }
+.turn-stripe.turn-1, .turn-avatar.turn-1 { background: #613583; }
+.turn-stripe.turn-2, .turn-avatar.turn-2 { background: #26a269; }
+.turn-stripe.turn-unknown { background: #e5a50a; }
+.turn-avatar.turn-unknown { color: #63460a; background: #f6d32d; }
+.turn-avatar.turn-none { background: alpha(currentColor, 0.4); }
+.turn-avatar { padding: 4px; }
+button.turn-who { min-height: 0; padding: 1px 8px 1px 1px; border-radius: 999px; font-weight: bold; }
+button.turn-who-none { min-height: 0; padding: 1px 9px; border: 1px dashed @borders; border-radius: 999px; font-weight: 600; color: alpha(currentColor, 0.7); }
+.turn-time { font-feature-settings: "tnum"; }
 "#;
 
 #[derive(Clone)]
@@ -4917,6 +4944,25 @@ impl SessionDetail {
                     },
                 );
             }
+            let frequent = Rc::new(frequent_speakers(&utterances, 3));
+            let colors = Rc::new(cut::person_colors(&utterances));
+            let groups = process::read_speaker_turns(&session)
+                .map(|artifact| artifact.groups)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|group| (group.id(), group))
+                .collect::<std::collections::HashMap<_, _>>();
+            let ranges = groups
+                .iter()
+                .map(|(id, group)| (id.clone(), (group.start_ms, group.end_ms)))
+                .collect();
+            let (utterances, states, turns) =
+                cut::fold_groups(utterances.into_iter().zip(states).collect(), &ranges);
+            let cut_lines = CutLines {
+                turns,
+                groups,
+                colors,
+            };
             if utterances.is_empty() {
                 append_empty(
                     &self.transcript,
@@ -4927,7 +4973,6 @@ impl SessionDetail {
                     },
                 );
             } else {
-                let frequent = Rc::new(frequent_speakers(&utterances, 3));
                 let learned =
                     process::learned_lines(&session, &speakers_database_path(), &utterances);
                 let has_mic = utterances
@@ -4961,6 +5006,7 @@ impl SessionDetail {
                             &frequent,
                             one_sided,
                             &marks,
+                            &cut_lines,
                         ));
                     }
                     container
@@ -5517,6 +5563,7 @@ fn transcript_timeline_row(
     frequent: &Rc<Vec<String>>,
     one_sided: bool,
     marks: &Marks,
+    cut_lines: &CutLines,
 ) -> gtk::Box {
     let timeline_row = &rows[index];
     let span = marks.span;
@@ -5538,7 +5585,8 @@ fn transcript_timeline_row(
     mic.set_visible(!one_sided || !timeline_row.mic.is_empty());
     for &index in &timeline_row.mic {
         let utterance = &utterances[index];
-        let card = transcript_card(
+        let card = cut_lines.card(
+            index,
             utterance,
             learned[index],
             detail,
@@ -5548,19 +5596,18 @@ fn transcript_timeline_row(
             format_timeline_timestamp(utterance.start_ms)
                 != format_timeline_timestamp(timeline_row.start_ms),
             states[index],
+            &markable,
         );
         card.set_halign(if one_sided {
             gtk::Align::Start
         } else {
             gtk::Align::End
         });
-        if !span.contains(utterance.start_ms) || states[index] == LineKeep::Hidden {
+        if !span.contains(utterance.start_ms)
+            || (states[index] == LineKeep::Hidden && !cut_lines.is_cut(index))
+        {
             card.add_css_class("outside-line");
         }
-        markable(
-            card.upcast_ref(),
-            keep::line_actions(states[index], utterance),
-        );
         mic.append(&card);
     }
     row.append(&mic);
@@ -5574,7 +5621,8 @@ fn transcript_timeline_row(
     system.set_visible(!one_sided || !timeline_row.system.is_empty());
     for &index in &timeline_row.system {
         let utterance = &utterances[index];
-        let card = transcript_card(
+        let card = cut_lines.card(
+            index,
             utterance,
             learned[index],
             detail,
@@ -5584,19 +5632,78 @@ fn transcript_timeline_row(
             format_timeline_timestamp(utterance.start_ms)
                 != format_timeline_timestamp(timeline_row.start_ms),
             states[index],
+            &markable,
         );
         card.set_halign(gtk::Align::Start);
-        if !span.contains(utterance.start_ms) || states[index] == LineKeep::Hidden {
+        if !span.contains(utterance.start_ms)
+            || (states[index] == LineKeep::Hidden && !cut_lines.is_cut(index))
+        {
             card.add_css_class("outside-line");
         }
-        markable(
-            card.upcast_ref(),
-            keep::line_actions(states[index], utterance),
-        );
         system.append(&card);
     }
     row.append(&system);
     row
+}
+
+/// The turns of every shown line, the cut lines on file by group id, and each
+/// person's colour on the transcript.
+struct CutLines {
+    turns: Vec<Vec<(Utterance, LineKeep)>>,
+    groups: std::collections::HashMap<String, crate::types::TurnGroup>,
+    colors: Rc<std::collections::HashMap<String, usize>>,
+}
+
+impl CutLines {
+    fn is_cut(&self, index: usize) -> bool {
+        self.turns.get(index).is_some_and(|turns| !turns.is_empty())
+    }
+
+    /// The card of a shown line, with its menu: `menu` gives a widget the line
+    /// menu with these keep items.
+    #[allow(clippy::too_many_arguments)]
+    fn card(
+        &self,
+        index: usize,
+        utterance: &Utterance,
+        learned: bool,
+        detail: &SessionDetail,
+        audio_path: PathBuf,
+        frequent: &Rc<Vec<String>>,
+        mirrored: bool,
+        show_timestamp: bool,
+        keep_state: LineKeep,
+        menu: cut::LineMenu,
+    ) -> gtk::Box {
+        if self.is_cut(index) {
+            return cut::group_card(
+                utterance,
+                &self.turns[index],
+                utterance
+                    .group
+                    .as_ref()
+                    .and_then(|group| self.groups.get(group)),
+                detail,
+                audio_path,
+                frequent,
+                &self.colors,
+                menu,
+            );
+        }
+        let card = transcript_card(
+            utterance,
+            learned,
+            detail,
+            audio_path,
+            frequent,
+            mirrored,
+            show_timestamp,
+            keep_state,
+            &self.colors,
+        );
+        menu(card.upcast_ref(), keep::line_actions(keep_state, utterance));
+        card
+    }
 }
 
 fn timeline_marker(start_ms: u64) -> gtk::Overlay {
@@ -5627,6 +5734,7 @@ fn transcript_card(
     mirrored: bool,
     show_timestamp: bool,
     keep_state: LineKeep,
+    colors: &Rc<std::collections::HashMap<String, usize>>,
 ) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 5);
     card.add_css_class("transcript-card");
@@ -5638,15 +5746,8 @@ fn transcript_card(
     avatar.add_css_class("speaker-avatar");
     if is_anonymous_speaker(utterance) {
         avatar.add_css_class("speaker-unknown");
-    } else if utterance.source == AudioSource::Mic {
-        avatar.add_css_class("speaker-2");
     } else {
-        let speaker_number = utterance
-            .speaker_id
-            .bytes()
-            .fold(0usize, |total, value| total.wrapping_add(value as usize))
-            % 3;
-        avatar.add_css_class(&format!("speaker-{speaker_number}"));
+        avatar.add_css_class(&format!("speaker-{}", avatar_color(utterance)));
     }
     avatar.set_valign(gtk::Align::Start);
     let head = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -5748,7 +5849,16 @@ fn transcript_card(
             let end_ms = utterance.end_ms;
             let frequent = frequent.clone();
             edit.connect_clicked(move |_| {
-                show_assignment_dialog(&detail, source, start_ms, end_ms, None, &frequent);
+                show_assignment_dialog(
+                    &detail,
+                    AssignTarget::Line {
+                        source,
+                        start_ms,
+                        end_ms,
+                    },
+                    None,
+                    &frequent,
+                );
             });
         } else {
             let detail = detail.clone();
@@ -5760,9 +5870,11 @@ fn transcript_card(
             edit.connect_clicked(move |_| {
                 show_assignment_dialog(
                     &detail,
-                    source,
-                    start_ms,
-                    end_ms,
+                    AssignTarget::Line {
+                        source,
+                        start_ms,
+                        end_ms,
+                    },
                     Some(&current),
                     &frequent,
                 );
@@ -5770,6 +5882,29 @@ fn transcript_card(
         }
         head.append(&edit);
     }
+    let scissors = cut::scissors_button("Cut into turns…");
+    let card_for_cut = card.downgrade();
+    let detail_for_cut = detail.clone();
+    let (source, start_ms, end_ms) = (utterance.source, utterance.start_ms, utterance.end_ms);
+    let line_speaker = utterance.speaker.clone();
+    let colors = colors.clone();
+    scissors.connect_clicked(move |_| {
+        if let Some(card) = card_for_cut.upgrade() {
+            cut::enter_cut_mode(
+                &card,
+                cut::CutTarget {
+                    source,
+                    start_ms,
+                    end_ms,
+                    group: None,
+                    line_speaker: line_speaker.clone(),
+                    colors: colors.clone(),
+                },
+                &detail_for_cut,
+            );
+        }
+    });
+    head.append(&scissors);
     if has_assignable_id(utterance) && is_anonymous_speaker(utterance) && !utterance.echo {
         for name in frequent.iter() {
             let shortcut = shortcut_button(name);
@@ -5793,6 +5928,19 @@ fn transcript_card(
     text.set_selectable(true);
     card.append(&text);
     card
+}
+
+/// The colour of a named line's avatar: green for the microphone, and one of
+/// three per diarized system voice.
+fn avatar_color(utterance: &Utterance) -> usize {
+    if utterance.source == AudioSource::Mic {
+        return 2;
+    }
+    utterance
+        .speaker_id
+        .bytes()
+        .fold(0usize, |total, value| total.wrapping_add(value as usize))
+        % 3
 }
 
 fn caption_button(text: &str) -> gtk::Button {
@@ -5852,26 +6000,44 @@ fn frequent_speakers(utterances: &[Utterance], limit: usize) -> Vec<String> {
         .collect()
 }
 
+/// What a speaker name goes to: a whole line, or one turn of a cut line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignTarget {
+    Line {
+        source: AudioSource,
+        start_ms: u64,
+        end_ms: u64,
+    },
+    Turn {
+        source: AudioSource,
+        group_start_ms: u64,
+        turn_start_ms: u64,
+    },
+}
+
 fn show_assignment_dialog(
     detail: &SessionDetail,
-    source: AudioSource,
-    start_ms: u64,
-    end_ms: u64,
+    target: AssignTarget,
     current: Option<&str>,
     frequent: &[String],
 ) {
-    let (heading, body) = if let Some(current) = current {
-        (
+    const TURN_ONLY: &str = "The name is locked on this turn only. Its voice is not learned, and later lines are not renamed, because a cut line holds more than one voice.";
+    let (heading, body) = match (target, current) {
+        (AssignTarget::Line { .. }, Some(current)) => (
             "Change this speaker",
             format!(
                 "Currently {current}. The new name is locked on this line. Later lines that Singstone recognizes as the same voice get the name too, without a lock. Earlier lines stay as they are. When the local voice model is available, it also learns the voice under the new name."
             ),
-        )
-    } else {
-        (
+        ),
+        (AssignTarget::Line { .. }, None) => (
             "Who is this speaker?",
             "The name is locked on this line. Later lines that Singstone recognizes as the same voice get the name too, without a lock. Earlier lines stay as they are. When the local voice model is available, it also learns this voice for future meetings.".to_owned(),
-        )
+        ),
+        (AssignTarget::Turn { .. }, Some(current)) => (
+            "Who says this turn?",
+            format!("Currently {current}. {TURN_ONLY}"),
+        ),
+        (AssignTarget::Turn { .. }, None) => ("Who says this turn?", TURN_ONLY.to_owned()),
     };
     let dialog = adw::AlertDialog::new(Some(heading), Some(&body));
     let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -5989,9 +6155,7 @@ fn show_assignment_dialog(
                 submit_assignment(
                     &dialog,
                     &detail_for_keys,
-                    source,
-                    start_ms,
-                    end_ms,
+                    target,
                     current_for_keys.as_deref(),
                     name,
                 );
@@ -6015,9 +6179,7 @@ fn show_assignment_dialog(
             submit_assignment(
                 &dialog,
                 &detail_for_row,
-                source,
-                start_ms,
-                end_ms,
+                target,
                 current_for_row.as_deref(),
                 name,
             );
@@ -6031,9 +6193,7 @@ fn show_assignment_dialog(
         submit_assignment(
             dialog,
             &detail_for_response,
-            source,
-            start_ms,
-            end_ms,
+            target,
             current.as_deref(),
             entry_for_response.text().to_string(),
         );
@@ -6120,9 +6280,7 @@ fn assignment_suggestion_name(row: &gtk::ListBoxRow) -> Option<String> {
 fn submit_assignment(
     dialog: &adw::AlertDialog,
     detail: &SessionDetail,
-    source: AudioSource,
-    start_ms: u64,
-    end_ms: u64,
+    target: AssignTarget,
     current: Option<&str>,
     name: String,
 ) {
@@ -6143,7 +6301,33 @@ fn submit_assignment(
         return;
     }
     dialog.close();
-    start_assignment(detail, source, start_ms, end_ms, name);
+    match target {
+        AssignTarget::Line {
+            source,
+            start_ms,
+            end_ms,
+        } => start_assignment(detail, source, start_ms, end_ms, name),
+        AssignTarget::Turn {
+            source,
+            group_start_ms,
+            turn_start_ms,
+        } => {
+            let request = process::TurnRequest {
+                source,
+                group_start_ms,
+                turn_start_ms,
+                speaker: name,
+            };
+            update_transcript(
+                detail,
+                "Name turns once processing has finished.",
+                "Could not name the turn",
+                move |session| {
+                    process::name_turn(&ProcessArgs::for_session(session.to_owned()), &request)
+                },
+            );
+        }
+    }
 }
 
 fn start_assignment(
@@ -6253,6 +6437,22 @@ fn update_hidden_sources(
     detail: &SessionDetail,
     update: impl FnOnce(&Path) -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
 ) {
+    update_transcript(
+        detail,
+        "Change hidden lines once processing has finished.",
+        "Could not update the transcript",
+        update,
+    );
+}
+
+/// Runs `update` on the selected session off the main thread and shows the
+/// session again.
+fn update_transcript(
+    detail: &SessionDetail,
+    while_processing: &'static str,
+    failure: &'static str,
+    update: impl FnOnce(&Path) -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
+) {
     if detail.busy.get() {
         return;
     }
@@ -6260,11 +6460,7 @@ fn update_hidden_sources(
         return;
     };
     if detail.queue.borrow().state(&session) == Some(JobState::Running) {
-        show_error(
-            &detail.window,
-            "Session is processing",
-            "Change hidden lines once processing has finished.",
-        );
+        show_error(&detail.window, "Session is processing", while_processing);
         return;
     }
     detail.busy.set(true);
@@ -6288,7 +6484,7 @@ fn update_hidden_sources(
         progress.close();
         reload_session(&detail);
         if let Err(error) = result {
-            show_error(&detail.window, "Could not update the transcript", &error);
+            show_error(&detail.window, failure, &error);
         }
         glib::ControlFlow::Break
     });
@@ -6573,6 +6769,7 @@ mod tests {
             text: "text".into(),
             locked: false,
             echo: false,
+            group: None,
         }
     }
 

@@ -60,6 +60,16 @@ recognizes as the same voice. Those later lines stay unlocked, so a later
 choice can rename them. Earlier lines are never changed. A lock icon marks a
 line you named, and a fingerprint icon marks a line whose voice was learned.
 
+When one line holds several people talking back and forth, press its scissors
+button to cut it into turns. Click between two words to place a cut, or click
+a cut to remove it; Tab to a gap and press Enter to cut from the keyboard, and
+Escape cancels. After **Done** the line stays one bubble with one play button,
+and each turn shows its own speaker: the first keeps the line's name, and new
+turns ask **Who?**. Naming a turn names only that turn, without renaming later
+lines or learning a voice, since the audio holds more than one. When every turn
+ends up with the same person, the cuts go and the line is named after them.
+Each turn is its own line in both transcript files.
+
 Open Speakers to inspect the locally learned voices and the number of voice
 samples stored for each person.
 
@@ -148,6 +158,8 @@ a session can be archived with or without it.
 - Names speakers from the transcript: one-click shortcuts for people already
   in the meeting, and line-specific correction when a voice was matched to the
   wrong person. Confirmed lines remain locked across reprocessing.
+- Cuts a line where diarization merged several people into speaker turns,
+  each named on its own.
 - Plays a whole recording from a waveform timeline, with scrubbing and a
   mute per track.
 - Splits a recording that has not been processed yet into two sessions at a

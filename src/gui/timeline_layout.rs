@@ -245,6 +245,7 @@ mod tests {
             text: String::new(),
             locked: false,
             echo: false,
+            group: None,
         }
     }
 

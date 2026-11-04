@@ -1,5 +1,5 @@
 use crate::types::{
-    AudioSource, KeptRange, SpeakerCorrection, SpeakerSegment, TimedWord, Utterance,
+    AudioSource, KeptRange, SpeakerCorrection, SpeakerSegment, TimedWord, TurnGroup, Utterance,
 };
 use std::collections::HashMap;
 
@@ -60,6 +60,7 @@ pub fn build_utterances(
         recognized,
         corrections,
         &[],
+        &[],
         local_speaker,
         diarize_mic,
         tolerance_ms,
@@ -71,7 +72,8 @@ pub fn build_utterances(
 
 /// Builds the utterances and tells which consist of words kept by `kept`,
 /// each word by its midpoint; a kept stretch never shares a line with words
-/// outside it.
+/// outside it. Each turn of a group is one line of its own, named after the
+/// turn when it has a name.
 #[allow(clippy::too_many_arguments)]
 pub fn build_kept_utterances(
     words: &[TimedWord],
@@ -79,6 +81,7 @@ pub fn build_kept_utterances(
     segments: &[SpeakerSegment],
     recognized: &HashMap<(AudioSource, u32), String>,
     corrections: &[SpeakerCorrection],
+    groups: &[TurnGroup],
     kept: &[KeptRange],
     local_speaker: &str,
     diarize_mic: bool,
@@ -115,12 +118,19 @@ pub fn build_kept_utterances(
             .collect::<Vec<_>>();
         source_words.sort_by_key(|(_, word)| (word.start_ms, word.end_ms));
         let mut current: Option<(Utterance, bool)> = None;
+        let mut current_turn = None;
         for (index, word) in source_words {
             let word_echo = source == AudioSource::Mic && echo[index];
+            let word_midpoint = midpoint(word);
             let word_kept = kept
                 .iter()
-                .any(|range| range.contains(source, midpoint(word)));
-            let (speaker_id, speaker, locked) = word_speaker(
+                .any(|range| range.contains(source, word_midpoint));
+            let place = groups
+                .iter()
+                .find(|group| group.contains(source, word_midpoint))
+                .map(|group| (group, group.turn_at(word.start_ms)));
+            let turn = place.map(|(group, turn)| (group.start_ms, turn));
+            let (speaker_id, mut speaker, mut locked) = word_speaker(
                 word,
                 segments,
                 recognized,
@@ -130,19 +140,29 @@ pub fn build_kept_utterances(
                 diarize_mic,
                 tolerance_ms,
             );
+            if let Some(name) = place
+                .and_then(|(group, turn)| group.turns.get(turn))
+                .and_then(|turn| turn.speaker.as_ref())
+            {
+                speaker.clone_from(name);
+                locked = true;
+            }
             let split = current.as_ref().is_some_and(|(utterance, kept)| {
                 *kept != word_kept
-                    || utterance.speaker_id != speaker_id
-                    || utterance.speaker != speaker
-                    || utterance.locked != locked
                     || utterance.echo != word_echo
-                    || word.start_ms.saturating_sub(utterance.end_ms) > 1_000
-                    || (utterance.end_ms.saturating_sub(utterance.start_ms) >= 15_000
-                        && ends_sentence(&utterance.text))
+                    || current_turn != turn
+                    || (turn.is_none()
+                        && (utterance.speaker_id != speaker_id
+                            || utterance.speaker != speaker
+                            || utterance.locked != locked
+                            || word.start_ms.saturating_sub(utterance.end_ms) > 1_000
+                            || (utterance.end_ms.saturating_sub(utterance.start_ms) >= 15_000
+                                && ends_sentence(&utterance.text))))
             });
             if split && let Some(utterance) = current.take() {
                 output.push(utterance);
             }
+            current_turn = turn;
             if let Some((utterance, _)) = current.as_mut() {
                 utterance.end_ms = utterance.end_ms.max(word.end_ms);
                 append_word(&mut utterance.text, &word.text);
@@ -157,6 +177,7 @@ pub fn build_kept_utterances(
                         text: clean_text(&word.text),
                         locked,
                         echo: word_echo,
+                        group: place.map(|(group, _)| group.id()),
                     },
                     word_kept,
                 ));
@@ -171,7 +192,7 @@ pub fn build_kept_utterances(
     output
 }
 
-fn midpoint(word: &TimedWord) -> u64 {
+pub fn midpoint(word: &TimedWord) -> u64 {
     word.start_ms
         .saturating_add(word.end_ms.saturating_sub(word.start_ms) / 2)
 }
@@ -558,6 +579,105 @@ mod tests {
                 .iter()
                 .filter(|utterance| utterance.source == AudioSource::System)
                 .all(|utterance| !utterance.echo)
+        );
+    }
+
+    fn cut(start_ms: u64, end_ms: u64, turns: &[(u64, Option<&str>)]) -> TurnGroup {
+        TurnGroup {
+            source: AudioSource::System,
+            start_ms,
+            end_ms,
+            turns: turns
+                .iter()
+                .map(|&(start_ms, speaker)| crate::types::Turn {
+                    start_ms,
+                    speaker: speaker.map(str::to_owned),
+                })
+                .collect(),
+        }
+    }
+
+    fn cut_lines(
+        words: &[TimedWord],
+        segments: &[SpeakerSegment],
+        corrections: &[SpeakerCorrection],
+        groups: &[TurnGroup],
+    ) -> Vec<(String, String, bool, Option<String>)> {
+        build_kept_utterances(
+            words,
+            &vec![false; words.len()],
+            segments,
+            &HashMap::new(),
+            corrections,
+            groups,
+            &[],
+            "Me",
+            false,
+            0,
+        )
+        .into_iter()
+        .map(|(line, _)| (line.text, line.speaker, line.locked, line.group))
+        .collect()
+    }
+
+    #[test]
+    fn named_turns_win_over_corrections_and_every_turn_is_its_own_line() {
+        let words = [
+            word(AudioSource::System, 0, 100, "before"),
+            word(AudioSource::System, 200, 300, "a"),
+            word(AudioSource::System, 300, 400, "b"),
+            word(AudioSource::System, 400, 500, "c"),
+            word(AudioSource::System, 600, 700, "d"),
+            word(AudioSource::System, 800, 900, "after"),
+        ];
+        let segments = [segment(AudioSource::System, 0, 1_000, 0)];
+        let corrections = [SpeakerCorrection {
+            source: AudioSource::System,
+            start_ms: 0,
+            end_ms: 900,
+            speaker: "Laura".into(),
+            inferred: false,
+        }];
+        let groups = [cut(
+            200,
+            700,
+            &[(200, None), (400, Some("Andrew")), (600, None)],
+        )];
+        let group = Some("system-200".to_owned());
+        let line = |text: &str, speaker: &str, group: &Option<String>| {
+            (text.to_owned(), speaker.to_owned(), true, group.clone())
+        };
+        assert_eq!(
+            cut_lines(&words, &segments, &corrections, &groups),
+            [
+                line("before", "Laura", &None),
+                line("a b", "Laura", &group),
+                line("c", "Andrew", &group),
+                line("d", "Laura", &group),
+                line("after", "Laura", &None),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unnamed_turn_stays_one_line_across_voices_and_pauses() {
+        let words = [
+            word(AudioSource::System, 0, 100, "one"),
+            word(AudioSource::System, 2_000, 2_100, "two"),
+            word(AudioSource::System, 2_200, 2_300, "three"),
+        ];
+        let segments = [
+            segment(AudioSource::System, 0, 1_000, 0),
+            segment(AudioSource::System, 1_900, 2_400, 1),
+        ];
+        let groups = [cut(0, 2_300, &[(0, None), (2_200, Some("Craig"))])];
+        let lines = cut_lines(&words, &segments, &[], &groups);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|(text, speaker, locked, _)| (text.as_str(), speaker.as_str(), *locked))
+                .collect::<Vec<_>>(),
+            [("one two", "SPEAKER_00", false), ("three", "Craig", true)]
         );
     }
 }

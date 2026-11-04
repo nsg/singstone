@@ -233,6 +233,7 @@ mod tests {
             text: "text".into(),
             locked: false,
             echo,
+            group: None,
         }
     }
 

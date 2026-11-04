@@ -433,6 +433,71 @@ The GUI applies every proposed row without asking, as an inferred entry. Only
 the line named by hand is locked and learned; rows that are not proposed keep
 their current name.
 
+### Cutting a line into turns
+
+When diarization heard two or more people as one voice, a line can be cut into
+turns, each with its own speaker. The audio is not cut: the line stays one
+group with one playback range. Cuts are kept in the versioned
+`speaker-turns.json` artifact:
+
+```json
+{
+  "format_version": 1,
+  "groups": [
+    {"source":"system","start_ms":38680,"end_ms":45270,
+     "turns":[{"start_ms":38680,"speaker":null},
+              {"start_ms":43040,"speaker":"Andrew"},
+              {"start_ms":44030,"speaker":"Craig"}]}
+  ]
+}
+```
+
+Groups of one source may touch at an endpoint but not overlap, a start is
+used once per source, and each group's first turn starts with it and every
+turn lies inside it; a file that breaks this is rejected when it is read, and
+a cut that would overlap another cut line is refused. A word belongs to a
+group when its midpoint is inside `[start_ms, end_ms]` on the same source, and to the last turn that starts at or before the word does,
+so a cut sits exactly at the start of the word after it. The first turn starts
+with the group. Each turn is rendered as one line of its own, whatever the
+voices and pauses inside it, timed from its own words, and never shares a line
+with words outside the group; only a change of echo or kept state splits it
+further. A named turn takes its name and `"locked":true`, overriding
+corrections and recognition. A turn with a `null` speaker keeps what the line
+would otherwise get, a correction's name or the cluster's.
+
+Naming a turn names only that turn: no later line is renamed, and no voice is
+learned or forgotten, because the audio of a cut line holds more than one
+voice. For the same reason a chunk of `embeddings.jsonl` that reaches into a
+cut line is never used for a voice: not to learn or unlearn when a
+neighbouring line is named, not to score later lines for proposals, and not
+for the app's learned-line mark. A cut line is never proposed as a later line
+of a voice either. Whenever a line is cut or its cuts change, every sample
+that this session learned from the line's source and that matches the vector
+of such a chunk (cosine similarity at least `0.999`) is removed, under
+whichever name holds it, so audio taught by the line itself or by a
+neighbouring line before the cut stops counting; samples learned in other
+sessions are left alone. Only the current `embeddings.jsonl` is compared, so a
+sample learned before reprocessing moved the chunk boundaries is not found and
+stays. Locks stay, so the unnamed turns keep the line's name.
+
+When every turn ends up with the same speaker, counting an unnamed first turn
+as the line's current name, the group is removed and the whole range becomes
+one locked line, stored as a correction, without learning. Removing every cut
+does the same, keeping the first turn's name when it has one. Removing one
+cut joins two turns, and the joined turn keeps the earlier turn's speaker. A
+line outside the meeting, a hidden line and a kept line move as described
+under [Render](#4-render-intermediate-artifacts-to-the-final-transcript).
+
+Like corrections, cuts are keyed by source and time and kept across
+reprocessing, and a failed render puts `speaker-turns.json` back as it was.
+When new word timings move a word past a cut, the app's cut mode shows the cut
+before the first word that rendering puts in its turn, and removing it there
+removes it from the file. Words that rendering puts in different turns are
+never shown as one, punctuation included. A cut that no longer starts any word
+is dropped the next time the cuts are saved; when that empties the first
+turn, the first turn takes the speaker of the turn that now holds the line's
+first words, so removing every cut shown leaves one line with that speaker.
+
 ### Tidying learned voices
 
 A tidy pass runs when the app starts and after every correction that changed
@@ -486,6 +551,7 @@ singstone render SESSION
 **Input:** `manifest.json`, `words.jsonl`, `diarization.jsonl`, their metadata
 sidecars when present, optionally
 `speaker-assignments.json`, optionally `speaker-corrections.json`, optionally
+`speaker-turns.json`, optionally
 `hidden-sources.json`, optionally `meeting-span.json`, and the audio tracks
 when both are available. Missing assignment, correction, hidden-source, and
 meeting-span data is allowed, but malformed or unsupported assignment,
@@ -544,6 +610,9 @@ They override recognized and anonymous display names without replacing the
 cluster ID. Grouping starts a new utterance when the lock state changes, so a
 confirmed range cannot be merged into an unlocked row.
 
+The turns in `speaker-turns.json` are applied next, as described under
+[Cutting a line into turns](#cutting-a-line-into-turns).
+
 Audio-detected words form their own microphone utterances and carry
 `"echo":true` in `transcript.jsonl`. Surrounding local words form separate,
 unmarked utterances, and system utterances are never marked. Older transcripts
@@ -597,6 +666,9 @@ A speaker rule follows the rendered name, so naming a hidden line yourself
 (see [Manual assignment and correction](#manual-assignment-and-correction))
 lets your rule keep it, and the later lines of that voice you accept. Hidden
 lines can be named, and later hidden lines are proposed like transcript lines.
+The turns of a cut line are lines of their own here, so a speaker rule keeps
+only the turns of that speaker; the app offers each turn its own speaker's
+rules, and **Keep this line** on any turn keeps the whole cut line.
 
 Every utterance of a hidden source that nothing keeps is written to
 `hidden-lines.jsonl`, in the transcript's format and whether it is inside the
@@ -628,7 +700,8 @@ recording. The meeting must not be empty: `end_ms` must be above `start_ms`,
 or above 0 without a start, and when the recorded audio can be read, `start_ms`
 must be below its length. An
 utterance belongs to the meeting when its `start_ms` lies in
-`[start_ms, end_ms)`. Utterances outside it are omitted from
+`[start_ms, end_ms)`; the turns of a cut line all go where the group's first
+turn starts, whichever of them are shown. Utterances outside it are omitted from
 `transcript.jsonl` and `transcript.txt` and written instead to
 `outside-meeting.jsonl`, in the same format, so the app can still show them;
 that file exists only while the session has a span. Timestamps stay relative to
@@ -657,7 +730,8 @@ The stage replaces the canonical `transcript.jsonl` and readable
 {"start_ms":12340,"end_ms":15780,"source":"system","speaker_id":"spk_0","speaker":"Alice","text":"I think we should ship it on Friday.","locked":true}
 ```
 
-Unlocked utterances omit the `locked` field.
+Unlocked utterances omit the `locked` field. The turns cut from one line share
+a `group` id, such as `"group":"system-38680"`, which other lines omit.
 
 ```text
 [00:00:12.340] Alice: I think we should ship it on Friday.

@@ -114,6 +114,52 @@ pub struct SpeakerCorrections {
     pub corrections: Vec<SpeakerCorrection>,
 }
 
+pub const SPEAKER_TURNS_FORMAT_VERSION: u32 = 1;
+
+/// `speaker-turns.json`: lines cut into turns, each with its own speaker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeakerTurns {
+    pub format_version: u32,
+    pub groups: Vec<TurnGroup>,
+}
+
+/// One line cut into turns. A word belongs to the group when its midpoint is
+/// in `[start_ms, end_ms]`, and to the last turn that starts at or before the
+/// word does, else to the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnGroup {
+    pub source: AudioSource,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub turns: Vec<Turn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Turn {
+    pub start_ms: u64,
+    /// A name given to this turn alone; none keeps the line's own name.
+    pub speaker: Option<String>,
+}
+
+impl TurnGroup {
+    /// The `group` of the transcript lines cut from this one.
+    pub fn id(&self) -> String {
+        format!("{}-{}", self.source, self.start_ms)
+    }
+
+    pub fn contains(&self, source: AudioSource, at_ms: u64) -> bool {
+        self.source == source && (self.start_ms..=self.end_ms).contains(&at_ms)
+    }
+
+    /// The turn a word starting at `start_ms` belongs to.
+    pub fn turn_at(&self, start_ms: u64) -> usize {
+        self.turns
+            .iter()
+            .rposition(|turn| turn.start_ms <= start_ms)
+            .unwrap_or(0)
+    }
+}
+
 pub const HIDDEN_SOURCES_FORMAT_VERSION: u32 = 2;
 
 /// `hidden-sources.json`: the sources left out of the transcript and the lines
@@ -235,6 +281,9 @@ pub struct Utterance {
         deserialize_with = "deserialize_echo"
     )]
     pub echo: bool,
+    /// Shared by the turns cut from one line, see [`TurnGroup::id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {

@@ -7,6 +7,7 @@ use crate::diarization::sherpa::SherpaDiarizer;
 use crate::format::jsonl;
 use crate::meeting::{self, MeetingDetails};
 use crate::merge::leakage::{self, AudioEnvelopes};
+use crate::merge::turns;
 use crate::merge::utterances::{self, DEFAULT_NEAREST_TOLERANCE_MS};
 use crate::models;
 use crate::session::Session;
@@ -20,9 +21,10 @@ use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
     AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, HIDDEN_SOURCES_FORMAT_VERSION,
-    HiddenSources, KeptRange, Manifest, MeetingSpan, MeetingSpanFile, SAMPLE_RATE, SessionState,
-    SpeakerAssignment, SpeakerAssignmentProvenance, SpeakerAssignments, SpeakerCorrection,
-    SpeakerCorrections, SpeakerSegment, TimedWord, Utterance,
+    HiddenSources, KeptRange, Manifest, MeetingSpan, MeetingSpanFile, SAMPLE_RATE,
+    SPEAKER_TURNS_FORMAT_VERSION, SessionState, SpeakerAssignment, SpeakerAssignmentProvenance,
+    SpeakerAssignments, SpeakerCorrection, SpeakerCorrections, SpeakerSegment, SpeakerTurns,
+    TimedWord, TurnGroup, Utterance,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -511,18 +513,35 @@ fn write_render_input_and_render(
     path: &Path,
     write: impl FnOnce(&Path) -> io::Result<()>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let paths = [
-        path.to_owned(),
-        session.outside_meeting_path(),
-        session.hidden_lines_path(),
-        session.transcript_path(),
-        session.transcript_text_path(),
-    ];
+    write_render_inputs_and_render(session, &[path.to_owned()], || write(path))
+}
+
+/// [`write_render_input_and_render`] for a change to several inputs at once.
+fn write_render_inputs_and_render(
+    session: &Session,
+    inputs: &[PathBuf],
+    write: impl FnOnce() -> io::Result<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = inputs
+        .iter()
+        .cloned()
+        .chain([
+            session.outside_meeting_path(),
+            session.hidden_lines_path(),
+            session.transcript_path(),
+            session.transcript_text_path(),
+        ])
+        .collect::<Vec<_>>();
     let previous = paths
         .iter()
         .map(|path| read_optional_file(path))
         .collect::<io::Result<Vec<_>>>()?;
-    write(path)?;
+    if let Err(error) = write() {
+        for (path, previous) in paths.iter().zip(&previous).take(inputs.len()) {
+            let _ = restore_file(path, previous.as_deref());
+        }
+        return Err(error.into());
+    }
     if let Err(render_error) = run_render(RenderArgs {
         session: session.dir.clone(),
         diarize_mic: None,
@@ -730,6 +749,317 @@ pub fn set_meeting_span(
     })
 }
 
+/// A line to cut into turns, or a group to cut again: `cuts` are where every
+/// turn after the first starts. `first_from` names the turn of the group whose
+/// speaker the first turn takes, when its own turn no longer starts any word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutRequest {
+    pub source: AudioSource,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub cuts: Vec<u64>,
+    pub first_from: Option<u64>,
+}
+
+/// A name for one turn of the group that starts at `group_start_ms`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRequest {
+    pub source: AudioSource,
+    pub group_start_ms: u64,
+    pub turn_start_ms: u64,
+    pub speaker: String,
+}
+
+/// Cuts a line into turns, or changes the cuts of a group. The voice samples
+/// learned from audio the cut line reaches into are forgotten, whoever taught
+/// them, since that audio holds more than one voice.
+pub fn cut_line(
+    args: &ProcessArgs,
+    request: &CutRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if request.end_ms < request.start_ms {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a cut line must not end before it starts",
+        )
+        .into());
+    }
+    let (session, _) = open_session(&args.session)?;
+    let mut artifact = read_speaker_turns(&session)?;
+    let previous = artifact
+        .groups
+        .iter()
+        .position(|group| group.source == request.source && group.start_ms == request.start_ms)
+        .map(|index| artifact.groups.remove(index));
+    let group = turns::with_cuts(
+        previous.as_ref(),
+        request.source,
+        request.start_ms,
+        request.end_ms,
+        &request.cuts,
+        request.first_from,
+    );
+    let mut corrections = read_speaker_corrections(&session)?;
+    let first_line_speaker = first_turn_speaker(&session, &group)?;
+    let cut = settle_group(
+        &mut artifact,
+        &mut corrections,
+        group,
+        first_line_speaker.as_deref(),
+    )?;
+    save_turns_and_render(&session, &artifact, &corrections)?;
+    if cut {
+        let database_path = args
+            .speakers_db
+            .clone()
+            .unwrap_or_else(database::default_path);
+        forget_line_voices(&session, &database_path, request).map_err(|error| {
+            io::Error::other(format!(
+                "the line was cut, but the voices learned from its audio could not be forgotten: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Names one turn and nothing else: no voice is learned or forgotten and no
+/// later line is renamed, since a cut line holds more than one voice.
+pub fn name_turn(
+    args: &ProcessArgs,
+    request: &TurnRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let speaker = request
+        .speaker
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if speaker.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "speaker name cannot be empty").into(),
+        );
+    }
+    let database_path = args
+        .speakers_db
+        .clone()
+        .unwrap_or_else(database::default_path);
+    let speaker = match SpeakerDatabase::peek(&database_path) {
+        Ok(database) => database.resolve_name(&speaker),
+        Err(_) => speaker,
+    };
+    let (session, _) = open_session(&args.session)?;
+    let mut artifact = read_speaker_turns(&session)?;
+    let not_found = || {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no turn of a cut {} line starts at {} ms",
+                request.source, request.turn_start_ms
+            ),
+        )
+    };
+    let index = artifact
+        .groups
+        .iter()
+        .position(|group| {
+            group.source == request.source && group.start_ms == request.group_start_ms
+        })
+        .ok_or_else(not_found)?;
+    let mut group = artifact.groups.remove(index);
+    group
+        .turns
+        .iter_mut()
+        .find(|turn| turn.start_ms == request.turn_start_ms)
+        .ok_or_else(not_found)?
+        .speaker = Some(speaker);
+    let mut corrections = read_speaker_corrections(&session)?;
+    let first_line_speaker = first_turn_speaker(&session, &group)?;
+    settle_group(
+        &mut artifact,
+        &mut corrections,
+        group,
+        first_line_speaker.as_deref(),
+    )?;
+    save_turns_and_render(&session, &artifact, &corrections)
+}
+
+/// Files the group, or joins it back into one line; tells whether it stays
+/// cut. `artifact` holds the other groups only; a group that would overlap
+/// one of them is refused rather than replacing it.
+fn settle_group(
+    artifact: &mut SpeakerTurns,
+    corrections: &mut SpeakerCorrections,
+    group: TurnGroup,
+    first_line_speaker: Option<&str>,
+) -> io::Result<bool> {
+    let (source, start_ms, end_ms) = (group.source, group.start_ms, group.end_ms);
+    match turns::settle(group, first_line_speaker) {
+        turns::Settled::Turns(group) => {
+            artifact.groups.push(group);
+            turns::check_groups(&artifact.groups)
+                .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+            artifact
+                .groups
+                .sort_by_key(|group| (group.start_ms, source_order(group.source)));
+            Ok(true)
+        }
+        turns::Settled::Line(name) => {
+            if let Some(speaker) = name {
+                upsert_correction(
+                    corrections,
+                    SpeakerCorrection {
+                        source,
+                        start_ms,
+                        end_ms,
+                        speaker,
+                        inferred: false,
+                    },
+                );
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// The transcript's name for the first turn of `group` while it has none of
+/// its own: the name of the line it was cut from.
+fn first_turn_speaker(session: &Session, group: &TurnGroup) -> io::Result<Option<String>> {
+    if group
+        .turns
+        .first()
+        .is_some_and(|turn| turn.speaker.is_some())
+    {
+        return Ok(None);
+    }
+    let id = group.id();
+    let mut lines = read_correctable_lines(session)?;
+    lines.extend(read_outside_meeting(session)?);
+    Ok(lines
+        .into_iter()
+        .filter(|line| {
+            line.source == group.source
+                && (line.group.as_deref() == Some(id.as_str())
+                    || (line.start_ms == group.start_ms && line.end_ms == group.end_ms))
+        })
+        .min_by_key(|line| line.start_ms)
+        .map(|line| line.speaker))
+}
+
+fn save_turns_and_render(
+    session: &Session,
+    artifact: &SpeakerTurns,
+    corrections: &SpeakerCorrections,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let turns_path = session.speaker_turns_path();
+    let corrections_path = session.speaker_corrections_path();
+    let corrections_changed = corrections != &read_speaker_corrections(session)?;
+    write_render_inputs_and_render(
+        session,
+        &[turns_path.clone(), corrections_path.clone()],
+        || {
+            if artifact.groups.is_empty() {
+                remove_if_present(&turns_path)?;
+            } else {
+                write_json_atomic(&turns_path, artifact)?;
+            }
+            if corrections_changed {
+                write_json_atomic(&corrections_path, corrections)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Drops the samples a line taught `names` before it was cut.
+/// Drops every sample this session learned from `line`'s source, under any
+/// name, that is the vector of a chunk reaching into `line`; samples learned
+/// in other sessions are left alone.
+fn forget_line_voices(
+    session: &Session,
+    database_path: &Path,
+    line: &CutRequest,
+) -> io::Result<usize> {
+    if !database_path.is_file() {
+        return Ok(0);
+    }
+    let chunks: Vec<EmbeddingChunk> = match jsonl::read_all(&session.embeddings_path()) {
+        Ok(chunks) => chunks,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let vectors = chunks
+        .iter()
+        .filter(|chunk| chunk_reaches_into(chunk, line.source, line.start_ms, line.end_ms))
+        .map(|chunk| &chunk.embedding)
+        .collect::<Vec<_>>();
+    if vectors.is_empty() {
+        return Ok(0);
+    }
+    let lock = SpeakerDatabase::lock(database_path)?;
+    let mut database = SpeakerDatabase::load_locked(database_path, &lock)?;
+    let names = database.speakers.keys().cloned().collect::<Vec<_>>();
+    let learned_from = session_id(session);
+    let forgotten = names
+        .iter()
+        .flat_map(|name| vectors.iter().map(move |vector| (name, vector)))
+        .map(|(name, vector)| {
+            database.forget_learned_from(
+                name,
+                vector,
+                SAME_VECTOR_SIMILARITY,
+                &learned_from,
+                line.source,
+            )
+        })
+        .sum();
+    if forgotten > 0 {
+        database.refresh_centroids();
+        database.save(database_path)?;
+    }
+    Ok(forgotten)
+}
+
+/// Whether some of `chunk` is audio of `[start_ms, end_ms]` on `source`.
+fn chunk_reaches_into(
+    chunk: &EmbeddingChunk,
+    source: AudioSource,
+    start_ms: u64,
+    end_ms: u64,
+) -> bool {
+    chunk.source == source && chunk.start_ms < end_ms && start_ms < chunk.end_ms
+}
+
+/// The cut lines; none when the session has no file.
+pub fn read_speaker_turns(session: &Session) -> io::Result<SpeakerTurns> {
+    let path = session.speaker_turns_path();
+    let artifact: SpeakerTurns = match read_json(&path) {
+        Ok(artifact) => artifact,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SpeakerTurns {
+                format_version: SPEAKER_TURNS_FORMAT_VERSION,
+                groups: Vec::new(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if artifact.format_version != SPEAKER_TURNS_FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported speaker turns format version {} in {}",
+                artifact.format_version,
+                path.display()
+            ),
+        ));
+    }
+    turns::check_groups(&artifact.groups).map_err(|reason| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{reason} in {}", path.display()),
+        )
+    })?;
+    Ok(artifact)
+}
+
 fn correct_speaker_resolved(
     args: ProcessArgs,
     request: &CorrectionRequest,
@@ -786,6 +1116,7 @@ fn apply_corrections_inner(
     let recognized = read_speaker_assignments(&session)?;
     let prior_utterances = read_correctable_lines(&session)?;
     let mut corrections = read_speaker_corrections(&session)?;
+    let turn_groups = read_speaker_turns(&session)?.groups;
     let span = read_meeting_span(&session)?;
     let database_path = args
         .speakers_db
@@ -856,8 +1187,9 @@ fn apply_corrections_inner(
                     old_names,
                     source: request.source,
                     learn: span.contains(request.start_ms),
-                    vectors: embeddings_in_range(
+                    vectors: learnable_embeddings(
                         &learning.chunks,
+                        &turn_groups,
                         request.source,
                         request.start_ms,
                         request.end_ms,
@@ -1249,33 +1581,41 @@ fn build_proposals(
     threshold: f32,
 ) -> Result<Vec<Proposal>, Box<dyn std::error::Error>> {
     let utterances = read_correctable_lines(session)?;
+    let groups = read_speaker_turns(session)?.groups;
     let mut proposals = utterances
         .into_iter()
         .filter_map(|utterance| {
-            proposal_for_utterance(request, cluster, utterance, chunks, database, threshold)
+            proposal_for_utterance(
+                request, cluster, utterance, chunks, &groups, database, threshold,
+            )
         })
         .collect::<Vec<_>>();
     proposals.sort_by_key(|proposal| (proposal.start_ms, proposal.end_ms));
     Ok(proposals)
 }
 
+/// Scores a later line by its own audio, leaving out chunks that reach into a
+/// cut line.
 fn proposal_for_utterance(
     request: &CorrectionRequest,
     cluster: u32,
     utterance: Utterance,
     chunks: &[EmbeddingChunk],
+    groups: &[TurnGroup],
     database: &SpeakerDatabase,
     threshold: f32,
 ) -> Option<Proposal> {
     if utterance.source != request.source
         || utterance.start_ms < request.end_ms
         || utterance.locked
+        || utterance.group.is_some()
         || parse_speaker_id(&utterance.speaker_id) != Some((request.source, cluster))
     {
         return None;
     }
-    let query = embeddings_in_range(
+    let query = learnable_embeddings(
         chunks,
+        groups,
         utterance.source,
         utterance.start_ms,
         utterance.end_ms,
@@ -2111,6 +2451,7 @@ fn render_artifacts_with_segments_and_hook(
     warn_diarization_provenance(session, diarize_mic);
     let recognized = read_speaker_assignments(session)?;
     let corrections = read_speaker_corrections(session)?;
+    let turn_groups = read_speaker_turns(session)?.groups;
     let hidden = read_hidden_sources(session)?;
     let span = read_meeting_span(session)?;
     let recorded = recorded_duration_ms(session, manifest);
@@ -2149,11 +2490,25 @@ fn render_artifacts_with_segments_and_hook(
         &segments,
         &recognized,
         &corrections.corrections,
+        &turn_groups,
         &kept_ranges,
         &manifest.local_speaker,
         diarize_mic,
         DEFAULT_NEAREST_TOLERANCE_MS,
     );
+    // The turns of a cut line stay together, where its first turn starts,
+    // whichever of them are shown.
+    let group_starts = turn_groups
+        .iter()
+        .map(|group| (group.id(), group.start_ms))
+        .collect::<HashMap<_, _>>();
+    let line_start = |utterance: &Utterance| {
+        utterance
+            .group
+            .as_ref()
+            .and_then(|group| group_starts.get(group).copied())
+            .unwrap_or(utterance.start_ms)
+    };
     let (shown, hidden_lines): (Vec<_>, Vec<_>) =
         all_utterances.into_iter().partition(|(utterance, kept)| {
             !hidden.hidden.contains(&utterance.source)
@@ -2171,7 +2526,7 @@ fn render_artifacts_with_segments_and_hook(
     let (utterances, outside): (Vec<_>, Vec<_>) = shown
         .into_iter()
         .map(|(utterance, _)| utterance)
-        .partition(|utterance| span.contains(utterance.start_ms));
+        .partition(|utterance| span.contains(line_start(utterance)));
     before_write();
     jsonl::write_all_atomic(&session.echo_detections_path(), &detection.detections)?;
     match fs::remove_file(session.dir.join("leakage-suppressions.jsonl")) {
@@ -2848,8 +3203,12 @@ fn chunk_ranges(segment: &SpeakerSegment) -> Vec<(u64, u64)> {
         .collect()
 }
 
-fn embeddings_in_range(
+/// The vectors of the chunks of `source` that are at least half inside
+/// `[start_ms, end_ms]` and long enough to learn from, without the chunks that
+/// reach into a cut line, whose audio holds more than one voice.
+fn learnable_embeddings(
     chunks: &[EmbeddingChunk],
+    groups: &[TurnGroup],
     source: AudioSource,
     start_ms: u64,
     end_ms: u64,
@@ -2869,6 +3228,9 @@ fn embeddings_in_range(
                 .min(end_ms)
                 .saturating_sub(chunk.start_ms.max(start_ms));
             overlap.saturating_mul(2) >= duration
+                && !groups.iter().any(|group| {
+                    chunk_reaches_into(chunk, group.source, group.start_ms, group.end_ms)
+                })
         })
         .map(|chunk| chunk.embedding.clone())
         .collect()
@@ -2888,25 +3250,31 @@ pub fn learned_lines(
     let Ok(database) = SpeakerDatabase::load(database_path) else {
         return vec![false; utterances.len()];
     };
+    let groups = read_speaker_turns(session)
+        .map(|artifact| artifact.groups)
+        .unwrap_or_default();
     utterances
         .iter()
-        .map(|utterance| line_is_learned(utterance, &chunks, &database))
+        .map(|utterance| line_is_learned(utterance, &chunks, &groups, &database))
         .collect()
 }
 
+/// Whether the line taught its voice, by a chunk that is not cut line audio.
 fn line_is_learned(
     utterance: &Utterance,
     chunks: &[EmbeddingChunk],
+    groups: &[TurnGroup],
     database: &SpeakerDatabase,
 ) -> bool {
-    if !utterance.locked {
+    if !utterance.locked || utterance.group.is_some() {
         return false;
     }
     let Some(record) = database.speakers.get(&utterance.speaker) else {
         return false;
     };
-    embeddings_in_range(
+    learnable_embeddings(
         chunks,
+        groups,
         utterance.source,
         utterance.start_ms,
         utterance.end_ms,
@@ -3097,10 +3465,35 @@ mod tests {
         ];
 
         assert_eq!(
-            embeddings_in_range(&chunks, AudioSource::System, 1_000, 2_000),
+            learnable_embeddings(&chunks, &[], AudioSource::System, 1_000, 2_000),
             vec![vec![1.0, 0.0]]
         );
-        assert!(embeddings_in_range(&chunks, AudioSource::System, 1_001, 2_000).is_empty());
+        assert!(learnable_embeddings(&chunks, &[], AudioSource::System, 1_001, 2_000).is_empty());
+    }
+
+    #[test]
+    fn chunks_reaching_into_a_cut_line_are_not_learned() {
+        let chunk = |start_ms, end_ms, value| EmbeddingChunk {
+            source: AudioSource::System,
+            start_ms,
+            end_ms,
+            cluster: 1,
+            embedding: vec![value],
+        };
+        let chunks = [chunk(0, 2_000, 1.0), chunk(2_000, 4_000, 2.0)];
+        let groups = [TurnGroup {
+            source: AudioSource::System,
+            start_ms: 3_900,
+            end_ms: 6_000,
+            turns: vec![crate::types::Turn {
+                start_ms: 3_900,
+                speaker: None,
+            }],
+        }];
+        assert_eq!(
+            learnable_embeddings(&chunks, &groups, AudioSource::System, 0, 4_000),
+            [vec![1.0]]
+        );
     }
 
     #[test]
@@ -3120,6 +3513,7 @@ mod tests {
             text: "hello".into(),
             locked: false,
             echo: false,
+            group: None,
         }];
         let segments = [SpeakerSegment {
             source: AudioSource::System,
@@ -3311,6 +3705,7 @@ mod tests {
                 text: "hello".into(),
                 locked: false,
                 echo: false,
+                group: None,
             }],
         );
         round_trip(
@@ -3898,6 +4293,301 @@ mod tests {
         let assignments: SpeakerAssignments =
             read_json(&session.speaker_assignments_path()).expect("read assignments");
         assert_eq!(assignments.assignments[0].speaker, None);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    /// One anonymous system line, "did you finish? yes almost. great thanks"
+    /// from 1.0 to 2.9 s, and a later line of the same voice at 10 s.
+    fn turns_fixture(label: &str) -> (PathBuf, Session, ProcessArgs) {
+        let (root, session) = assignment_fixture(label, None);
+        let words = [
+            (1_000, 1_200, "did"),
+            (1_250, 1_400, "you"),
+            (1_450, 1_700, "finish?"),
+            (1_800, 2_000, "yes"),
+            (2_050, 2_300, "almost."),
+            (2_400, 2_600, "great"),
+            (2_650, 2_900, "thanks"),
+            (10_000, 10_200, "later"),
+        ]
+        .map(|(start_ms, end_ms, text)| TimedWord {
+            source: AudioSource::System,
+            start_ms,
+            end_ms,
+            text: text.into(),
+        });
+        jsonl::write_all_atomic(&session.words_path(), &words).expect("write words");
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 900,
+                end_ms: 10_300,
+                cluster: 7,
+            }],
+        )
+        .expect("write diarization");
+        render(&session);
+        let mut args = stage_process_args(session.dir.clone());
+        args.speakers_db = Some(root.join("speakers.json"));
+        (root, session, args)
+    }
+
+    fn render(session: &Session) {
+        run_render(RenderArgs {
+            session: session.dir.clone(),
+            diarize_mic: None,
+        })
+        .expect("render");
+    }
+
+    fn cut_at(args: &ProcessArgs, cuts: &[u64]) {
+        cut_line(
+            args,
+            &CutRequest {
+                source: AudioSource::System,
+                start_ms: 1_000,
+                end_ms: 2_900,
+                cuts: cuts.to_vec(),
+                first_from: None,
+            },
+        )
+        .expect("cut line");
+    }
+
+    fn name_turn_at(args: &ProcessArgs, turn_start_ms: u64, speaker: &str) {
+        name_turn(
+            args,
+            &TurnRequest {
+                source: AudioSource::System,
+                group_start_ms: 1_000,
+                turn_start_ms,
+                speaker: speaker.into(),
+            },
+        )
+        .expect("name turn");
+    }
+
+    #[test]
+    fn named_turns_are_lines_of_one_group_and_survive_rendering_again() {
+        let (root, session, args) = turns_fixture("turns-named");
+        cut_at(&args, &[2_400, 1_800]);
+        for (start_ms, name) in [(1_000, "Laura"), (1_800, "Andrew"), (2_400, "Craig")] {
+            name_turn_at(&args, start_ms, name);
+        }
+        let expected = [
+            "[00:00:01.000] Laura: did you finish?",
+            "[00:00:01.800] Andrew: yes almost.",
+            "[00:00:02.400] Craig: great thanks",
+            "[00:00:10.000] SPEAKER_00: later",
+        ];
+        let text = || fs::read_to_string(session.transcript_text_path()).expect("read text");
+        assert_eq!(text().lines().collect::<Vec<_>>(), expected);
+        let transcript = fs::read(session.transcript_path()).expect("read transcript");
+        let lines: Vec<Utterance> = jsonl::read_all(&session.transcript_path()).expect("lines");
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| (line.end_ms, line.locked, line.group.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (1_700, true, Some("system-1000")),
+                (2_300, true, Some("system-1000")),
+                (2_900, true, Some("system-1000")),
+                (10_200, false, None),
+            ]
+        );
+        // Naming a turn renames no later line and touches no voice.
+        assert!(!session.speaker_corrections_path().exists());
+        assert!(!root.join("speakers.json").exists());
+
+        render(&session);
+        assert_eq!(
+            fs::read(session.transcript_path()).expect("reread transcript"),
+            transcript
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn turns_named_alike_join_into_one_locked_line() {
+        let (root, session, args) = turns_fixture("turns-join");
+        cut_at(&args, &[1_800]);
+        name_turn_at(&args, 1_800, "Laura");
+        // The first turn is still the anonymous line's voice.
+        assert!(session.speaker_turns_path().exists());
+        name_turn_at(&args, 1_000, " laura ");
+        assert!(!session.speaker_turns_path().exists());
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            [
+                "laura: did you finish? yes almost. great thanks",
+                "SPEAKER_00: later"
+            ]
+        );
+        let lines: Vec<Utterance> = jsonl::read_all(&session.transcript_path()).expect("lines");
+        assert!(lines[0].locked && lines[0].group.is_none());
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn removing_the_last_cut_keeps_the_first_turns_name() {
+        let (root, session, args) = turns_fixture("turns-uncut");
+        cut_at(&args, &[1_800]);
+        name_turn_at(&args, 1_000, "Craig");
+        cut_at(&args, &[]);
+        assert!(!session.speaker_turns_path().exists());
+        assert_eq!(
+            line_texts(&session.transcript_path())[0],
+            "Craig: did you finish? yes almost. great thanks"
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn cutting_forgets_the_samples_this_session_learned_from_audio_of_the_line() {
+        let (root, session, args) = turns_fixture("turns-forget");
+        write_corrections(&session, &[(AudioSource::System, 1_000, 2_900, "Laura")]);
+        render(&session);
+        let chunk = |start_ms, end_ms, embedding: Vec<f32>| EmbeddingChunk {
+            source: AudioSource::System,
+            start_ms,
+            end_ms,
+            cluster: 7,
+            embedding,
+        };
+        // Bob's sample came from a neighbouring line whose chunk reaches into
+        // the cut line; Carol's chunk ends where the line starts.
+        jsonl::write_all_atomic(
+            &session.embeddings_path(),
+            &[
+                chunk(0, 1_000, vec![0.0, 1.0, 0.0]),
+                chunk(1_000, 2_900, vec![1.0, 0.0, 0.0]),
+                chunk(2_500, 12_500, vec![0.0, 0.0, 1.0]),
+            ],
+        )
+        .expect("write embeddings");
+        let database_path = root.join("speakers.json");
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "model".into(),
+            sha256: "hash".into(),
+            dimension: 3,
+        });
+        let here = session_id(&session);
+        let learned = |embedding: Vec<f32>, session: &str, source| {
+            Sample::learned(embedding, session, source, 1)
+        };
+        for (name, samples) in [
+            (
+                "Laura",
+                vec![
+                    learned(vec![1.0, 0.0, 0.0], &here, AudioSource::System),
+                    // The same voice from another meeting, and from this
+                    // meeting's microphone, are not this line's audio.
+                    learned(
+                        vec![0.9995, 0.0316, 0.0],
+                        "other-meeting",
+                        AudioSource::System,
+                    ),
+                    learned(vec![1.0, 0.0, 0.0], &here, AudioSource::Mic),
+                ],
+            ),
+            (
+                "Bob",
+                vec![learned(vec![0.0, 0.0, 1.0], &here, AudioSource::System)],
+            ),
+            (
+                "Carol",
+                vec![learned(vec![0.0, 1.0, 0.0], &here, AudioSource::System)],
+            ),
+        ] {
+            database.speakers.insert(
+                name.into(),
+                SpeakerRecord {
+                    samples,
+                    ..SpeakerRecord::default()
+                },
+            );
+        }
+        database.save(&database_path).expect("write database");
+
+        cut_at(&args, &[1_800]);
+        let database = SpeakerDatabase::load(&database_path).expect("read database");
+        let samples = |name: &str| {
+            database
+                .speakers
+                .get(name)
+                .map_or(0, |record| record.samples.len())
+        };
+        assert_eq!(
+            (samples("Laura"), samples("Bob"), samples("Carol")),
+            (2, 0, 1)
+        );
+        // The unnamed turns keep the line's lock.
+        assert_eq!(
+            line_texts(&session.transcript_path())[..2],
+            ["Laura: did you finish?", "Laura: yes almost. great thanks"]
+        );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn cutting_a_line_next_to_a_cut_line_keeps_both() {
+        let (root, session, args) = turns_fixture("turns-adjacent");
+        cut_at(&args, &[1_800]);
+        name_turn_at(&args, 1_800, "Andrew");
+        cut_line(
+            &args,
+            &CutRequest {
+                source: AudioSource::System,
+                start_ms: 2_900,
+                end_ms: 10_200,
+                cuts: vec![10_000],
+                first_from: None,
+            },
+        )
+        .expect("cut the next line");
+        let groups = read_speaker_turns(&session).expect("read turns").groups;
+        assert_eq!(
+            groups.iter().map(TurnGroup::id).collect::<Vec<_>>(),
+            ["system-1000", "system-2900"]
+        );
+        assert_eq!(groups[0].turns[1].speaker.as_deref(), Some("Andrew"));
+        let overlapping = cut_line(
+            &args,
+            &CutRequest {
+                source: AudioSource::System,
+                start_ms: 2_000,
+                end_ms: 3_000,
+                cuts: vec![2_500],
+                first_from: None,
+            },
+        );
+        assert!(overlapping.is_err());
+        assert_eq!(read_speaker_turns(&session).expect("reread").groups, groups);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn a_cut_line_stays_whole_outside_the_meeting_it_starts_before() {
+        let (root, session, args) = turns_fixture("turns-meeting");
+        cut_at(&args, &[1_800, 2_400]);
+        set_meeting_span(
+            &session.dir,
+            MeetingSpan {
+                start_ms: Some(1_900),
+                end_ms: None,
+            },
+        )
+        .expect("mark meeting");
+        assert_eq!(
+            line_texts(&session.outside_meeting_path()),
+            [
+                "SPEAKER_00: did you finish?",
+                "SPEAKER_00: yes almost.",
+                "SPEAKER_00: great thanks"
+            ]
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -4494,10 +5184,11 @@ mod tests {
             text: "later".into(),
             locked: false,
             echo: false,
+            group: None,
         };
 
         let proposal =
-            proposal_for_utterance(&request, 7, candidate.clone(), &chunks, &database, 0.6)
+            proposal_for_utterance(&request, 7, candidate.clone(), &chunks, &[], &database, 0.6)
                 .expect("proposal");
         assert_eq!(proposal.current_speaker.as_deref(), Some("Bob"));
         assert_eq!(proposal.score_new, 1.0);
@@ -4506,7 +5197,7 @@ mod tests {
 
         database.speakers.get_mut("Bob").unwrap().samples = vec![Sample::settled(vec![0.8, 0.6])];
         assert!(
-            proposal_for_utterance(&request, 7, candidate.clone(), &chunks, &database, 0.6)
+            proposal_for_utterance(&request, 7, candidate.clone(), &chunks, &[], &database, 0.6)
                 .expect("positive margin proposal")
                 .proposed
         );
@@ -4515,7 +5206,7 @@ mod tests {
             ..candidate.clone()
         };
         let anonymous_proposal =
-            proposal_for_utterance(&request, 7, anonymous, &chunks, &database, 0.99)
+            proposal_for_utterance(&request, 7, anonymous, &chunks, &[], &database, 0.99)
                 .expect("anonymous threshold proposal");
         assert_eq!(anonymous_proposal.score_old, None);
         assert!(anonymous_proposal.proposed);
@@ -4529,6 +5220,7 @@ mod tests {
                     ..candidate.clone()
                 },
                 &chunks,
+                &[],
                 &database,
                 0.6,
             )
@@ -4543,12 +5235,52 @@ mod tests {
                     ..candidate.clone()
                 },
                 &chunks,
+                &[],
                 &database,
                 0.6,
             )
             .is_none()
         );
-        assert!(proposal_for_utterance(&request, 8, candidate, &chunks, &database, 0.6).is_none());
+        assert!(
+            proposal_for_utterance(
+                &request,
+                7,
+                Utterance {
+                    group: Some("system-2000".into()),
+                    ..candidate.clone()
+                },
+                &chunks,
+                &[],
+                &database,
+                0.6,
+            )
+            .is_none()
+        );
+        // The candidate's only chunk reaches into a cut line after it.
+        let cut = [TurnGroup {
+            source: AudioSource::System,
+            start_ms: 3_900,
+            end_ms: 6_000,
+            turns: vec![crate::types::Turn {
+                start_ms: 3_900,
+                speaker: None,
+            }],
+        }];
+        assert!(
+            proposal_for_utterance(
+                &request,
+                7,
+                candidate.clone(),
+                &chunks,
+                &cut,
+                &database,
+                0.6
+            )
+            .is_none()
+        );
+        assert!(
+            proposal_for_utterance(&request, 8, candidate, &chunks, &[], &database, 0.6).is_none()
+        );
     }
 
     #[test]
@@ -4581,19 +5313,35 @@ mod tests {
             text: "line".into(),
             locked: true,
             echo: false,
+            group: None,
         };
 
-        assert!(line_is_learned(&line, &chunks, &database));
+        assert!(line_is_learned(&line, &chunks, &[], &database));
         let unlocked = Utterance {
             locked: false,
             ..line.clone()
         };
-        assert!(!line_is_learned(&unlocked, &chunks, &database));
+        assert!(!line_is_learned(&unlocked, &chunks, &[], &database));
+        let cut = Utterance {
+            group: Some("system-0".into()),
+            ..line.clone()
+        };
+        assert!(!line_is_learned(&cut, &chunks, &[], &database));
+        let next_cut_line = [TurnGroup {
+            source: AudioSource::System,
+            start_ms: 1_900,
+            end_ms: 3_000,
+            turns: vec![crate::types::Turn {
+                start_ms: 1_900,
+                speaker: None,
+            }],
+        }];
+        assert!(!line_is_learned(&line, &chunks, &next_cut_line, &database));
         let other_voice = Utterance {
             speaker: "Bob".into(),
             ..line
         };
-        assert!(!line_is_learned(&other_voice, &chunks, &database));
+        assert!(!line_is_learned(&other_voice, &chunks, &[], &database));
     }
 
     #[test]
@@ -4992,6 +5740,7 @@ mod tests {
             text: "hi".into(),
             locked: false,
             echo,
+            group: None,
         };
         assert!(rules.keeps_speaker_of("Me", &line("mic_2", false)));
         assert!(!rules.keeps_speaker_of("Me", &line("mic_2", true)));

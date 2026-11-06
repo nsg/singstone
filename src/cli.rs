@@ -48,6 +48,9 @@ pub enum Command {
     /// Cut an unprocessed recording into two new sessions; the original is
     /// kept as an archived backup.
     Split(SplitArgs),
+    /// Join unprocessed recordings into one new session, with a second of
+    /// silence at each seam; the pieces are kept as archived backups.
+    Merge(MergeArgs),
     /// List learned speakers, or tidy their voice samples.
     Speakers(SpeakersArgs),
 }
@@ -410,6 +413,19 @@ pub struct SplitArgs {
     /// Title of the part after the cut (default: the session's title with " (2)").
     #[arg(long)]
     pub second_title: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct MergeArgs {
+    /// Session directories, two or more.
+    #[arg(required = true, num_args = 2..)]
+    pub sessions: Vec<PathBuf>,
+    /// Title of the merged session (default: the first piece's title).
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Join the sessions in the order given instead of by start time.
+    #[arg(long)]
+    pub keep_order: bool,
 }
 
 #[derive(Args, Debug)]

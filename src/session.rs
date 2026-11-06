@@ -3,6 +3,7 @@
 use crate::audio::archive;
 use crate::format::jsonl;
 use crate::types::Manifest;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -180,6 +181,16 @@ impl Session {
     pub fn split_into_path(&self) -> PathBuf {
         self.dir.join("split-into.json")
     }
+    pub fn merged_from_path(&self) -> PathBuf {
+        self.dir.join("merged-from.json")
+    }
+    pub fn merged_into_path(&self) -> PathBuf {
+        self.dir.join("merged-into.json")
+    }
+    /// When the recording joins stretches recorded at different times.
+    pub fn wallclock_path(&self) -> PathBuf {
+        self.dir.join("wallclock.json")
+    }
     pub fn echo_detections_path(&self) -> PathBuf {
         self.dir.join("echo-detections.jsonl")
     }
@@ -209,6 +220,60 @@ impl Session {
         f.write_all(b"\n")?;
         f.sync_all()?;
         fs::rename(tmp, path)
+    }
+
+    /// Which stretch of the recording was recorded when: `wallclock.json`,
+    /// or one stretch from the manifest's start when there is none.
+    pub fn wallclock_map(&self, manifest: &Manifest) -> io::Result<WallClockMap> {
+        let path = self.wallclock_path();
+        let data = match fs::read(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(WallClockMap::single(&manifest.started_wallclock));
+            }
+            Err(error) => return Err(error),
+        };
+        let invalid = |message: String| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {message}", path.display()),
+            )
+        };
+        let file: WallClockFile =
+            serde_json::from_slice(&data).map_err(|error| invalid(error.to_string()))?;
+        if file.format_version != WALLCLOCK_FORMAT_VERSION {
+            return Err(invalid(format!(
+                "unsupported format version {}",
+                file.format_version
+            )));
+        }
+        WallClockMap::new(file.segments).map_err(|message| invalid(message.into()))
+    }
+
+    /// Write the map of a `length_ms` recording, or remove the file when
+    /// the manifest's start says it all.
+    pub fn write_wallclock_map(&self, map: &WallClockMap, length_ms: u64) -> io::Result<()> {
+        if map.segments.len() == 1 && map.segments[0].length_ms >= length_ms {
+            return match fs::remove_file(self.wallclock_path()) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            };
+        }
+        crate::merge::process::write_json_atomic(
+            &self.wallclock_path(),
+            &WallClockFile {
+                format_version: WALLCLOCK_FORMAT_VERSION,
+                segments: map.segments.clone(),
+            },
+        )
+    }
+
+    /// The time of day `offset_ms` into the recording.
+    pub fn wallclock_at(&self, offset_ms: u64) -> Option<WallClock> {
+        let manifest = self.read_manifest().ok()?;
+        self.wallclock_map(&manifest)
+            .unwrap_or_else(|_| WallClockMap::single(&manifest.started_wallclock))
+            .at(offset_ms)
     }
 
     /// Read a track's stored audio fully into memory.
@@ -288,6 +353,181 @@ impl WallClock {
     }
 }
 
+pub const WALLCLOCK_FORMAT_VERSION: u32 = 1;
+
+/// `wallclock.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WallClockFile {
+    pub format_version: u32,
+    pub segments: Vec<WallClockSegment>,
+}
+
+/// A stretch of the recording that was recorded in one go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WallClockSegment {
+    /// Where the stretch starts in the recording.
+    pub offset_ms: u64,
+    /// How long it ran. Anything after it, up to the next stretch or the end
+    /// of the recording, is seam silence, which maps to its end.
+    pub length_ms: u64,
+    /// RFC 3339 time of its first sample.
+    pub started_wallclock: String,
+}
+
+/// The time of day anywhere in a recording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WallClockMap {
+    segments: Vec<WallClockSegment>,
+}
+
+/// Where one stretch of a recording ends and the next one starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seam {
+    /// The end of the earlier stretch.
+    pub start_ms: u64,
+    /// The start of the next one.
+    pub end_ms: u64,
+    pub before: Option<WallClock>,
+    pub after: Option<WallClock>,
+}
+
+impl WallClockMap {
+    /// A recording made in one go.
+    pub fn single(started: &str) -> Self {
+        Self {
+            segments: vec![WallClockSegment {
+                offset_ms: 0,
+                length_ms: u64::MAX,
+                started_wallclock: started.to_owned(),
+            }],
+        }
+    }
+
+    /// Stretches that start at 0 and in order, each at a valid time.
+    pub fn new(segments: Vec<WallClockSegment>) -> Result<Self, &'static str> {
+        if segments.first().is_none_or(|first| first.offset_ms != 0) {
+            return Err("the first stretch must start at 0");
+        }
+        if segments
+            .windows(2)
+            .any(|pair| pair[1].offset_ms <= pair[0].offset_ms)
+        {
+            return Err("the stretches are not in order");
+        }
+        if segments
+            .iter()
+            .any(|segment| wallclock_after(&segment.started_wallclock, 0).is_none())
+        {
+            return Err("a stretch has no valid start time");
+        }
+        Ok(Self { segments })
+    }
+
+    pub fn segments(&self) -> &[WallClockSegment] {
+        &self.segments
+    }
+
+    pub fn started(&self) -> &str {
+        &self.segments[0].started_wallclock
+    }
+
+    /// The time of day `offset_ms` into the recording.
+    pub fn at(&self, offset_ms: u64) -> Option<WallClock> {
+        let segment = &self.segments[self.index_at(offset_ms)];
+        let elapsed = offset_ms
+            .saturating_sub(segment.offset_ms)
+            .min(segment.length_ms);
+        wallclock_after(&segment.started_wallclock, elapsed)
+    }
+
+    fn index_at(&self, offset_ms: u64) -> usize {
+        self.segments
+            .iter()
+            .rposition(|segment| segment.offset_ms <= offset_ms)
+            .unwrap_or(0)
+    }
+
+    pub fn seams(&self) -> Vec<Seam> {
+        self.segments
+            .windows(2)
+            .map(|pair| Seam {
+                start_ms: pair[0]
+                    .offset_ms
+                    .saturating_add(pair[0].length_ms)
+                    .min(pair[1].offset_ms),
+                end_ms: pair[1].offset_ms,
+                before: wallclock_after(&pair[0].started_wallclock, pair[0].length_ms),
+                after: wallclock_after(&pair[1].started_wallclock, 0),
+            })
+            .collect()
+    }
+
+    /// The stretches of `from_ms..until_ms`, on that range's own clock.
+    pub fn slice(&self, from_ms: u64, until_ms: u64) -> Option<Self> {
+        let first = self.index_at(from_ms);
+        let mut segments = Vec::new();
+        for (index, segment) in self.segments.iter().enumerate().skip(first) {
+            if index > first && segment.offset_ms >= until_ms {
+                break;
+            }
+            let start = segment.offset_ms.max(from_ms);
+            let end = segment
+                .offset_ms
+                .saturating_add(segment.length_ms)
+                .min(until_ms)
+                .max(start);
+            segments.push(WallClockSegment {
+                offset_ms: start - from_ms,
+                length_ms: end - start,
+                started_wallclock: if start == segment.offset_ms {
+                    segment.started_wallclock.clone()
+                } else {
+                    self.at(from_ms)?.rfc3339()
+                },
+            });
+        }
+        Some(Self { segments })
+    }
+
+    /// Recordings placed one after another: each map at its offset, cut to
+    /// its length.
+    pub fn joined(parts: &[(&WallClockMap, u64, u64)]) -> Option<Self> {
+        let mut segments = Vec::new();
+        for (map, offset_ms, length_ms) in parts {
+            for segment in map.slice(0, *length_ms)?.segments {
+                segments.push(WallClockSegment {
+                    offset_ms: segment.offset_ms + offset_ms,
+                    ..segment
+                });
+            }
+        }
+        Self::new(segments).ok()
+    }
+}
+
+/// Milliseconds since the Unix epoch of an RFC 3339 time.
+pub fn unix_ms(started: &str) -> Option<i64> {
+    let seconds = crate::meeting::parse_rfc3339(started).ok()?;
+    seconds
+        .checked_mul(1000)?
+        .checked_add(i64::try_from(fraction_ms(started)).ok()?)
+}
+
+/// The milliseconds of an RFC 3339 time's fractional seconds.
+fn fraction_ms(started: &str) -> u64 {
+    started
+        .get(19..)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .map(|rest| {
+            rest.bytes()
+                .take_while(u8::is_ascii_digit)
+                .chain(std::iter::repeat(b'0'))
+                .take(3)
+                .fold(0u64, |value, digit| value * 10 + u64::from(digit - b'0'))
+        })
+        .unwrap_or(0)
+}
+
 /// The wall-clock time `offset_ms` after an RFC 3339 `started` time, in
 /// `started`'s own UTC offset, to the millisecond.
 pub fn wallclock_after(started: &str, offset_ms: u64) -> Option<WallClock> {
@@ -306,18 +546,7 @@ pub fn wallclock_after(started: &str, offset_ms: u64) -> Option<WallClock> {
             sign * (hours * 60 + minutes)
         }
     };
-    let fraction = started
-        .get(19..)
-        .and_then(|rest| rest.strip_prefix('.'))
-        .map(|rest| {
-            rest.bytes()
-                .take_while(u8::is_ascii_digit)
-                .chain(std::iter::repeat(b'0'))
-                .take(3)
-                .fold(0u64, |value, digit| value * 10 + u64::from(digit - b'0'))
-        })
-        .unwrap_or(0);
-    let total_ms = offset_ms.checked_add(fraction)?;
+    let total_ms = offset_ms.checked_add(fraction_ms(started))?;
     let seconds = unix
         .checked_add(i64::try_from(total_ms / 1000).ok()?)?
         .checked_add(i64::from(offset_minutes) * 60)?;

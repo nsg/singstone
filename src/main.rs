@@ -5,6 +5,7 @@ mod cli;
 mod diarization;
 mod format;
 mod gui;
+mod join;
 mod meeting;
 mod merge;
 mod model_setup;
@@ -60,6 +61,7 @@ fn main() -> ExitCode {
         cli::Command::Render(args) => merge::process::run_render(args),
         cli::Command::Archive(args) => audio::archive::run(args),
         cli::Command::Split(args) => split::run(args),
+        cli::Command::Merge(args) => join::run(args),
         cli::Command::Speakers(args) => speaker::speakers::run(args),
     };
     match result {

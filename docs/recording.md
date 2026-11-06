@@ -49,6 +49,30 @@ against the original is the original archived; its `split-into.json` lists
 every split made from it. Any failure removes the parts and leaves the
 original as it was.
 
+`singstone merge SESSION SESSION...` joins sessions that have not been
+processed, are not archived and do not overlap in time into one new session
+next to them, by default in start-time order (`--keep-order` keeps the order
+given). The tracks are the pieces one after another with one second of
+digital silence between them; a piece that lacks a track or whose track is
+shorter than the piece gets silence there, so all tracks stay aligned.
+Timeline events and screenshots are shifted by the piece's offset. The new
+folder is named after the first piece's start. Its `merged-from.json` lists
+the pieces in order (folder, title, start, offset and length in
+milliseconds, and whether the order was the recorded one), and each piece's
+`merged-into.json` lists the merges it went into. The merge is written to a
+staging folder and every track is read back and compared byte for byte with
+the pieces, the silence included, before it is moved into place; then all
+pieces are archived together or not at all. Any failure removes the new
+session and restores the pieces' records.
+
+A session joined from recordings made at different times has a
+`wallclock.json`: `segments` of `offset_ms`, `length_ms` and
+`started_wallclock`, one per stretch recorded in one go. The time of day at
+an offset is the start of its stretch plus the time into it; the seam
+silence after a stretch maps to its end. Without the file, the recording is
+one stretch from `started_wallclock`. Splitting such a session gives each
+part the stretches it covers, and a part's start time comes from them.
+
 ## Audio capture
 
 Both streams share one monotonic start time. Each PipeWire callback validates

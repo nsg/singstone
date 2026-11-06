@@ -4,6 +4,7 @@ mod dictation;
 mod keep;
 mod label;
 mod meeting_span;
+mod merge_picker;
 mod player;
 mod queue;
 mod remote;
@@ -14,6 +15,7 @@ mod wrap_layout;
 use crate::audio::{archive, devices, record};
 use crate::cli::{ProcessArgs, RecordArgs, RenderArgs};
 use crate::format::jsonl;
+use crate::join;
 use crate::meeting::{self, Attendees, MeetingDetails};
 use crate::merge::events::{self, ProcessingEvent};
 use crate::merge::process::{self, ProcessingProgress, ProcessingStage};
@@ -119,6 +121,21 @@ const CSS: &str = r#"
 .split-part { padding: 8px 10px; border: 1px solid @borders; border-radius: 10px; background: @card_bg_color; }
 .split-part-1 { border-left: 4px solid #3584e4; }
 .split-part-2 { border-left: 4px solid #e66100; }
+button.merge-action { color: white; background: #9141ac; }
+button.merge-action:hover { background: shade(#9141ac, 1.1); }
+button.merge-action:disabled { color: alpha(white, 0.6); background: alpha(#9141ac, 0.5); }
+.merge-panel { padding: 10px 12px; border: 1px solid alpha(#9141ac, 0.4); border-radius: 12px; background: alpha(#9141ac, 0.05); }
+.merge-piece { padding: 6px 4px 8px 10px; border: 1px solid @borders; border-radius: 10px; background: @card_bg_color; }
+.merge-piece-0 { border-left: 4px solid #3584e4; }
+.merge-piece-1 { border-left: 4px solid #9141ac; }
+.merge-piece-2 { border-left: 4px solid #26a269; }
+.merge-piece-3 { border-left: 4px solid #e66100; }
+.merge-piece-4 { border-left: 4px solid #986a44; }
+.merge-seam { color: #813d9c; font-size: 11px; font-weight: bold; }
+.merge-tag { border-radius: 999px; padding: 1px 8px; font-size: 11px; color: #813d9c; background: alpha(#9141ac, 0.12); }
+.merge-summary { border-radius: 8px; padding: 8px 10px; background: alpha(#9141ac, 0.1); }
+.seam-divider { margin: 6px 0; color: #813d9c; font-size: 12px; font-weight: bold; }
+.seam-divider-line { min-height: 0; border-top: 2px dashed alpha(#9141ac, 0.55); background: none; }
 .transcript-card.cut-editing { border-color: @accent_color; box-shadow: 0 0 0 3px alpha(@accent_color, 0.2); }
 .turn-count { border-radius: 999px; padding: 1px 8px; font-size: 11px; font-weight: 600; background: alpha(currentColor, 0.08); }
 .cut-turn { border-left: 3px solid alpha(currentColor, 0.3); border-radius: 4px; padding: 4px 8px 4px 10px; background: alpha(currentColor, 0.03); }
@@ -3919,6 +3936,9 @@ fn wire_processing(
     wire_splitting(
         window, detail, banner, config, list, paths, search, busy, queue,
     );
+    wire_merging(
+        window, detail, banner, config, list, paths, search, busy, queue,
+    );
     let controller = QueueController::new(
         app,
         window,
@@ -4366,6 +4386,134 @@ fn wire_splitting(
                 glib::ControlFlow::Break
             });
         }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_merging(
+    window: &adw::ApplicationWindow,
+    detail: &SessionDetail,
+    banner: &adw::Banner,
+    config: &Rc<RefCell<GuiConfig>>,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    search: &gtk::SearchEntry,
+    busy: &Rc<Cell<bool>>,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+) {
+    let queue_for_reason = queue.clone();
+    let queue_reason: player::QueueReason =
+        Rc::new(
+            move |path: &Path| match queue_for_reason.borrow().state(path) {
+                Some(JobState::Running) => Some("processing"),
+                Some(JobState::Waiting { .. }) => Some("queued"),
+                None => None,
+            },
+        );
+    let parent = window.clone();
+    let detail_for_merge = detail.clone();
+    let banner = banner.clone();
+    let config = config.clone();
+    let list = list.clone();
+    let paths = paths.clone();
+    let search = search.clone();
+    let busy = busy.clone();
+    let queue = queue.clone();
+    let handler: player::MergeHandler = Rc::new(move |pieces, title, order| {
+        if busy.get() {
+            show_error(
+                &parent,
+                "Could not merge the sessions",
+                "Wait for the current task to finish, then try again.",
+            );
+            return;
+        }
+        for piece in &pieces {
+            let state = queue.borrow().state(piece);
+            let cancelling = detail_for_merge.cancel_requested.get()
+                && detail_for_merge.selected.borrow().as_deref() == Some(piece.as_path());
+            if let Some(reason) = merge_blocked(false, false, state, cancelling) {
+                show_error(
+                    &parent,
+                    "Could not merge the sessions",
+                    &format!("“{}”: {reason}", session_title(piece)),
+                );
+                return;
+            }
+        }
+        let Some(shown) = pieces
+            .iter()
+            .find(|piece| detail_for_merge.selected.borrow().as_deref() == Some(piece.as_path()))
+            .or(pieces.first())
+            .cloned()
+        else {
+            return;
+        };
+        detail_for_merge.playback.stop();
+        busy.set(true);
+        let progress = progress_window(
+            &parent,
+            "Merging the recordings",
+            "Writing the merged session, checking it against the originals and archiving them…",
+        );
+        let result = Arc::new(Mutex::new(None));
+        let thread_result = result.clone();
+        std::thread::spawn(move || {
+            let value = pieces
+                .iter()
+                .map(join::Piece::open)
+                .collect::<io::Result<Vec<_>>>()
+                .and_then(|pieces| join::merge_sessions(&pieces, &title, order))
+                .map_err(|error| error.to_string());
+            *thread_result.lock().expect("merge result mutex") = Some(value);
+        });
+        let parent = parent.clone();
+        let detail = detail_for_merge.clone();
+        let banner = banner.clone();
+        let config = config.clone();
+        let list = list.clone();
+        let paths = paths.clone();
+        let search = search.clone();
+        let busy = busy.clone();
+        let queue = queue.clone();
+        glib::timeout_add_local(Duration::from_millis(150), move || {
+            let Some(result) = result.lock().expect("merge result mutex").take() else {
+                return glib::ControlFlow::Continue;
+            };
+            busy.set(false);
+            progress.close();
+            populate_sessions(
+                &list,
+                &paths,
+                &config.borrow().meetings_dir,
+                &search.text(),
+                &queue,
+            );
+            let show = match &result {
+                Ok(outcome) => outcome.session.clone(),
+                Err(_) => shown.clone(),
+            };
+            match paths.borrow().iter().position(|path| *path == show) {
+                Some(index) => select_session_row(&list, index),
+                None => {
+                    let _ = detail.load(&show);
+                }
+            }
+            match result {
+                Ok(outcome) => {
+                    let title = Session::open(&outcome.session)
+                        .map(|session| session.title())
+                        .unwrap_or_else(|_| session_title(&outcome.session));
+                    banner.set_title(&format!(
+                        "Merged into “{title}”. The originals are archived as backups."
+                    ));
+                    banner.set_revealed(true);
+                }
+                Err(error) => show_error(&parent, "Could not merge the sessions", &error),
+            }
+            glib::ControlFlow::Break
+        });
+    });
+    detail.player.connect_merge(queue_reason, handler);
 }
 
 #[derive(Debug, PartialEq)]
@@ -4953,10 +5101,15 @@ impl SessionDetail {
             .into_iter()
             .any(|source| session.stored_audio_path(source).is_file());
         self.player.root.set_visible(!recording && has_audio);
+        let clock = session.wallclock_map(&manifest).unwrap_or_else(|error| {
+            eprintln!("warning: {error}");
+            crate::session::WallClockMap::single(&manifest.started_wallclock)
+        });
+        let seams = clock.seams();
         if !recording && has_audio {
             self.player.load(
                 &session,
-                &manifest.started_wallclock,
+                clock,
                 duration,
                 screenshots.iter().map(|entry| entry.time_ms).collect(),
             );
@@ -5088,6 +5241,13 @@ impl SessionDetail {
                 let row_widgets = |indexes: std::ops::Range<usize>| {
                     let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
                     for index in indexes {
+                        if let Some(previous) = index.checked_sub(1) {
+                            for seam in
+                                seams_between(&seams, rows[previous].start_ms, rows[index].start_ms)
+                            {
+                                container.append(&seam_divider(seam));
+                            }
+                        }
                         container.append(&transcript_timeline_row(
                             &rows,
                             index,
@@ -5265,6 +5425,71 @@ impl SessionDetail {
             }
         }
 
+        let root = session.dir.parent().unwrap_or(Path::new("."));
+        if let Ok(Some(from)) = join::read_merged_from(&session) {
+            let day = |started: &str| started.get(..10).map(str::to_owned);
+            let lines = from
+                .pieces
+                .iter()
+                .map(|piece| {
+                    let start = crate::session::wallclock_after(&piece.started_wallclock, 0)
+                        .map(|clock| {
+                            if day(&piece.started_wallclock) == day(&manifest.started_wallclock) {
+                                join::time_label(&clock)
+                            } else {
+                                format!("{} {}", join::date_label(&clock), join::time_label(&clock))
+                            }
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "“{}”, {start}, {}",
+                        piece.title,
+                        format_duration(piece.length_ms)
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.metadata.append(&property_row(
+                "Merged from",
+                &format!(
+                    "{}\n{}",
+                    lines.join("\n"),
+                    if lines.len() == 2 {
+                        "Both are kept as backups."
+                    } else {
+                        "All are kept as backups."
+                    }
+                ),
+            ));
+        }
+        if let Ok(Some(into)) = join::read_merged_into(&session) {
+            for record in &into.merges {
+                let text = match Session::open(root.join(&record.session)) {
+                    Ok(merged) => {
+                        let summary = merged.read_manifest().ok().map(|manifest| {
+                            let start = merged
+                                .wallclock_at(0)
+                                .map(|clock| format!("{}, ", join::time_label(&clock)))
+                                .unwrap_or_default();
+                            format!(
+                                " ({start}{})",
+                                format_duration(process::recorded_duration_ms(&merged, &manifest))
+                            )
+                        });
+                        format!(
+                            "“{}”{}. This session is kept as a backup.",
+                            merged.title(),
+                            summary.unwrap_or_default()
+                        )
+                    }
+                    Err(_) => format!(
+                        "{} (deleted). This session is kept as a backup.",
+                        record.session
+                    ),
+                };
+                self.metadata.append(&property_row("Merged into", &text));
+            }
+        }
+
         clear_box(&self.files);
         let outputs = gtk::Label::new(Some("Outputs:"));
         outputs.add_css_class("dim-label");
@@ -5396,6 +5621,12 @@ impl SessionDetail {
             queue_state,
             self.cancel_requested.get(),
         ));
+        self.player.set_merge_blocked(merge_blocked(
+            processed,
+            archived,
+            queue_state,
+            self.cancel_requested.get(),
+        ));
     }
 
     fn refresh_queue_state(&self) {
@@ -5519,6 +5750,64 @@ fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {
         .collect::<Vec<_>>();
     sessions.sort_by(|a, b| b.started.cmp(&a.started));
     sessions
+}
+
+/// Why the player cannot merge the session now, or `None` when it can.
+fn merge_blocked(
+    processed: bool,
+    archived: bool,
+    queue_state: Option<JobState>,
+    cancelling: bool,
+) -> Option<&'static str> {
+    if processed {
+        Some(
+            "Merging would discard the transcript. Merging is for recordings that have not been processed yet.",
+        )
+    } else if archived {
+        Some("Archived sessions are kept as backups and cannot be merged")
+    } else if matches!(queue_state, Some(JobState::Running)) || cancelling {
+        Some("The session is being processed")
+    } else if queue_state.is_some() {
+        Some("Remove the session from the processing queue before merging it")
+    } else {
+        None
+    }
+}
+
+/// The seams between a line starting at `before_ms` and the next one at
+/// `after_ms`, in order; a piece without a line puts two between them.
+fn seams_between(
+    seams: &[crate::session::Seam],
+    before_ms: u64,
+    after_ms: u64,
+) -> impl Iterator<Item = &crate::session::Seam> {
+    seams
+        .iter()
+        .filter(move |seam| before_ms < seam.start_ms && seam.start_ms <= after_ms)
+}
+
+/// A line across the transcript where the recording jumps in time.
+fn seam_divider(seam: &crate::session::Seam) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    row.add_css_class("seam-divider");
+    let line = || {
+        let line = gtk::Separator::new(gtk::Orientation::Horizontal);
+        line.add_css_class("seam-divider-line");
+        line.set_hexpand(true);
+        line.set_valign(gtk::Align::Center);
+        line
+    };
+    row.append(&line());
+    let label = gtk::Label::new(Some(&format!(
+        "Seam · {}",
+        join::seam_label(seam.before, seam.after)
+    )));
+    label.set_tooltip_text(Some(
+        "The recording was joined here from pieces recorded at different times",
+    ));
+    row.append(&label);
+    row.append(&line());
+    row
 }
 
 /// Why the player cannot split the session now, or `None` when it can.
@@ -6873,6 +7162,30 @@ fn show_about(parent: &adw::ApplicationWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_piece_without_lines_puts_both_its_seams_between_the_lines() {
+        let segment = |offset_ms, started: &str| crate::session::WallClockSegment {
+            offset_ms,
+            length_ms: 3_000,
+            started_wallclock: started.into(),
+        };
+        let seams = crate::session::WallClockMap::new(vec![
+            segment(0, "2026-09-14T09:30:00+02:00"),
+            segment(4_000, "2026-09-14T10:00:00+02:00"),
+            segment(8_000, "2026-09-14T11:00:00+02:00"),
+        ])
+        .expect("map")
+        .seams();
+        let between = |before_ms, after_ms| {
+            seams_between(&seams, before_ms, after_ms)
+                .map(|seam| seam.end_ms)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(between(2_000, 8_500), [4_000, 8_000]);
+        assert_eq!(between(2_000, 3_500), [4_000], "a line in the silence");
+        assert!(between(500, 2_000).is_empty());
+    }
 
     #[test]
     fn test_cases_and_meetings_folders_must_not_nest() {

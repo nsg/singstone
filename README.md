@@ -23,7 +23,8 @@ Click or drag to scrub, hover to read the time, press Space to play or pause
 and ←/→ to jump 5 seconds; the clock also shows the wall-clock time at the
 playhead. The **Microphone** and **System** buttons mute a track while
 listening. A recording that has not been processed yet can be cut in two, see
-[Split a recording](#split-a-recording).
+[Split a recording](#split-a-recording), or joined with others, see
+[Merge recordings](#merge-recordings).
 
 Browse processed meetings and review speaker-attributed transcripts from the
 session view, below the player. Microphone lines sit to the left of a shared
@@ -185,6 +186,8 @@ a session can be archived with or without it.
   mute per track.
 - Splits a recording that has not been processed yet into two sessions at a
   chosen point, keeping the original as an archived backup.
+- Merges recordings that have not been processed yet into one session, in
+  recorded or chosen order, keeping the pieces as archived backups.
 - Renames sessions and deletes them, after a confirmation, from the session view.
 - Flags a processed session as done, to tell reviewed sessions from those that
   still need attention.
@@ -423,6 +426,48 @@ Without titles, the parts are called after the original, the second with
 " (2)" appended. Splitting checks for enough free disk space first and needs
 the `flac` program to archive the original.
 
+## Merge recordings
+
+When one meeting ended up in several recordings, for example the parts
+before and after another meeting that split cut out, or a missing piece
+recorded days later, join them before processing. Press **Merge with…** in
+the player and tick the other recordings; the list holds every recording
+that has not been processed yet, nearest in time first, and tags the parts
+split from the same original. Recordings that overlap in time cannot be
+picked together: they are the same moment recorded twice.
+
+**Preview merge** shows the merged waveform in the player, each piece tinted,
+with a dotted seam where two pieces meet. Nothing is written yet. Playing and
+scrubbing run across the pieces, and the clock shows the real time of day of
+each piece, so it jumps at a seam; the seam's label shows that jump, with the
+date when the day changes. **Hear the seam** plays 4 seconds on each side of
+the seam nearest the playhead. Pieces start in the order they were recorded;
+the arrows on each piece move it earlier or later, and **Recorded order**
+puts them back. Edit the title, then **Merge…** and confirm.
+
+The merged recording is the pieces one after another, with one second of
+silence at each seam so that no transcript line runs across it. Both tracks
+are joined at the same point; a piece without a track, or with a shorter
+one, gets silence there. Screenshots, capture timing events and lines kept
+from a hidden source move to the merged clock. Meeting details, hidden
+sources and the start mark come from the first piece, the end mark from the
+last. The merge is written to a hidden folder and read back against every
+piece, sample by sample, before it moves into place. Only then are the
+pieces archived as FLAC, all of them or none, and kept as **Archived**
+backups, labelled **Merged into**; the new session lists them under
+**Merged from**. Any failure leaves the pieces as they were. After
+processing, the transcript marks each seam with the jump in time.
+
+Processed, archived, queued and recording sessions cannot be merged. From a
+terminal, the pieces go in start-time order unless `--keep-order` keeps the
+order given:
+
+```bash
+singstone merge ~/Meetings/session-20260914-093000 \
+  ~/Meetings/session-20260916-140000 ~/Meetings/session-20260914-102100 \
+  --keep-order --title "Weekly sync"
+```
+
 ## Archive audio
 
 Recordings are raw 32-bit float audio, about 230 MB per hour and track.
@@ -439,7 +484,7 @@ track's FLAC copy has been written to disk and decoded back to the same
 samples; if any track fails, all raw files stay as they were. Archived
 sessions show an **Archived** label and still play, render and reprocess.
 Unprocessed sessions are only archived as the backup of a
-[split](#split-a-recording).
+[split](#split-a-recording) or a [merge](#merge-recordings).
 
 The Snap bundles the `flac` program for this. Outside the Snap, install it
 from your distribution, or point `SINGSTONE_FLAC` at the executable.
@@ -499,7 +544,7 @@ exact URLs recorded in [`docs/models.lock`](docs/models.lock), verifies the
 downloaded artifacts and final files, then publishes them atomically under
 `$SNAP_USER_COMMON/models`—normally `~/snap/singstone/common/models`.
 
-`devices`, `record`, `render`, `archive`, `split`, and `speakers` never start the
+`devices`, `record`, `render`, `archive`, `split`, `merge`, and `speakers` never start the
 download service.
 `process`, `transcribe`, `diarize`, `recognize`, `correct`, and `dictate` wait for setup
 when they use a missing default Snap model. Interrupted downloads resume on the
@@ -530,6 +575,7 @@ snap logs -n=100 singstone.model-download
 | `render` | Build transcripts from persistent intermediate artifacts |
 | `archive` | Convert a processed session's raw audio to 16-bit FLAC |
 | `split` | Cut an unprocessed session into two new sessions, keeping the original as an archived backup |
+| `merge` | Join unprocessed sessions into one new session, keeping the pieces as archived backups |
 | `speakers` | List learned speakers; `speakers tidy --dry-run` shows what tidying would remove and why |
 
 Run `singstone COMMAND --help` for command-specific flags. Use `process` for the

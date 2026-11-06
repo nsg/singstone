@@ -162,7 +162,7 @@ pub fn read_split_into(session: &Session) -> io::Result<Option<SplitInto>> {
     read_optional(&session.split_into_path())
 }
 
-fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+pub(crate) fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
     match process::read_json(path) {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -174,6 +174,22 @@ fn read_optional<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Opti
 /// `session`, then archive `session` as their backup. Nothing changes unless
 /// every step succeeds.
 pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Result<SplitOutcome> {
+    let mut undo = Undo::default();
+    match write_parts(session, at_ms, titles, &mut undo) {
+        Ok(outcome) => {
+            undo.disarm();
+            Ok(outcome)
+        }
+        Err(error) => Err(undo.fail(error)),
+    }
+}
+
+fn write_parts(
+    session: &Session,
+    at_ms: u64,
+    titles: [&str; 2],
+    undo: &mut Undo,
+) -> io::Result<SplitOutcome> {
     let manifest = session.read_manifest()?;
     if let Some(reason) = refusal(session, &manifest) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
@@ -244,11 +260,15 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
         ));
     }
 
-    let started = [
-        session::wallclock_after(&manifest.started_wallclock, 0),
-        session::wallclock_after(&manifest.started_wallclock, at_ms),
+    let clock_map = session.wallclock_map(&manifest)?;
+    let started = [clock_map.at(0), clock_map.at(at_ms)];
+    let clocks = [
+        clock_map.slice(0, at_ms),
+        clock_map.slice(at_ms, length_ms.max(at_ms)),
     ];
-    let [Some(first_start), Some(second_start)] = started else {
+    let ([Some(first_start), Some(second_start)], [Some(first_clock), Some(second_clock)]) =
+        (started, clocks)
+    else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -257,13 +277,13 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
             ),
         ));
     };
+    let part_clocks = [first_clock, second_clock];
     let original_name = session
         .dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let mut undo = Undo::default();
     let staging = session::reserve_dir(&root.join(format!(".{original_name}.split")))?;
     undo.directories.push(staging.clone());
     let parts = [
@@ -311,6 +331,7 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
         if let Some(part_details) = part_details {
             meeting::write_details_atomic(&part.meeting_path(), &part_details)?;
         }
+        part.write_wallclock_map(&part_clocks[index], [at_ms, length_ms - at_ms][index])?;
         if !hidden[index].is_default() {
             process::write_json_atomic(&part.hidden_sources_path(), &hidden[index])?;
         }
@@ -341,11 +362,7 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
         };
         part.write_manifest(&Manifest {
             state: SessionState::Stopped,
-            started_wallclock: if index == 0 {
-                manifest.started_wallclock.clone()
-            } else {
-                second_start.rfc3339()
-            },
+            started_wallclock: part_clocks[index].started().to_owned(),
             mic: StreamInfo {
                 enabled: manifest.mic.enabled && recorded(AudioSource::Mic),
                 ..manifest.mic.clone()
@@ -373,11 +390,6 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
     sync_directory(&root)?;
 
     let into_path = session.split_into_path();
-    let previous = match fs::read(&into_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
-    };
     let mut record = read_split_into(session)?.unwrap_or(SplitInto {
         format_version: SPLIT_FORMAT_VERSION,
         splits: Vec::new(),
@@ -391,16 +403,18 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
                 .unwrap_or_default()
         }),
     });
-    undo.split_into = Some((into_path.clone(), previous));
+    undo.keep_record(&into_path)?;
     process::write_json_atomic(&into_path, &record)?;
+    undo.record_installed();
     sync_directory(&session.dir)?;
-    let archived = archive::archive_split_backup(session).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not archive the original, so it was not split: {error}"),
-        )
-    })?;
-    undo.disarm();
+    let archived = archive::archive_backups(&[session])
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("could not archive the original, so it was not split: {error}"),
+            )
+        })?
+        .remove(0);
     let [first, second] = <[PathBuf; 2]>::try_from(finished).expect("two parts");
     Ok(SplitOutcome {
         parts: [first, second],
@@ -408,30 +422,129 @@ pub fn split_session(session: &Session, at_ms: u64, titles: [&str; 2]) -> io::Re
     })
 }
 
-/// Removes what a failed split left behind and restores the original's record.
+/// Removes what a failed split or merge left behind and puts the
+/// originals' records back.
 #[derive(Default)]
-struct Undo {
-    directories: Vec<PathBuf>,
-    split_into: Option<(PathBuf, Option<Vec<u8>>)>,
+pub(crate) struct Undo {
+    pub directories: Vec<PathBuf>,
+    records: Vec<RecordChange>,
+}
+
+/// A record file about to be replaced.
+struct RecordChange {
+    path: PathBuf,
+    /// A second link to the record as it was, `None` when there was none.
+    kept: Option<PathBuf>,
+    /// Whether the new record has replaced it.
+    installed: bool,
 }
 
 impl Undo {
-    fn disarm(&mut self) {
+    /// Keep the record at `path` as it is, under a second name, so that a
+    /// failure can put it back by renaming rather than by writing it again.
+    pub fn keep_record(&mut self, path: &Path) -> io::Result<()> {
+        // A free name: one left by an interrupted run may be the only copy
+        // of an older record, so it is never replaced.
+        let mut kept = None;
+        for suffix in 0u32.. {
+            let mut candidate = path.as_os_str().to_owned();
+            candidate.push(".undo");
+            if suffix > 0 {
+                candidate.push(format!("-{suffix}"));
+            }
+            let candidate = PathBuf::from(candidate);
+            match fs::hard_link(path, &candidate) {
+                Ok(()) => {
+                    kept = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error),
+            }
+        }
+        self.records.push(RecordChange {
+            path: path.to_path_buf(),
+            kept,
+            installed: false,
+        });
+        Ok(())
+    }
+
+    /// The record last kept has been replaced.
+    pub fn record_installed(&mut self) {
+        if let Some(change) = self.records.last_mut() {
+            change.installed = true;
+        }
+    }
+
+    /// Everything succeeded: keep the new state.
+    pub fn disarm(&mut self) {
         self.directories.clear();
-        self.split_into = None;
+        for change in self.records.drain(..) {
+            if let Some(kept) = change.kept
+                && let Err(error) = fs::remove_file(&kept)
+            {
+                eprintln!("warning: could not remove {}: {error}", kept.display());
+            }
+        }
+    }
+
+    /// Undo everything and return `error`, with what could not be undone.
+    pub fn fail(&mut self, error: io::Error) -> io::Error {
+        let failures = self.rollback();
+        if failures.is_empty() {
+            return error;
+        }
+        io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; undoing it also failed, so fix this by hand: {}",
+                failures.join("; ")
+            ),
+        )
+    }
+
+    /// What could not be undone.
+    fn rollback(&mut self) -> Vec<String> {
+        let mut failures = Vec::new();
+        for directory in self.directories.drain(..).rev() {
+            match fs::remove_dir_all(&directory) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    failures.push(format!("remove {}: {error}", directory.display()));
+                }
+                _ => {}
+            }
+        }
+        for change in self.records.drain(..).rev() {
+            let restored = match (&change.kept, change.installed) {
+                (Some(kept), true) => fs::rename(kept, &change.path),
+                (None, true) => fs::remove_file(&change.path),
+                (Some(kept), false) => fs::remove_file(kept),
+                (None, false) => Ok(()),
+            };
+            if let Err(error) = restored {
+                failures.push(format!("restore {}: {error}", change.path.display()));
+            }
+            if !change.installed {
+                // A half-written temporary; leave anything else there alone.
+                let temporary = jsonl::tmp_path(&change.path);
+                if fs::symlink_metadata(&temporary).is_ok_and(|metadata| metadata.is_file()) {
+                    let _ = fs::remove_file(&temporary);
+                }
+            }
+            if let Some(parent) = change.path.parent() {
+                let _ = sync_directory(parent);
+            }
+        }
+        failures
     }
 }
 
 impl Drop for Undo {
     fn drop(&mut self) {
-        for directory in self.directories.iter().rev() {
-            let _ = fs::remove_dir_all(directory);
-        }
-        if let Some((path, previous)) = self.split_into.take() {
-            let _ = match previous {
-                Some(bytes) => fs::write(&path, bytes),
-                None => fs::remove_file(&path),
-            };
+        for failure in self.rollback() {
+            eprintln!("error: could not undo: {failure}");
         }
     }
 }
@@ -536,7 +649,7 @@ fn split_timeline(
     Ok(())
 }
 
-fn event_sample(event: &TimelineEvent) -> u64 {
+pub(crate) fn event_sample(event: &TimelineEvent) -> u64 {
     match event {
         TimelineEvent::Start { sample, .. }
         | TimelineEvent::Xrun { sample, .. }
@@ -548,7 +661,7 @@ fn event_sample(event: &TimelineEvent) -> u64 {
     }
 }
 
-fn at_sample(mut event: TimelineEvent, new: u64) -> TimelineEvent {
+pub(crate) fn at_sample(mut event: TimelineEvent, new: u64) -> TimelineEvent {
     match &mut event {
         TimelineEvent::Start { sample, time_ms }
         | TimelineEvent::Xrun {
@@ -613,7 +726,10 @@ fn split_screenshots(
 
 /// `screenshots/<name>` opened without following symlinks, if it is a
 /// regular file directly in a real `screenshots` folder of the session.
-fn open_screenshot(session: &Session, relative: &str) -> Option<(std::ffi::OsString, File)> {
+pub(crate) fn open_screenshot(
+    session: &Session,
+    relative: &str,
+) -> Option<(std::ffi::OsString, File)> {
     let mut components = Path::new(relative).components();
     let (Some(Component::Normal(folder)), Some(Component::Normal(name)), None) =
         (components.next(), components.next(), components.next())
@@ -640,7 +756,7 @@ fn open_screenshot(session: &Session, relative: &str) -> Option<(std::ffi::OsStr
 }
 
 /// Copy `source` into a new owner-only file and flush it to disk.
-fn copy_private(source: &mut File, target: &Path) -> io::Result<()> {
+pub(crate) fn copy_private(source: &mut File, target: &Path) -> io::Result<()> {
     let mut file = session::create_private_file(target)?;
     io::copy(source, &mut file)?;
     file.sync_all()
@@ -648,7 +764,7 @@ fn copy_private(source: &mut File, target: &Path) -> io::Result<()> {
 
 /// `<time>-<name>` as the screenshot watcher names files, with the time
 /// replaced; other names are kept. Either gets a `-N` suffix when taken.
-fn free_screenshot_name(directory: &Path, name: &OsStr, time_ms: u64) -> PathBuf {
+pub(crate) fn free_screenshot_name(directory: &Path, name: &OsStr, time_ms: u64) -> PathBuf {
     let bytes = name.as_bytes();
     let timed = bytes.len() > 10 && bytes[..9].iter().all(u8::is_ascii_digit) && bytes[9] == b'-';
     (0u32..)
@@ -729,11 +845,11 @@ fn split_hidden_sources(hidden: HiddenSources, at_ms: u64) -> [HiddenSources; 2]
     })
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-fn clock(ms: u64) -> String {
+pub(crate) fn clock(ms: u64) -> String {
     let seconds = ms / 1000;
     if seconds < 3600 {
         format!("{}:{:02}", seconds / 60, seconds % 60)

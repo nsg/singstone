@@ -501,12 +501,18 @@ pub fn create_private_dir(path: &Path) -> io::Result<()> {
     fs::DirBuilder::new().mode(0o700).create(path)
 }
 
-/// Create (truncating) a file readable only by the owner.
+/// Create a new, empty file readable only by the owner. Whatever was at
+/// `path` is unlinked first, so a symlink or hard link left there never
+/// leads the write into another file.
 pub fn create_private_file(path: &Path) -> io::Result<File> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    // Exclusive creation does not follow a symlink that appeared meanwhile.
     OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
 }

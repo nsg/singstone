@@ -41,6 +41,9 @@ const SPEAKER_CORRECTIONS_FORMAT_VERSION: u32 = 1;
 pub(crate) const MEETING_SPAN_FORMAT_VERSION: u32 = 1;
 const EMBEDDING_WINDOW_MS: u64 = 10_000;
 const MIN_LEARN_MS: u64 = 1_500;
+/// Recognition scores a cluster on its chunks that other voices of the same
+/// source cover less than this, when it has any.
+const MAX_RECOGNITION_OTHER_VOICE_MS: u64 = 200;
 const PROPOSAL_MARGIN: f32 = 0.05;
 
 struct CorrectionLearning {
@@ -2180,14 +2183,38 @@ fn recognize_speakers(
     }
     let mut result = RecognitionResult::default();
     for source in [AudioSource::System, AudioSource::Mic] {
+        let source_chunks = chunks
+            .iter()
+            .filter(|chunk| {
+                chunk.source == source
+                    && chunk.end_ms.saturating_sub(chunk.start_ms) >= MIN_LEARN_MS
+            })
+            .collect::<Vec<_>>();
         let mut cluster_embeddings = BTreeMap::<u32, Vec<Vec<f32>>>::new();
-        for chunk in chunks.iter().filter(|chunk| {
-            chunk.source == source && chunk.end_ms.saturating_sub(chunk.start_ms) >= MIN_LEARN_MS
-        }) {
-            cluster_embeddings
+        let mut overlapped = BTreeMap::<u32, Vec<Vec<f32>>>::new();
+        for chunk in &source_chunks {
+            let other_voices_ms = chunks
+                .iter()
+                .filter(|other| other.source == source && other.cluster != chunk.cluster)
+                .map(|other| {
+                    other
+                        .end_ms
+                        .min(chunk.end_ms)
+                        .saturating_sub(other.start_ms.max(chunk.start_ms))
+                })
+                .sum::<u64>();
+            let target = if other_voices_ms >= MAX_RECOGNITION_OTHER_VOICE_MS {
+                &mut overlapped
+            } else {
+                &mut cluster_embeddings
+            };
+            target
                 .entry(chunk.cluster)
                 .or_default()
                 .push(chunk.embedding.clone());
+        }
+        for (cluster, embeddings) in overlapped {
+            cluster_embeddings.entry(cluster).or_insert(embeddings);
         }
         if cluster_embeddings.is_empty() {
             continue;

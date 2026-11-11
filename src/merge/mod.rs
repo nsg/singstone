@@ -6,3 +6,4 @@ pub mod leakage;
 pub mod process;
 pub mod turns;
 pub mod utterances;
+pub mod voices;

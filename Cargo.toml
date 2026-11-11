@@ -15,7 +15,7 @@ rustix = { version = "1", features = ["fs", "event", "time", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sherpa-onnx = { version = "1.13.8", default-features = false, features = ["shared"] }
+sherpa-onnx = { version = "2.0.1", default-features = false, features = ["shared"] }
 whisper-rs = "0.16"
 
 [features]

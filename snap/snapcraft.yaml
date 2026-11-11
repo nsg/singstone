@@ -177,7 +177,7 @@ parts:
     plugin: cmake
     source: https://github.com/k2-fsa/sherpa-onnx.git
     source-type: git
-    source-commit: 11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf
+    source-commit: af2d8d81dbfa61c4cea4c568da78f3982edca005
     build-packages:
       - build-essential
       - ca-certificates

@@ -181,7 +181,8 @@ calendar as well.
 - Uses per-meeting attendee details to guide speaker counts and recognition.
 - Marks loudspeaker sound picked up by the microphone as echo by comparing the
   two recordings, without deleting it, and shows which side was talking on
-  every line.
+  every line. Voices in the room keep their whole turn, even where they talk
+  over the remote side.
 - Hides either audio source from a session's transcript without deleting it,
   keeping your own lines or any lines you pick.
 - Marks where the meeting starts and ends in a longer recording, leaving the

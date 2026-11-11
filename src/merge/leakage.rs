@@ -1,7 +1,9 @@
 use crate::audio::archive;
 use crate::merge::lead;
+use crate::merge::voices::MicVoices;
 use crate::types::{AudioSource, Lead, SAMPLE_RATE, TimedWord};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
@@ -39,6 +41,26 @@ const LEAD_ECHO_MIN_SHARE: f32 = 0.7;
 /// A word with fewer led frames of its own is judged on a 200 ms stretch
 /// around it, and only when none of its own frames has the microphone leading.
 const LEAD_MIN_WORD_FRAMES: usize = 5;
+/// Someone in the room talks where the microphone leads, alone or over the
+/// system audio, for this many frames with gaps of at most
+/// `ROOM_STRETCH_MAX_GAP_FRAMES`.
+const ROOM_STRETCH_MIN_FRAMES: usize = 40;
+const ROOM_STRETCH_MAX_GAP_FRAMES: usize = 10;
+/// No pass marks words this close to such a stretch as echo, since people
+/// cut in and trail off under the other side.
+const ROOM_MARGIN_MS: u64 = 250;
+/// A diarized microphone voice is someone in the room when the microphone
+/// leads at least this share of its led frames...
+const ROOM_VOICE_MIN_MIC_SHARE: f32 = 0.4;
+/// ...and it is less similar than this to every remote voice; an echo still
+/// sounds like the remote speaker it repeats.
+const ECHO_VOICE_MIN_SIMILARITY: f32 = 0.5;
+/// A room voice's turn in which the microphone leads this many frames is
+/// kept whole: diarization tells where that person starts and stops.
+const ROOM_TURN_MIN_FRAMES: usize = 5;
+/// In the turns of a microphone voice that sounds like a remote one, a word
+/// is echo when the system audio alone leads this share of its led frames.
+const ECHO_VOICE_LEAD_SHARE: f32 = 0.4;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EchoDetection {
@@ -65,10 +87,14 @@ pub struct DetectionResult {
 pub fn detect_leaked_mic_words(
     words: &[TimedWord],
     audio: Option<&AudioEnvelopes>,
+    voices: &MicVoices,
 ) -> DetectionResult {
     let mut echo = vec![false; words.len()];
+    let spans = audio
+        .map(|audio| audio.voice_spans(voices))
+        .unwrap_or_default();
     let mut detections = audio
-        .map(|audio| detect_with_audio(words, audio, &mut echo))
+        .map(|audio| detect_with_audio(words, audio, &spans.room, &mut echo))
         .unwrap_or_default();
 
     let system_tokens = source_tokens(words, AudioSource::System);
@@ -82,6 +108,7 @@ pub fn detect_leaked_mic_words(
     for phrase in mic_phrases(words, &echo) {
         let mic_tokens = phrase
             .iter()
+            .filter(|&&index| !spans.in_room(&words[index]))
             .filter_map(|&index| normalize_token(&words[index].text).map(|text| (index, text)))
             .collect::<Vec<_>>();
         if mic_tokens.len() < AUDIO_MIN_MATCHES {
@@ -183,7 +210,7 @@ pub fn detect_leaked_mic_words(
     }
 
     if let Some(audio) = audio.filter(|audio| audio.lead.echo_path) {
-        detections.extend(detect_with_lead(words, audio, &mut echo));
+        detections.extend(detect_with_lead(words, audio, &spans, &mut echo));
     }
     detections.sort_by_key(|detection| detection.mic_start_ms);
 
@@ -193,6 +220,7 @@ pub fn detect_leaked_mic_words(
 fn detect_with_audio(
     words: &[TimedWord],
     audio: &AudioEnvelopes,
+    room: &[(u64, u64)],
     echo: &mut [bool],
 ) -> Vec<EchoDetection> {
     let mut detections = Vec::new();
@@ -201,9 +229,13 @@ fn detect_with_audio(
             .iter()
             .map(|&index| audio.word_evidence(&words[index]))
             .collect::<Vec<_>>();
-        let mut phrase_echo = evidence
+        let mut phrase_echo = phrase
             .iter()
-            .map(AudioWordEvidence::passes)
+            .zip(&evidence)
+            .map(|(&index, evidence)| {
+                let word = &words[index];
+                !overlaps_any(room, word.start_ms, word.end_ms) && evidence.passes()
+            })
             .collect::<Vec<_>>();
         let smoothed = (1..phrase_echo.len().saturating_sub(1))
             .filter(|&position| {
@@ -277,13 +309,22 @@ fn detect_with_audio(
 fn detect_with_lead(
     words: &[TimedWord],
     audio: &AudioEnvelopes,
+    spans: &VoiceSpans,
     echo: &mut [bool],
 ) -> Vec<EchoDetection> {
     let mut detections = Vec::new();
     for phrase in mic_phrases(words, echo) {
         let marked = phrase
             .iter()
-            .map(|&index| audio.system_leads_word(&words[index]))
+            .map(|&index| {
+                let word = &words[index];
+                let min_share = if overlaps_any(&spans.echo_voice, word.start_ms, word.end_ms) {
+                    ECHO_VOICE_LEAD_SHARE
+                } else {
+                    LEAD_ECHO_MIN_SHARE
+                };
+                !spans.in_room(word) && audio.system_leads_word(word, min_share)
+            })
             .collect::<Vec<_>>();
         for run in phrase
             .iter()
@@ -317,6 +358,42 @@ fn detect_with_lead(
         }
     }
     detections
+}
+
+/// Microphone time as ordered, disjoint `(start_ms, end_ms)` spans.
+#[derive(Default)]
+struct VoiceSpans {
+    /// Someone in the room talks: no pass marks these words as echo.
+    room: Vec<(u64, u64)>,
+    /// Turns of microphone voices that sound like a remote voice.
+    echo_voice: Vec<(u64, u64)>,
+}
+
+impl VoiceSpans {
+    fn in_room(&self, word: &TimedWord) -> bool {
+        overlaps_any(&self.room, word.start_ms, word.end_ms)
+    }
+}
+
+/// Whether `[start_ms, end_ms)` overlaps one of the ordered, disjoint `spans`.
+fn overlaps_any(spans: &[(u64, u64)], start_ms: u64, end_ms: u64) -> bool {
+    let first = spans.partition_point(|&(_, end)| end <= start_ms);
+    spans
+        .get(first)
+        .is_some_and(|&(start, _)| start < end_ms.max(start_ms + 1))
+}
+
+/// Joins overlapping or touching spans into ordered, disjoint ones.
+fn merged(mut spans: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    spans.sort_unstable();
+    let mut joined = Vec::<(u64, u64)>::with_capacity(spans.len());
+    for (start, end) in spans {
+        match joined.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => joined.push((start, end)),
+        }
+    }
+    joined
 }
 
 fn shifted_to_system_time(mic_time_ms: u64, delay_ms: i64) -> u64 {
@@ -547,7 +624,7 @@ impl AudioEnvelopes {
 
     /// Whether the system audio alone leads at least `LEAD_ECHO_MIN_SHARE` of
     /// a microphone word's led frames.
-    fn system_leads_word(&self, word: &TimedWord) -> bool {
+    fn system_leads_word(&self, word: &TimedWord, min_share: f32) -> bool {
         let counts = |frames: &[Option<Lead>]| {
             let led = frames.iter().filter(|lead| lead.is_some()).count();
             let system = frames
@@ -556,9 +633,8 @@ impl AudioEnvelopes {
                 .count();
             (led, system)
         };
-        let leads = |(led, system): (usize, usize)| {
-            led > 0 && system as f32 >= LEAD_ECHO_MIN_SHARE * led as f32
-        };
+        let leads =
+            |(led, system): (usize, usize)| led > 0 && system as f32 >= min_share * led as f32;
         let own = counts(self.lead_frames_between(word.start_ms, word.end_ms));
         if own.0 >= LEAD_MIN_WORD_FRAMES {
             return leads(own);
@@ -579,6 +655,85 @@ impl AudioEnvelopes {
             start_ms.saturating_add_signed(shift),
             end_ms.saturating_add_signed(shift),
         ))
+    }
+
+    /// Where someone in the room talks and where a microphone voice repeats
+    /// a remote one, on the microphone's time line.
+    fn voice_spans(&self, voices: &MicVoices) -> VoiceSpans {
+        let room_led = |lead: &Option<Lead>| matches!(lead, Some(Lead::Mic | Lead::Both));
+        let mut stretches = Vec::new();
+        let mut current: Option<(usize, usize, usize)> = None;
+        for (frame, _) in self
+            .lead
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(_, lead)| room_led(lead))
+        {
+            current = match current {
+                Some((start, end, count)) if frame - end <= ROOM_STRETCH_MAX_GAP_FRAMES => {
+                    Some((start, frame + 1, count + 1))
+                }
+                previous => {
+                    stretches.extend(previous);
+                    Some((frame, frame + 1, 1))
+                }
+            };
+        }
+        stretches.extend(current);
+        let frame_ms = |frame: usize| frame as u64 * AUDIO_FRAME_MS;
+        let widened = stretches
+            .into_iter()
+            .filter(|&(_, _, count)| count >= ROOM_STRETCH_MIN_FRAMES)
+            .map(|(start, end, _)| {
+                (
+                    frame_ms(start).saturating_sub(ROOM_MARGIN_MS),
+                    frame_ms(end).saturating_add(ROOM_MARGIN_MS),
+                )
+            });
+
+        let counts = |start_ms: u64, end_ms: u64| {
+            let frames = self.lead_frames_between(start_ms, end_ms);
+            let led = frames.iter().filter(|lead| lead.is_some()).count();
+            (led, frames.iter().filter(|lead| room_led(lead)).count())
+        };
+        let mut shares = BTreeMap::<u32, (usize, usize)>::new();
+        for &(start_ms, end_ms, cluster) in &voices.turns {
+            let (led, room) = counts(start_ms, end_ms);
+            let share = shares.entry(cluster).or_default();
+            share.0 += led;
+            share.1 += room;
+        }
+        let is_room_voice = |cluster: &u32| {
+            shares.get(cluster).is_some_and(|&(led, room)| {
+                room > 0 && room as f32 >= ROOM_VOICE_MIN_MIC_SHARE * led as f32
+            }) && voices
+                .remote_similarity
+                .get(cluster)
+                .is_none_or(|&similarity| similarity < ECHO_VOICE_MIN_SIMILARITY)
+        };
+        let room_turns = voices
+            .turns
+            .iter()
+            .filter(|&&(start_ms, end_ms, cluster)| {
+                is_room_voice(&cluster) && counts(start_ms, end_ms).1 >= ROOM_TURN_MIN_FRAMES
+            })
+            .map(|&(start_ms, end_ms, _)| (start_ms, end_ms));
+        let echo_voice = voices
+            .turns
+            .iter()
+            .filter(|(_, _, cluster)| {
+                voices
+                    .remote_similarity
+                    .get(cluster)
+                    .is_some_and(|&similarity| similarity >= ECHO_VOICE_MIN_SIMILARITY)
+            })
+            .map(|&(start_ms, end_ms, _)| (start_ms, end_ms))
+            .collect();
+        VoiceSpans {
+            room: merged(widened.chain(room_turns).collect()),
+            echo_voice: merged(echo_voice),
+        }
     }
 
     /// The loudspeaker delay the lead assumed near a time.
@@ -1075,7 +1230,7 @@ mod tests {
             AudioSource::Mic,
             1_120,
         ));
-        let result = detect_leaked_mic_words(&input, None);
+        let result = detect_leaked_mic_words(&input, None, &MicVoices::default());
         assert_eq!(
             result.echo,
             [false, false, false, false, true, true, true, true]
@@ -1095,7 +1250,7 @@ mod tests {
             AudioSource::Mic,
             770,
         ));
-        let result = detect_leaked_mic_words(&input, None);
+        let result = detect_leaked_mic_words(&input, None, &MicVoices::default());
         assert_eq!(
             result.echo,
             [false, false, false, false, false, true, true, true, true]
@@ -1114,7 +1269,7 @@ mod tests {
             AudioSource::Mic,
             1_050,
         ));
-        let result = detect_leaked_mic_words(&input, None);
+        let result = detect_leaked_mic_words(&input, None, &MicVoices::default());
         assert!(result.echo.iter().all(|echo| !echo));
         assert!(result.detections.is_empty());
     }
@@ -1124,7 +1279,7 @@ mod tests {
         let mut input = words(&["thank", "you"], AudioSource::System, 1_000);
         input.extend(words(&["Thank", "you!"], AudioSource::Mic, 1_120));
         assert!(
-            detect_leaked_mic_words(&input, None)
+            detect_leaked_mic_words(&input, None, &MicVoices::default())
                 .echo
                 .iter()
                 .all(|echo| !echo)
@@ -1132,7 +1287,7 @@ mod tests {
 
         let (system, mic) = correlated_audio(4_000, 120);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
         assert_eq!(result.echo, [false, false, true, true]);
         assert_eq!(result.detections[0].evidence, "text_audio");
         assert!(result.detections[0].audio_similarity.unwrap() > 0.9);
@@ -1154,7 +1309,7 @@ mod tests {
         let (system, mic) = calibrated_audio(8_000, 120);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
 
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
 
         assert_eq!(
             result.echo,
@@ -1178,7 +1333,7 @@ mod tests {
         assert!(!audio.reference_points.is_empty());
         let input = words(&["local", "speech"], AudioSource::Mic, 7_120);
 
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
 
         assert!(result.echo.iter().all(|echo| !echo));
         assert!(result.detections.is_empty());
@@ -1202,7 +1357,7 @@ mod tests {
         ));
         input.extend(words(&["my", "question"], AudioSource::Mic, 5_120));
 
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
 
         assert_eq!(
             result.echo,
@@ -1228,7 +1383,7 @@ mod tests {
         });
         let audio = AudioEnvelopes::from_samples(&mic, &system);
         assert!(audio.reference_points.is_empty());
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
         assert!(result.echo.iter().all(|echo| !echo));
         assert!(result.detections.is_empty());
     }
@@ -1236,7 +1391,7 @@ mod tests {
     #[test]
     fn preserves_a_later_repetition_without_audio() {
         let input = duplicate_words(1_000, 2_200);
-        let result = detect_leaked_mic_words(&input, None);
+        let result = detect_leaked_mic_words(&input, None, &MicVoices::default());
         assert!(result.echo.iter().all(|echo| !echo));
         assert!(result.detections.is_empty());
     }
@@ -1246,7 +1401,7 @@ mod tests {
         let input = duplicate_words(1_000, 2_200);
         let (system, mic) = correlated_audio(4_000, 120);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
         // The text match is rejected; the microphone carries nothing but the
         // system's echo, so the lead pass marks the words instead.
         assert_eq!(
@@ -1276,7 +1431,7 @@ mod tests {
         let input = vec![word(AudioSource::Mic, 2_050, "mm")];
         let audio = AudioEnvelopes::from_samples(&mic, &system);
         assert!(!audio.lead.echo_path);
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
         assert_eq!(result.echo, [false]);
     }
 
@@ -1300,7 +1455,7 @@ mod tests {
         let mut input = words(&["one", "two"], AudioSource::Mic, 1_000);
         input.push(reply);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
         assert_eq!(result.echo, [true, true, false]);
     }
 
@@ -1356,7 +1511,7 @@ mod tests {
         input.extend(words(&["four", "five"], AudioSource::Mic, 3_800));
         input.push(word(AudioSource::Mic, 7_200, "right"));
         let audio = AudioEnvelopes::from_samples(&mic, &system);
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
         assert_eq!(
             result.echo,
             [true, true, true, false, true, true, false],
@@ -1378,6 +1533,77 @@ mod tests {
         );
     }
 
+    /// Six seconds of remote speech and its distorted echo on the microphone.
+    fn remote_talk() -> (Vec<f32>, Vec<f32>) {
+        let system = synthetic_audio(9_000, |frame| {
+            if frame < 600 {
+                0.2 + ((frame * 13) % 7) as f32 / 30.0
+            } else {
+                0.0
+            }
+        });
+        (distorted_echo(9_000, 600, 0.2, 0.15), system)
+    }
+
+    fn echo_and_room_voices() -> MicVoices {
+        MicVoices {
+            turns: vec![(0, 2_500, 0), (2_500, 3_200, 1), (3_200, 6_000, 0)],
+            remote_similarity: BTreeMap::from([(0, 0.8), (1, 0.1)]),
+        }
+    }
+
+    #[test]
+    fn a_room_voice_keeps_its_whole_diarized_turn() {
+        // Someone in the room starts loudly over the remote side and trails
+        // off under its echo.
+        let (mut mic, system) = remote_talk();
+        add_local_signal(&mut mic, 2_500, 2_800, 1.0);
+        let input = vec![
+            word(AudioSource::Mic, 2_500, "well"),
+            word(AudioSource::Mic, 2_850, "maybe"),
+            word(AudioSource::Mic, 4_000, "four"),
+        ];
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+
+        let unknown = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
+        let known = detect_leaked_mic_words(&input, Some(&audio), &echo_and_room_voices());
+
+        assert_eq!(unknown.echo, [false, true, true]);
+        assert_eq!(known.echo, [false, false, true]);
+    }
+
+    #[test]
+    fn words_next_to_room_speech_stay() {
+        let (mut mic, system) = remote_talk();
+        add_local_signal(&mut mic, 2_500, 3_000, 1.0);
+        let input = vec![
+            word(AudioSource::Mic, 2_600, "right"),
+            word(AudioSource::Mic, 3_150, "so"),
+            word(AudioSource::Mic, 3_700, "four"),
+        ];
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
+
+        assert_eq!(result.echo, [false, false, true]);
+    }
+
+    #[test]
+    fn a_voice_that_sounds_remote_needs_less_system_lead_to_be_echo() {
+        // Half of the word's frames have the microphone leading, as where
+        // the room still rings after the remote speaker stops.
+        let (mut mic, system) = remote_talk();
+        add_local_signal(&mut mic, 4_150, 4_300, 1.0);
+        let input = vec![word(AudioSource::Mic, 4_000, "four")];
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+
+        let unknown = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
+        let known = detect_leaked_mic_words(&input, Some(&audio), &echo_and_room_voices());
+
+        assert_eq!(unknown.echo, [false]);
+        assert_eq!(known.echo, [true]);
+    }
+
     #[test]
     fn one_timing_outlier_prevents_detection() {
         let mut input = words(&["one", "two", "three", "four"], AudioSource::System, 1_000);
@@ -1392,7 +1618,7 @@ mod tests {
             input.push(word(AudioSource::Mic, start, text));
         }
         input.push(word(AudioSource::Mic, 5_050, "four"));
-        let result = detect_leaked_mic_words(&input, None);
+        let result = detect_leaked_mic_words(&input, None, &MicVoices::default());
         assert!(result.echo.iter().all(|echo| !echo));
         assert!(result.detections.is_empty());
     }
@@ -1417,7 +1643,7 @@ mod tests {
                 word(AudioSource::Mic, 19_120, "late local"),
             ];
 
-            let result = detect_leaked_mic_words(&input, Some(&audio));
+            let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
 
             assert_eq!(result.echo, [true, false, true, false]);
         }
@@ -1434,7 +1660,7 @@ mod tests {
             word(AudioSource::Mic, 17_120, "headphones local"),
         ];
 
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
 
         assert_eq!(result.echo, [true, false]);
     }
@@ -1496,7 +1722,7 @@ mod tests {
         let audio = AudioEnvelopes::read(&mic_path, &system_path).expect("open audio");
         let mut input = words(&["thank", "you"], AudioSource::System, 1_000);
         input.extend(words(&["thank", "you"], AudioSource::Mic, 1_120));
-        let result = detect_leaked_mic_words(&input, Some(&audio));
+        let result = detect_leaked_mic_words(&input, Some(&audio), &MicVoices::default());
         assert_eq!(result.echo, [false, false, true, true]);
         assert!((result.detections[0].audio_delay_ms.unwrap() - 120).abs() <= 10);
         fs::remove_dir_all(root).expect("remove fixture");

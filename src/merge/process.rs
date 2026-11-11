@@ -8,6 +8,7 @@ use crate::meeting::{self, MeetingDetails};
 use crate::merge::leakage::{self, AudioEnvelopes};
 use crate::merge::turns;
 use crate::merge::utterances::{self, DEFAULT_NEAREST_TOLERANCE_MS};
+use crate::merge::voices::MicVoices;
 use crate::models;
 use crate::session::Session;
 use crate::speaker::database::{
@@ -2516,7 +2517,8 @@ fn render_artifacts_with_segments_and_hook(
             None
         }
     };
-    let detection = leakage::detect_leaked_mic_words(&words, audio.as_ref());
+    let voices = MicVoices::new(&segments, &current_embeddings(session));
+    let detection = leakage::detect_leaked_mic_words(&words, audio.as_ref(), &voices);
     let kept_ranges = hidden
         .keep
         .iter()
@@ -3171,6 +3173,24 @@ fn read_embedding_audio(
             Ok(None)
         }
     }
+}
+
+/// The voiceprints recognition wrote for the current diarization, or none
+/// when they are missing or were made for another one.
+fn current_embeddings(session: &Session) -> Vec<EmbeddingChunk> {
+    (|| -> io::Result<Vec<EmbeddingChunk>> {
+        let metadata: EmbeddingsMetadata = read_json(&session.embeddings_metadata_path())?;
+        let current = metadata.format_version == EMBEDDINGS_FORMAT_VERSION
+            && models::sha256_file(&session.diarization_path())?
+                .eq_ignore_ascii_case(&metadata.diarization_sha256)
+            && models::sha256_file(&session.embeddings_path())?
+                .eq_ignore_ascii_case(&metadata.output_sha256);
+        if !current {
+            return Ok(Vec::new());
+        }
+        jsonl::read_all(&session.embeddings_path())
+    })()
+    .unwrap_or_default()
 }
 
 fn embeddings_metadata_is_current(

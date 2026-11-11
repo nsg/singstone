@@ -680,8 +680,9 @@ singstone render SESSION
 sidecars when present, optionally
 `speaker-assignments.json`, optionally `speaker-corrections.json`, optionally
 `speaker-turns.json`, optionally
-`hidden-sources.json`, optionally `meeting-span.json`, and the audio tracks
-when both are available. Missing assignment, correction, hidden-source, and
+`hidden-sources.json`, optionally `meeting-span.json`, optionally
+`embeddings.jsonl` when its metadata matches the current `diarization.jsonl`,
+and the audio tracks when both are available. Missing assignment, correction, hidden-source, and
 meeting-span data is allowed, but malformed or unsupported assignment,
 correction, hidden-source, meeting-span, or diarization metadata is an error. This stage uses no ML model and is fast.
 
@@ -731,9 +732,25 @@ either); it is omitted when only one track was recorded. A system utterance
 is looked up one loudspeaker delay later, where its sound reaches the
 microphone.
 
+Before any echo pass, `render` finds where someone in the room talks, and
+no pass marks those words as echo:
+
+- every stretch of at least 400 ms of frames the microphone leads, alone or
+  over the system audio, with gaps of at most 100 ms, widened by 250 ms on
+  both sides, since people cut in and trail off under the other side;
+- every diarized microphone turn of a *room voice* in which the microphone
+  leads at least five frames, from the turn's start to its end. A microphone
+  cluster is a room voice when the microphone leads at least 40% of the led
+  frames of its turns and, when `embeddings.jsonl` holds voiceprints, its
+  voiceprint has a cosine similarity below 0.5 to every system cluster's.
+
+A microphone cluster at or above that similarity is an *echo voice*: the
+loudspeaker's echo still sounds like the remote speaker it repeats.
+
 With an echo path, a final pass marks microphone words that the audio and
 text passes left when the system audio alone leads at least 70% of the
-word's led frames: in a call one side usually talks at a time, so microphone
+word's led frames, or 40% inside an echo voice's turns, where the room's
+reverberation after the remote speaker stops can make the microphone lead: in a call one side usually talks at a time, so microphone
 sound that is not clearly louder than the predicted echo of a talking remote
 side is that echo, even where distortion or room sound keeps the envelopes
 from correlating. A word with fewer than five led frames of its own is judged

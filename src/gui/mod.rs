@@ -2503,6 +2503,9 @@ fn wire_session_browser(
         } else {
             "Show archived sessions"
         }));
+        // Only a session open beside the list is selected again; the calendar
+        // and other pages stay where they are.
+        let had_selection = list_for_toggle.selected_row().is_some();
         populate_sessions(
             &list_for_toggle,
             &paths_for_toggle,
@@ -2510,7 +2513,10 @@ fn wire_session_browser(
             &search_for_toggle.text(),
             &queue_for_toggle,
         );
-        let selected = selected_for_toggle.borrow().clone();
+        let selected = selected_for_toggle
+            .borrow()
+            .clone()
+            .filter(|_| had_selection);
         if let Some(index) = selected.and_then(|selected| {
             paths_for_toggle
                 .borrow()

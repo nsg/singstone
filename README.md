@@ -159,6 +159,13 @@ dates, and older weeks by their dates alone. Archived sessions are hidden; a
 line at the bottom of the list counts them, and the **Archived** toggle next to
 the filter shows them until the app is closed.
 
+The calendar button next to **Sessions** shows the same sessions on a month
+calendar instead: whole weeks from Monday, each session as a short label in
+the colour of its status, so what is left to process or check stands out.
+The arrows step between months, **Today** returns to this month, and clicking
+a label opens the session. The filter and the **Archived** toggle apply to the
+calendar as well.
+
 ## Features
 
 - Records a microphone, a PipeWire sink monitor, or both as aligned 16 kHz audio.

@@ -1,6 +1,7 @@
 //! Sessions grouped by the week they were recorded in, weeks starting Monday.
 
 use crate::meeting::days_from_civil;
+use std::ops::Range;
 
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -65,7 +66,20 @@ fn week_dates(week: i64, today: i64) -> String {
     }
 }
 
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+/// The days a month's calendar shows: whole weeks, from the Monday on or
+/// before the 1st to the Sunday on or after its last day.
+pub fn month_days(year: i32, month: u32) -> Range<i64> {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first = week_of(days_from_civil(year, month, 1));
+    let last = week_of(days_from_civil(next_year, next_month, 1) - 1);
+    first * 7 - 3..(last + 1) * 7 - 3
+}
+
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let days = days + 719_468;
     let era = days.div_euclid(146_097);
     let day_of_era = days.rem_euclid(146_097);
@@ -112,6 +126,20 @@ mod tests {
             let (year, month, date) = civil_from_days(parsed);
             assert_eq!(format!("{year:04}-{month:02}-{date:02}"), value);
         }
+    }
+
+    #[test]
+    fn month_calendars_pad_to_whole_weeks() {
+        let shown = |year, month| {
+            let days = month_days(year, month);
+            let first = civil_from_days(days.start);
+            let last = civil_from_days(days.end - 1);
+            (first, last, (days.end - days.start) / 7)
+        };
+        assert_eq!(shown(2026, 11), ((2026, 10, 26), (2026, 12, 6), 6));
+        assert_eq!(shown(2026, 12), ((2026, 11, 30), (2027, 1, 3), 5));
+        assert_eq!(shown(2027, 2), ((2027, 2, 1), (2027, 2, 28), 4));
+        assert_eq!(shown(2026, 6), ((2026, 6, 1), (2026, 7, 5), 5));
     }
 
     #[test]

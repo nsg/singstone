@@ -1,3 +1,4 @@
+mod calendar;
 mod config;
 mod cut;
 mod dictation;
@@ -181,6 +182,17 @@ button.turn-who-none { min-height: 0; padding: 1px 9px; border: 1px dashed @bord
 button.add-speaker { min-height: 0; padding: 2px 8px; border: 1px dashed alpha(@accent_color, 0.5); color: @accent_color; background: none; font-weight: 600; }
 button.add-speaker:hover { background: alpha(@accent_color, 0.08); }
 .label-footer { padding: 8px 14px; border-top: 1px solid @borders; }
+.calendar-grid { border-left: 1px solid @borders; border-bottom: 1px solid @borders; }
+.calendar-weekday { padding: 4px 6px; font-size: 11px; font-weight: 700; opacity: 0.6; border-right: 1px solid transparent; }
+.calendar-day { min-height: 64px; padding: 4px; border-top: 1px solid @borders; border-right: 1px solid @borders; }
+.calendar-day-outside { background: alpha(currentColor, 0.035); }
+.calendar-day-outside .calendar-date { opacity: 0.45; }
+.calendar-date { padding: 1px 7px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.calendar-today .calendar-date { color: @accent_fg_color; background: @accent_bg_color; }
+button.calendar-session { min-height: 0; min-width: 0; padding: 2px 6px; border-radius: 5px; font-size: 11px; font-weight: 600; box-shadow: none; }
+button.calendar-session:hover { background-image: image(alpha(white, 0.18)); }
+button.calendar-session:active { background-image: image(alpha(black, 0.12)); }
+.calendar-session-time { font-feature-settings: "tnum"; opacity: 0.8; }
 "#;
 
 #[derive(Clone)]
@@ -820,8 +832,15 @@ fn build_window(app: &adw::Application) {
         .hexpand(true)
         .build();
     let show_archived = archived_toggle();
+    let show_calendar = calendar_toggle();
     let queue_panel = QueuePanel::new();
-    let sidebar = build_sidebar(&search, &show_archived, &session_list, &queue_panel);
+    let sidebar = build_sidebar(
+        &search,
+        &show_archived,
+        &show_calendar,
+        &session_list,
+        &queue_panel,
+    );
 
     let tidy_notice = tidy_notice();
     let toasts = adw::ToastOverlay::new();
@@ -903,6 +922,17 @@ fn build_window(app: &adw::Application) {
         &banner,
     );
 
+    wire_calendar(
+        &window,
+        &config,
+        &search,
+        &show_calendar,
+        &session_list,
+        &session_paths,
+        &detail,
+        &stack,
+        &processing_queue,
+    );
     wire_session_browser(
         &window,
         &config,
@@ -1132,15 +1162,20 @@ fn install_css() {
 fn build_sidebar(
     search: &gtk::SearchEntry,
     show_archived: &gtk::ToggleButton,
+    show_calendar: &gtk::ToggleButton,
     list: &gtk::ListBox,
     queue_panel: &QueuePanel,
 ) -> gtk::Box {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let title = gtk::Label::new(Some("Sessions"));
     title.add_css_class("title-4");
-    title.set_margin_top(16);
-    title.set_margin_bottom(8);
-    root.append(&title);
+    let title_row = gtk::CenterBox::new();
+    title_row.set_margin_top(10);
+    title_row.set_margin_start(10);
+    title_row.set_margin_end(10);
+    title_row.set_center_widget(Some(&title));
+    title_row.set_end_widget(Some(show_calendar));
+    root.append(&title_row);
     let filters = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     filters.set_margin_top(8);
     filters.set_margin_bottom(8);
@@ -2437,6 +2472,7 @@ fn delete_expired_archives(
 }
 
 fn remove_session_row(list: &gtk::ListBox, paths: &Rc<RefCell<Vec<PathBuf>>>, path: &Path) {
+    sessions_changed(list);
     let Some(index) = paths
         .borrow()
         .iter()
@@ -2451,6 +2487,126 @@ fn remove_session_row(list: &gtk::ListBox, paths: &Rc<RefCell<Vec<PathBuf>>>, pa
     {
         list.remove(&row);
     }
+}
+
+fn calendar_toggle() -> gtk::ToggleButton {
+    let toggle = gtk::ToggleButton::builder()
+        .icon_name("x-office-calendar-symbolic")
+        .tooltip_text("Show sessions in a calendar")
+        .build();
+    toggle.add_css_class("flat");
+    toggle.update_property(&[gtk::accessible::Property::Label("Calendar")]);
+    toggle
+}
+
+/// Opens the month calendar in place of the session while the sidebar
+/// toggle is on, and opens a session clicked in it.
+#[allow(clippy::too_many_arguments)]
+fn wire_calendar(
+    window: &adw::ApplicationWindow,
+    config: &Rc<RefCell<GuiConfig>>,
+    search: &gtk::SearchEntry,
+    toggle: &gtk::ToggleButton,
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    detail: &SessionDetail,
+    stack: &adw::ViewStack,
+    queue: &Rc<RefCell<ProcessingQueue>>,
+) {
+    let config_for_load = config.clone();
+    let search_for_load = search.clone();
+    let queue_for_load = queue.clone();
+    let list_for_open = list.clone();
+    let paths_for_open = paths.clone();
+    let detail_for_open = detail.clone();
+    let stack_for_open = stack.clone();
+    let window_for_open = window.clone();
+    let view = calendar::CalendarView::new(
+        Rc::new(move || {
+            listed_sessions(
+                &config_for_load.borrow(),
+                &search_for_load.text(),
+                &queue_for_load.borrow(),
+            )
+            .0
+        }),
+        Rc::new(move |path| {
+            let index = paths_for_open
+                .borrow()
+                .iter()
+                .position(|candidate| candidate == path);
+            let selected = list_for_open.selected_row().map(|row| row.index() as usize);
+            if index.is_some() && index != selected {
+                select_session_row(&list_for_open, index.unwrap_or_default());
+            } else if let Err(error) = detail_for_open.load(path) {
+                show_error(
+                    &window_for_open,
+                    "Could not open session",
+                    &error.to_string(),
+                );
+            } else {
+                stack_for_open.set_visible_child_name("session");
+            }
+        }),
+    );
+    stack.add_named(&view.root, Some("calendar"));
+
+    let stack_for_toggle = stack.clone();
+    let list_for_toggle = list.clone();
+    let paths_for_toggle = paths.clone();
+    let selected_for_toggle = detail.selected.clone();
+    let view_for_toggle = view.clone();
+    toggle.connect_toggled(move |toggle| {
+        let showing = stack_for_toggle.visible_child_name().as_deref() == Some("calendar");
+        toggle.set_tooltip_text(Some(if toggle.is_active() {
+            "Hide the calendar"
+        } else {
+            "Show sessions in a calendar"
+        }));
+        if toggle.is_active() && !showing {
+            list_for_toggle.unselect_all();
+            view_for_toggle.refresh();
+            stack_for_toggle.set_visible_child_name("calendar");
+        } else if !toggle.is_active() && showing {
+            stack_for_toggle.set_visible_child_name("session");
+            let selected = selected_for_toggle.borrow().clone();
+            if let Some(index) = selected.and_then(|selected| {
+                paths_for_toggle
+                    .borrow()
+                    .iter()
+                    .position(|path| *path == selected)
+            }) {
+                select_session_row(&list_for_toggle, index);
+            }
+        }
+    });
+    let toggle_for_stack = toggle.clone();
+    stack.connect_visible_child_name_notify(move |stack| {
+        toggle_for_stack.set_active(stack.visible_child_name().as_deref() == Some("calendar"));
+    });
+
+    let pending = Rc::new(Cell::new(false));
+    let refresh = gio::SimpleAction::new("sessions-changed", None);
+    let stack_for_refresh = stack.clone();
+    refresh.connect_activate(move |_, _| {
+        if stack_for_refresh.visible_child_name().as_deref() != Some("calendar")
+            || pending.replace(true)
+        {
+            return;
+        }
+        let view = view.clone();
+        let pending = pending.clone();
+        glib::idle_add_local_once(move || {
+            pending.set(false);
+            view.refresh();
+        });
+    });
+    window.add_action(&refresh);
+}
+
+/// Lets the calendar know the sessions the sidebar lists, or their status, changed.
+fn sessions_changed(list: &gtk::ListBox) {
+    let _ = list.activate_action("win.sessions-changed", None);
 }
 
 fn archived_toggle() -> gtk::ToggleButton {
@@ -2485,6 +2641,7 @@ fn wire_session_browser(
         let now = local_today();
         if today.replace(now) != now {
             list_for_clock.invalidate_headers();
+            sessions_changed(&list_for_clock);
         }
         glib::ControlFlow::Continue
     });
@@ -2588,6 +2745,7 @@ fn update_session_row(
     path: &Path,
     queue: &ProcessingQueue,
 ) {
+    sessions_changed(list);
     let Some(index) = paths
         .borrow()
         .iter()
@@ -6045,6 +6203,7 @@ fn populate_sessions(
         list.append(&session_row(&summary));
     }
     append_list_notes(list, paths.borrow().is_empty(), hidden);
+    sessions_changed(list);
 }
 
 /// The sessions the sidebar lists, newest first, and how many archived ones
@@ -6079,6 +6238,7 @@ fn refresh_list_notes(
     }
     let (_, hidden) = listed_sessions(config, filter, queue);
     append_list_notes(list, paths.borrow().is_empty(), hidden);
+    sessions_changed(list);
 }
 
 fn append_list_notes(list: &gtk::ListBox, empty: bool, archived_hidden: usize) {

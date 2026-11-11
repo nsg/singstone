@@ -1,5 +1,5 @@
 use crate::audio::dictate::DictationLanguage;
-use crate::types::{AudioSource, DEFAULT_SPEAKER_THRESHOLD};
+use crate::types::{AudioSource, DEFAULT_CLUSTER_THRESHOLD, DEFAULT_SPEAKER_THRESHOLD};
 use clap::{ArgAction, Args, Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -158,9 +158,9 @@ pub struct ProcessArgs {
     /// Minimum speaker-matching score required to name a diarized cluster.
     #[arg(long, default_value_t = DEFAULT_SPEAKER_THRESHOLD)]
     pub speaker_threshold: f32,
-    /// Sherpa agglomerative clustering distance threshold (lower = more
-    /// speakers; 0.9-1.1 works with titanet-small on meeting audio).
-    #[arg(long, default_value_t = 1.0)]
+    /// Average cosine distance at which voice clustering stops merging
+    /// (lower = more speakers).
+    #[arg(long, default_value_t = DEFAULT_CLUSTER_THRESHOLD)]
     pub cluster_threshold: f32,
     /// Fix the number of speakers instead of estimating it.
     #[arg(long)]
@@ -190,7 +190,7 @@ impl ProcessArgs {
             threads: None,
             speakers_db: std::env::var_os("SINGSTONE_SPEAKERS_DB").map(PathBuf::from),
             speaker_threshold: DEFAULT_SPEAKER_THRESHOLD,
-            cluster_threshold: 1.0,
+            cluster_threshold: DEFAULT_CLUSTER_THRESHOLD,
             num_speakers: None,
             events: false,
         }
@@ -304,8 +304,9 @@ pub struct DiarizeArgs {
     /// Inference threads (defaults to available parallelism).
     #[arg(long)]
     pub threads: Option<usize>,
-    /// Sherpa agglomerative clustering distance threshold.
-    #[arg(long, default_value_t = 1.0)]
+    /// Average cosine distance at which voice clustering stops merging
+    /// (lower = more speakers).
+    #[arg(long, default_value_t = DEFAULT_CLUSTER_THRESHOLD)]
     pub cluster_threshold: f32,
     /// Fix the number of speakers instead of estimating it.
     #[arg(long)]

@@ -2,8 +2,7 @@ use crate::audio::archive;
 use crate::cli::{
     CorrectArgs, DiarizeArgs, ProcessArgs, RecognizeArgs, RenderArgs, TranscribeArgs,
 };
-use crate::diarization::Diarizer;
-use crate::diarization::sherpa::SherpaDiarizer;
+use crate::diarization::{Clustering, Diarizer};
 use crate::format::jsonl;
 use crate::meeting::{self, MeetingDetails};
 use crate::merge::leakage::{self, AudioEnvelopes};
@@ -20,11 +19,11 @@ use crate::speaker::tidy;
 use crate::transcription::whisper::WhisperTranscriber;
 use crate::transcription::{ProgressReporter, Transcriber};
 use crate::types::{
-    AudioSource, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk, HIDDEN_SOURCES_FORMAT_VERSION,
-    HiddenSources, KeptRange, Manifest, MeetingSpan, MeetingSpanFile, SAMPLE_RATE,
-    SPEAKER_TURNS_FORMAT_VERSION, SessionState, SpeakerAssignment, SpeakerAssignmentProvenance,
-    SpeakerAssignments, SpeakerCorrection, SpeakerCorrections, SpeakerSegment, SpeakerTurns,
-    TimedWord, TurnGroup, Utterance,
+    AudioSource, DEFAULT_CLUSTER_THRESHOLD, DEFAULT_SPEAKER_THRESHOLD, EmbeddingChunk,
+    HIDDEN_SOURCES_FORMAT_VERSION, HiddenSources, KeptRange, Manifest, MeetingSpan,
+    MeetingSpanFile, SAMPLE_RATE, SPEAKER_TURNS_FORMAT_VERSION, SessionState, SpeakerAssignment,
+    SpeakerAssignmentProvenance, SpeakerAssignments, SpeakerCorrection, SpeakerCorrections,
+    SpeakerSegment, SpeakerTurns, TimedWord, TurnGroup, Utterance,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1764,7 +1763,7 @@ fn stage_process_args(session: PathBuf) -> ProcessArgs {
         threads: None,
         speakers_db: None,
         speaker_threshold: DEFAULT_SPEAKER_THRESHOLD,
-        cluster_threshold: 1.0,
+        cluster_threshold: DEFAULT_CLUSTER_THRESHOLD,
         num_speakers: None,
         events: false,
     }
@@ -1999,6 +1998,13 @@ fn diarize_sources(
         }
     }
     let meeting = meeting::read_details(&session.meeting_path())?;
+    if args.cluster_threshold >= 0.9 {
+        eprintln!(
+            "warning: --cluster-threshold {} is a cosine distance (default {DEFAULT_CLUSTER_THRESHOLD}); values near 1 merge almost every voice into one speaker",
+            args.cluster_threshold
+        );
+    }
+    let mut diarizer: Option<Diarizer> = None;
     let mut all_segments = Vec::new();
     for (source, enabled) in [
         (AudioSource::System, manifest.system.enabled),
@@ -2023,16 +2029,22 @@ fn diarize_sources(
         if let Some(num_speakers) = num_speakers {
             eprintln!("diarize {source}: fixed speaker count {num_speakers}");
         }
-        let result = SherpaDiarizer::new(
-            segmentation_model,
-            embedding_model,
-            source,
-            threads,
-            args.cluster_threshold,
+        let diarizer = match &mut diarizer {
+            Some(diarizer) => diarizer,
+            None => match Diarizer::new(segmentation_model, embedding_model, threads) {
+                Ok(created) => diarizer.insert(created),
+                Err(error) if strict => return Err(error),
+                Err(error) => {
+                    eprintln!("warning: diarization unavailable: {error}");
+                    break;
+                }
+            },
+        };
+        let clustering = Clustering {
+            threshold: args.cluster_threshold,
             num_speakers,
-        )
-        .and_then(|mut diarizer| diarizer.diarize(&samples));
-        match result {
+        };
+        match diarizer.diarize(&samples, source, clustering) {
             Ok(mut segments) => {
                 eprintln!(
                     "diarize {source}: {:.1} s audio, {} segment(s) in {:.1} s",

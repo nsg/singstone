@@ -133,7 +133,7 @@ as a staleness check rather than a complete recipe for reproducing inference.
 singstone diarize SESSION \
     --segmentation-model ~/.local/share/singstone/models/sherpa-onnx-pyannote-segmentation-3-0/model.onnx \
     --embedding-model ~/.local/share/singstone/models/nemo_en_titanet_small.onnx \
-    --cluster-threshold 1.0
+    --cluster-threshold 0.5
 ```
 
 **Input:** `manifest.json`, the optional per-session `meeting.json`, the enabled
@@ -143,21 +143,65 @@ single-local-speaker workflow.
 `words.jsonl` is not an input, so this stage can run before or in parallel with
 transcription.
 
-**Models:** sherpa-onnx runs a pyannote speaker-segmentation model and a speaker
-embedding model. The segmentation model finds speaker-homogeneous time ranges;
-the embedding model represents the voice in each range as a numeric vector.
-Fast agglomerative clustering groups similar vectors under numeric cluster IDs.
-Both models run on CPU.
+**Models:** a pyannote speaker-segmentation model, run directly through ONNX
+Runtime, and a speaker embedding model, run through sherpa-onnx. The
+embedding model represents a voice as a numeric vector. Both run on CPU. Each
+source is diarized in five steps:
+
+1. The audio is cut into 10-second windows starting every second; the last
+   window is padded with silence. For every frame of about 17 ms, the
+   segmentation model picks the most likely set of up to two of three local
+   speakers in that window.
+2. Every local speaker active for at least three frames of a window gets a
+   voiceprint: the embedding of the frames where it speaks alone when they
+   add up to 0.3 seconds or more, otherwise of all its active frames. When
+   that is too short to embed, all its active speech is repeated eight
+   times, cut off at ten seconds.
+3. The voiceprints with at least two seconds of solo speech, or all of them
+   when fewer than two qualify, are clustered by average-linkage
+   agglomerative clustering on cosine distance. Merging stops when the
+   closest clusters are more than `--cluster-threshold` apart. Beyond 4000
+   such voiceprints, 4000 of them, evenly spread in time, are clustered. A
+   cluster with fewer than three voiceprints joins the larger cluster with
+   the most similar mean voiceprint. When the speaker count is estimated, so
+   does one with fewer than 2% of those clustered, so a long meeting does not
+   split into fragments of a few seconds each.
+4. Every local speaker of a window is assigned a cluster by cosine
+   similarity to the clusters' mean voiceprints. A window's local speakers
+   get different clusters with the highest summed similarity, so two voices
+   the segmentation model told apart within a window are never merged.
+   When a window has more local speakers than there are clusters, the ones
+   left over are voices the clustering missed, typically someone who only
+   gives short replies. Unless the speaker count is fixed, left-over
+   voiceprints more than `--cluster-threshold` from every cluster are
+   clustered the same way (at most 4000, evenly spread in time); each group
+   holding at least 5% of them and either two or more voiceprints or one
+   with at least 0.6 seconds of speech becomes a new cluster, and the
+   windows are matched again, up to three rounds. A local speaker still left
+   over takes its most similar cluster. A window holds at most three local
+   speakers, so this finds missed voices only while clustering found one or
+   two; a quiet participant in a larger meeting stays merged into the most
+   similar voice.
+5. The windows are overlaid on one frame grid. Each frame keeps as many
+   clusters as the rounded average number of speakers the overlapping
+   windows found there, choosing the clusters with the most votes. Runs of
+   one cluster less than 500 ms apart become one segment.
+
+Segmentation runs on the configured number of inference threads; embeddings
+run on that many worker threads with one inference thread each. ONNX Runtime
+is the library that sherpa-onnx already loads, so both share one runtime.
 
 Each source is diarized independently, so microphone cluster `0` and system
-cluster `0` describe unrelated voices. `--cluster-threshold` controls how
-readily clusters are combined. Lower values usually produce more speakers;
-values around 0.9 to 1.1 have worked best with
-the documented TitaNet model on the tested AMI sample. `--num-speakers N`
-replaces automatic speaker-count estimation with that fixed count separately
-for each enabled source. Without that flag, a nonzero remote attendee count in
-`meeting.json` fixes the system track's speaker count. It never fixes the
-microphone count because remote echo can create extra microphone clusters.
+cluster `0` describe unrelated voices. `--cluster-threshold` is the average
+cosine distance at which merging stops; lower values usually produce more
+speakers. The default 0.5 was chosen on synthetic Swedish meetings and
+hand-labeled clips of real meetings with the documented TitaNet model.
+`--num-speakers N` merges until N clusters remain, before small clusters are
+absorbed, separately for each enabled source, and adds no clusters for
+left-over voices.
+Without that flag, a nonzero remote attendee count in `meeting.json` fixes
+the system track's speaker count. It never fixes the microphone count
+because remote echo can create extra microphone clusters.
 Cluster numbers are local implementation labels, not persistent identities:
 cluster `2` from one diarization run need not represent cluster `2` after
 changing a model or threshold.
@@ -174,6 +218,8 @@ settings, effective thread count, input audio hashes and the output hash. It
 also records the effective microphone-diarization value: `diarize_mic` is true
 only when microphone diarization was requested and the output contains at least
 one microphone segment. This lets `render` inherit that policy automatically.
+In files written by the earlier sherpa-onnx diarizer, `cluster_threshold` is on
+that diarizer's different scale.
 
 ```json
 {
@@ -185,7 +231,7 @@ one microphone segment. This lets `render` inherit that policy automatically.
   "segmentation_model_sha256": "...",
   "embedding_model_sha256": "...",
   "diarize_mic": true,
-  "cluster_threshold": 1.0,
+  "cluster_threshold": 0.5,
   "num_speakers": null,
   "mic_num_speakers": null,
   "system_num_speakers": 4,

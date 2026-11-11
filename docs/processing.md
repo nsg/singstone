@@ -242,8 +242,10 @@ configured, correction regenerates it on demand.
 
 For every distinct `(source, cluster)` pair, recognition then:
 
-1. Uses that cluster's chunks of at least 1.5 seconds as query dots. With no
-   usable query dot, the cluster has no candidate.
+1. Uses that cluster's chunks of at least 1.5 seconds as query dots, leaving
+   out those that chunks of the source's other clusters cover for 200 ms or
+   more in total, since they hold a second voice, unless that leaves none.
+   With no usable query dot, the cluster has no candidate.
 2. Computes the normalized mean query dot and compares it with the cached
    centroid of every allowed person, retaining the five closest people (or all
    of them when fewer than five are available).

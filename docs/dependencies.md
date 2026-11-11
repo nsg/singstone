@@ -14,7 +14,8 @@ are reviewed when they are introduced.
 |---|---|---|---|---|
 | `pipewire` 0.10.1 + `libspa`, `-sys` | PipeWire capture | bindgen over system headers | links system libpipewire | Official freedesktop project (pipewire-rs). FFI wrappers, ~450 `unsafe` sites, expected for bindings. Pulls `cookie-factory` (dormant, tiny) and `nom` 8 for POD serialization. **Trusted, review recommended for the stream/buffer code path we use.** |
 | `whisper-rs` 0.16.0 + `-sys` 0.15.0 | whisper.cpp transcription | cmake build of vendored whisper.cpp; bindgen | whisper.cpp + ggml (C/C++) compiled at build time | Single-maintainer crate (tazz4843, Codeberg) but widely used; no downloads. The real attack surface is whisper.cpp/ggml parsing model files: treat models as untrusted input, hence `models.lock`. **Acceptable; the `-sys` build script deserves a read (cmake flags, feature gating).** |
-| `sherpa-onnx` 2.0.1 + `-sys` | diarization, speaker embeddings | selects supplied libraries; otherwise downloads and extracts a release archive | shared `libsherpa-onnx-c-api.so` and `libonnxruntime.so` | Official k2-fsa crates. Snapcraft builds sherpa-onnx 2.0.1 and ONNX Runtime 1.28.2 from exact upstream commits, then supplies that library directory to Cargo. `.cargo/config.toml` points direct developer builds at `target/native/lib`, preventing the crate's download fallback. Shared linking avoids combining ONNX Runtime and whisper.cpp objects built with different C++ toolchains. **Acceptable; native source pins are reviewed in `snap/snapcraft.yaml`, while model URLs and digests live in `docs/models.lock`.** |
+| `sherpa-onnx` 2.0.1 + `-sys` | speaker embeddings; brings in ONNX Runtime | selects supplied libraries; otherwise downloads and extracts a release archive | shared `libsherpa-onnx-c-api.so` and `libonnxruntime.so` | Official k2-fsa crates. Snapcraft builds sherpa-onnx 2.0.1 and ONNX Runtime 1.28.2 from exact upstream commits, then supplies that library directory to Cargo. `.cargo/config.toml` points direct developer builds at `target/native/lib`, preventing the crate's download fallback. Shared linking avoids combining ONNX Runtime and whisper.cpp objects built with different C++ toolchains. **Acceptable; native source pins are reviewed in `snap/snapcraft.yaml`, while model URLs and digests live in `docs/models.lock`.** |
+| `ort` =2.0.0-rc.14 + `ort-sys` (`load-dynamic` only) | runs the speaker-segmentation model for diarization | `ort-sys` build script returns at once because `load-dynamic` disables linking; no download features | none of its own; `dlopen`s the `libonnxruntime.so` that `libsherpa-onnx-c-api.so` already loaded, so one ONNX Runtime 1.28.2 serves both. The path comes from `/proc/self/maps`: the only mapped copy, or with several the one beside the sherpa-onnx library, otherwise the bare soname, which the loader resolves to sherpa-onnx's copy | pykeio's ONNX Runtime bindings, the most used Rust ONNX Runtime crate. Release candidate pinned exactly. Without `api-*` features it requires ONNX Runtime API 17 (1.17) or newer. FFI wrapper, ~800 `unsafe` sites, expected for bindings. Adds `ort-sys` and `libloading` 0.9 to the runtime closure; `ndarray` and `tracing` stay disabled. **Accepted with the user's approval; review the session, tensor, and loading code paths we use when upgrading.** |
 | `gtk4` 0.11.4 + `libadwaita` 0.9.2 | native desktop interface | `system-deps` probes installed GTK, GLib, Cairo, Pango, and Libadwaita libraries | links the GNOME platform libraries supplied by the Snap's GNOME extension | Official gtk-rs project under the GNOME organization. These crates are generated, widely deployed FFI bindings. Default features are disabled and the minimum APIs are pinned to GTK 4.10 / Libadwaita 1.5, matching core24. **Accepted for the user-approved native GUI; all recording and inference remain in the existing process and confinement boundary.** |
 | `clap` 4.6 (`derive`, `env`) | CLI | none (clap_derive proc macro) | none | clap-rs org, ubiquitous. Adds ~15 small crates (anstream/anstyle/…). Chosen over a hand-written parser on the user's request. |
 | `serde`, `serde_json` | JSON/JSONL | version-detection build scripts; `serde_derive` proc macro | none | dtolnay. `serde_json` now depends on `zmij` (float formatting, also dtolnay). Ubiquitous. |
@@ -76,11 +77,15 @@ built CPU binary.
    with multi-hundred-MB files. The model-backed `process`, `transcribe`,
    `diarize`, `recognize`, and `correct` commands refuse models not listed in
    `models.lock` unless `--allow-unverified-models` is passed.
-4. **`whisper-rs` bus factor.** One maintainer; watch for staleness. The
+4. **`ort` release candidate.** `ort` 2.0 has no stable release yet, so the
+   version is pinned exactly. With `load-dynamic`, a relative library name is
+   first looked up next to the executable; Singstone passes the absolute path
+   of the ONNX Runtime already mapped into the process instead.
+5. **`whisper-rs` bus factor.** One maintainer; watch for staleness. The
    crate is thin; a fork would be maintainable.
-5. **`cookie-factory` 0.3.3** (via `libspa`): last released 2022. Small and
+6. **`cookie-factory` 0.3.3** (via `libspa`): last released 2022. Small and
    pure; low risk, but it will show up in staleness scans.
-6. **Duplicate crate versions** (`nom` 7/8, `syn` 2/3, `shlex` 1/2) are
+7. **Duplicate crate versions** (`nom` 7/8, `syn` 2/3, `shlex` 1/2) are
    harmless build-versus-runtime splits.
 
 No Singstone recording, GUI, or inference code opens sockets. The GNOME stack

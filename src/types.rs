@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const SAMPLE_RATE: u32 = 16_000;
 pub const FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_SPEAKER_THRESHOLD: f32 = 0.72;
+/// Average cosine distance at which diarization stops merging voices.
+pub const DEFAULT_CLUSTER_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

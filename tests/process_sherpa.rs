@@ -4,11 +4,13 @@
 mod diarization;
 #[path = "../src/speaker/embedding.rs"]
 mod embedding;
+mod speaker {
+    pub(crate) use super::embedding;
+}
 #[path = "../src/types.rs"]
 mod types;
 
-use diarization::Diarizer;
-use diarization::sherpa::SherpaDiarizer;
+use diarization::{Clustering, Diarizer};
 use embedding::EmbeddingExtractor;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -34,7 +36,7 @@ struct SpeakerAssignment {
 }
 
 #[test]
-fn isolated_sherpa_diarization_and_embedding_calibration() {
+fn isolated_diarization_and_embedding_calibration() {
     let Some((models, samples)) = configured() else {
         eprintln!("skipped: SINGSTONE_TEST_MODELS and SINGSTONE_TEST_SAMPLES are required");
         return;
@@ -53,7 +55,7 @@ fn isolated_sherpa_diarization_and_embedding_calibration() {
         .map(|segment| segment.end_ms.saturating_sub(segment.start_ms))
         .sum::<u64>();
     eprintln!(
-        "isolated sherpa: {} segments, {} clusters, {:.1}% summed coverage in {:.1} s",
+        "isolated diarization: {} segments, {} clusters, {:.1}% summed coverage in {:.1} s",
         segments.len(),
         clusters.len(),
         coverage as f64 / 180_000.0 * 100.0,
@@ -172,7 +174,7 @@ fn isolated_full_diarization_when_requested() {
         .map(|segment| segment.cluster)
         .collect::<BTreeSet<_>>();
     eprintln!(
-        "isolated full sherpa: {:.1} s audio, {} segments, {} speakers in {:.1} s",
+        "isolated full diarization: {:.1} s audio, {} segments, {} speakers in {:.1} s",
         audio.len() as f64 / SAMPLE_RATE as f64,
         segments.len(),
         clusters.len(),
@@ -192,15 +194,19 @@ fn diarize(
     models: &Path,
     audio: &[f32],
 ) -> Result<Vec<SpeakerSegment>, Box<dyn std::error::Error>> {
-    let mut diarizer = SherpaDiarizer::new(
+    let mut diarizer = Diarizer::new(
         &models.join("sherpa-onnx-pyannote-segmentation-3-0/model.onnx"),
         &models.join("nemo_en_titanet_small.onnx"),
-        AudioSource::System,
         4,
-        0.5,
-        None,
     )?;
-    diarizer.diarize(audio)
+    diarizer.diarize(
+        audio,
+        AudioSource::System,
+        Clustering {
+            threshold: 0.5,
+            num_speakers: None,
+        },
+    )
 }
 
 fn learn_ground_truth_speakers(

@@ -704,9 +704,47 @@ correlated audio. If an audio track cannot be read, only the stricter
 long-sequence text fallback is available. No words are deleted, and the raw
 `words.jsonl` remains unchanged.
 
+From the same envelopes, `render` decides for every 10 ms which track carries
+the speech, its *lead*: the microphone where it is at least three times its
+noise floor and 8 dB louder than the echo predicted from the system audio, the
+system audio where it is active and the microphone is not, or both when both
+hold. The noise floor is the 10th percentile of microphone levels above
+-70 dBFS, and never lower, so stretches of digital silence do not count. The
+predicted echo is the system envelope, delayed, held over a room tail that
+decays by 30% per frame for 150 ms, and scaled by the leak gain: the 20th
+percentile of the microphone-to-prediction ratio over the system's active
+frames within 60 seconds. Local speech only raises that ratio, so its low end
+is the leak, and following it in time copes with volume changes. The delay
+comes from the nearest reference point within 180 seconds. Without any, one
+delay between -50 and 300 ms is estimated for the whole recording from the
+correlation of the log envelopes over the system's active frames, leaving
+out frames where the microphone is more than about 13 dB above the median
+ratio (someone in the room talking over the remote side); the earliest delay
+within 0.02 of the best correlation wins, since speech rhythm repeats the
+true peak a syllable later. The microphone hears the loudspeaker (an *echo
+path*) when there are reference points or that correlation reaches 0.3;
+without one, as with headphones, the leak gain is zero.
+
+Each utterance records the most common lead over its time as `"lead"`
+(`"mic"`, `"system"`, or `"both"` when double talk is at least as common as
+either); it is omitted when only one track was recorded. A system utterance
+is looked up one loudspeaker delay later, where its sound reaches the
+microphone.
+
+With an echo path, a final pass marks microphone words that the audio and
+text passes left when the system audio alone leads at least 70% of the
+word's led frames: in a call one side usually talks at a time, so microphone
+sound that is not clearly louder than the predicted echo of a talking remote
+side is that echo, even where distortion or room sound keeps the envelopes
+from correlating. A word with fewer than five led frames of its own is judged
+on a 200 ms stretch around it, and only when none of its own frames has the
+microphone leading. These detections carry `"evidence":"lead"`, the delay in
+`audio_delay_ms` and no similarity.
+
 Every detected run is written to `echo-detections.jsonl`, including the two
 spans, `words` count, evidence kind, and optional text similarity, audio
-similarity, and estimated delay. Audio-first detections omit text similarity.
+similarity, and estimated delay. Audio-first detections omit text similarity;
+lead detections omit both similarities.
 An empty file means no microphone words were detected as echo. Rendering also
 removes the obsolete `leakage-suppressions.jsonl` artifact when present.
 

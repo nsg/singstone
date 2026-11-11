@@ -286,6 +286,21 @@ pub struct Utterance {
     /// Shared by the turns cut from one line, see [`TurnGroup::id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Which track's sound the line's time was judged to come from, when
+    /// both tracks were recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<Lead>,
+}
+
+/// The track that carries the speech at a moment: the microphone (someone in
+/// the room), the system audio (someone remote, while the microphone at most
+/// picks up its echo), or both at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Lead {
+    Mic,
+    System,
+    Both,
 }
 
 fn is_false(value: &bool) -> bool {

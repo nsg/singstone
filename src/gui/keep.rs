@@ -234,6 +234,7 @@ mod tests {
             locked: false,
             echo,
             group: None,
+            lead: None,
         }
     }
 

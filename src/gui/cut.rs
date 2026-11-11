@@ -962,6 +962,7 @@ mod tests {
             locked: true,
             echo: false,
             group: group.map(str::to_owned),
+            lead: None,
         }
     }
 

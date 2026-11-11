@@ -30,7 +30,11 @@ Browse processed meetings and review speaker-attributed transcripts from the
 session view, below the player. Microphone lines sit to the left of a shared
 timeline and system audio lines to the right; speech that overlaps shares a
 row. Loudspeaker sound picked up by the microphone stays visible, dimmed and
-marked **Echo**, beside the remote line it repeats. Confirm individual names so
+marked **Echo**, beside the remote line it repeats. A bar on a line's
+timeline edge shows which side was heard at that time: lines from the side
+carrying the speech get a solid bar, a fainter bar on both sides means both
+were talking, and a dashed outline marks a line spoken while the other side
+was talking, such as an echo. Confirm individual names so
 they stay locked across reprocessing, use quick speaker shortcuts on anonymous
 lines, or change a named line.
 Use **Hide microphone** or **Hide system** to leave that source out of
@@ -176,7 +180,8 @@ calendar as well.
 - Recognizes learned voices while leaving uncertain matches anonymous.
 - Uses per-meeting attendee details to guide speaker counts and recognition.
 - Marks loudspeaker sound picked up by the microphone as echo by comparing the
-  two recordings, without deleting it.
+  two recordings, without deleting it, and shows which side was talking on
+  every line.
 - Hides either audio source from a session's transcript without deleting it,
   keeping your own lines or any lines you pick.
 - Marks where the meeting starts and ends in a longer recording, leaving the

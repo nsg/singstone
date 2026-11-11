@@ -1,5 +1,6 @@
 use crate::audio::archive;
-use crate::types::{AudioSource, SAMPLE_RATE, TimedWord};
+use crate::merge::lead;
+use crate::types::{AudioSource, Lead, SAMPLE_RATE, TimedWord};
 use serde::Serialize;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -32,6 +33,12 @@ const AUDIO_WORD_MIN_CONTEXT_MS: u64 = 1_500;
 const AUDIO_WORD_DELAY_SEARCH_FRAMES: i32 = 3;
 const AUDIO_WORD_MIN_CORRELATION: f32 = 0.75;
 const AUDIO_WORD_MAX_EXCESS_LN: f32 = 0.7;
+/// A microphone word is echo when the system audio leads this share of its
+/// frames that either side leads.
+const LEAD_ECHO_MIN_SHARE: f32 = 0.7;
+/// A word with fewer led frames of its own is judged on a 200 ms stretch
+/// around it, and only when none of its own frames has the microphone leading.
+const LEAD_MIN_WORD_FRAMES: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EchoDetection {
@@ -175,6 +182,9 @@ pub fn detect_leaked_mic_words(
         });
     }
 
+    if let Some(audio) = audio.filter(|audio| audio.lead.echo_path) {
+        detections.extend(detect_with_lead(words, audio, &mut echo));
+    }
     detections.sort_by_key(|detection| detection.mic_start_ms);
 
     DetectionResult { echo, detections }
@@ -254,6 +264,56 @@ fn detect_with_audio(
                 evidence: "audio",
             });
             run_start = run_end;
+        }
+    }
+    detections
+}
+
+/// Marks the microphone words the other passes left during which the system
+/// audio clearly carries the speech: in a call one side usually talks at a
+/// time, so microphone sound that is not clearly louder than the predicted
+/// echo of a talking remote side is that echo, even when distortion or room
+/// sound keeps the envelopes from correlating.
+fn detect_with_lead(
+    words: &[TimedWord],
+    audio: &AudioEnvelopes,
+    echo: &mut [bool],
+) -> Vec<EchoDetection> {
+    let mut detections = Vec::new();
+    for phrase in mic_phrases(words, echo) {
+        let marked = phrase
+            .iter()
+            .map(|&index| audio.system_leads_word(&words[index]))
+            .collect::<Vec<_>>();
+        for run in phrase
+            .iter()
+            .zip(&marked)
+            .collect::<Vec<_>>()
+            .chunk_by(|left, right| left.1 == right.1)
+            .filter(|run| *run[0].1)
+        {
+            let run = run.iter().map(|(index, _)| **index).collect::<Vec<_>>();
+            for &index in &run {
+                echo[index] = true;
+            }
+            let mic_start_ms = words[run[0]].start_ms;
+            let mic_end_ms = run
+                .iter()
+                .map(|&index| words[index].end_ms)
+                .max()
+                .unwrap_or(mic_start_ms);
+            let delay_ms = audio.lead_delay_ms(mic_start_ms);
+            detections.push(EchoDetection {
+                mic_start_ms,
+                mic_end_ms,
+                system_start_ms: shifted_to_system_time(mic_start_ms, delay_ms),
+                system_end_ms: shifted_to_system_time(mic_end_ms, delay_ms),
+                words: run.len(),
+                text_similarity: None,
+                audio_similarity: None,
+                audio_delay_ms: Some(delay_ms),
+                evidence: "lead",
+            });
         }
     }
     detections
@@ -406,6 +466,7 @@ pub struct AudioEnvelopes {
     system: Vec<f32>,
     activity_threshold: Option<f32>,
     reference_points: Vec<AudioReferencePoint>,
+    lead: lead::LeadTrack,
 }
 
 #[derive(Clone, Copy)]
@@ -458,12 +519,72 @@ impl AudioEnvelopes {
         let reference_points = activity_threshold
             .map(|threshold| calibrate_audio(&mic, &system, threshold))
             .unwrap_or_default();
+        let lead = activity_threshold
+            .map(|threshold| {
+                let calibrated = reference_points
+                    .iter()
+                    .map(|point| (point.center_frame, point.delay_frames))
+                    .collect();
+                lead::LeadTrack::new(&mic, &system, threshold, calibrated)
+            })
+            .unwrap_or_default();
         Self {
             mic,
             system,
             activity_threshold,
             reference_points,
+            lead,
         }
+    }
+
+    fn lead_frames_between(&self, start_ms: u64, end_ms: u64) -> &[Option<Lead>] {
+        let frame = |ms: u64| usize::try_from(ms).unwrap_or(usize::MAX);
+        let frames = &self.lead.frames;
+        let start = frame(start_ms / AUDIO_FRAME_MS).min(frames.len());
+        let end = frame(end_ms.div_ceil(AUDIO_FRAME_MS)).clamp(start, frames.len());
+        &frames[start..end]
+    }
+
+    /// Whether the system audio alone leads at least `LEAD_ECHO_MIN_SHARE` of
+    /// a microphone word's led frames.
+    fn system_leads_word(&self, word: &TimedWord) -> bool {
+        let counts = |frames: &[Option<Lead>]| {
+            let led = frames.iter().filter(|lead| lead.is_some()).count();
+            let system = frames
+                .iter()
+                .filter(|lead| **lead == Some(Lead::System))
+                .count();
+            (led, system)
+        };
+        let leads = |(led, system): (usize, usize)| {
+            led > 0 && system as f32 >= LEAD_ECHO_MIN_SHARE * led as f32
+        };
+        let own = counts(self.lead_frames_between(word.start_ms, word.end_ms));
+        if own.0 >= LEAD_MIN_WORD_FRAMES {
+            return leads(own);
+        }
+        let (start_ms, end_ms) = padded_interval(word, AUDIO_WORD_MIN_EVALUATED_MS);
+        own.0 == own.1 && leads(counts(self.lead_frames_between(start_ms, end_ms)))
+    }
+
+    /// Which track carries the speech during an utterance of `source`. The
+    /// lead is kept on the microphone's time line, where the system's sound
+    /// arrives one loudspeaker delay late.
+    pub fn lead_between(&self, source: AudioSource, start_ms: u64, end_ms: u64) -> Option<Lead> {
+        let shift = match source {
+            AudioSource::Mic => 0,
+            AudioSource::System => self.lead_delay_ms(start_ms),
+        };
+        lead::summarize(self.lead_frames_between(
+            start_ms.saturating_add_signed(shift),
+            end_ms.saturating_add_signed(shift),
+        ))
+    }
+
+    /// The loudspeaker delay the lead assumed near a time.
+    fn lead_delay_ms(&self, time_ms: u64) -> i64 {
+        let frame = usize::try_from(time_ms / AUDIO_FRAME_MS).unwrap_or(usize::MAX);
+        i64::from(self.lead.delay_at(frame)) * AUDIO_FRAME_MS as i64
     }
 
     fn similarity(&self, start_ms: u64, end_ms: u64) -> Option<(f32, i64)> {
@@ -1126,8 +1247,135 @@ mod tests {
         let (system, mic) = correlated_audio(4_000, 120);
         let audio = AudioEnvelopes::from_samples(&mic, &system);
         let result = detect_leaked_mic_words(&input, Some(&audio));
-        assert!(result.echo.iter().all(|echo| !echo));
-        assert!(result.detections.is_empty());
+        // The text match is rejected; the microphone carries nothing but the
+        // system's echo, so the lead pass marks the words instead.
+        assert_eq!(
+            result.echo,
+            [false, false, false, false, true, true, true, true]
+        );
+        assert!(!result.detections.is_empty());
+        assert!(
+            result
+                .detections
+                .iter()
+                .all(|detection| detection.evidence == "lead")
+        );
+    }
+
+    #[test]
+    fn with_headphones_a_soft_reply_over_remote_speech_stays() {
+        let system = synthetic_audio(6_000, |frame| {
+            if frame < 500 {
+                0.3 + ((frame * 13) % 7) as f32 / 30.0
+            } else {
+                0.0
+            }
+        });
+        let mut mic = synthetic_audio(6_000, |frame| 0.002 * (1 + frame % 3) as f32);
+        add_local_signal(&mut mic, 2_000, 2_400, 0.02);
+        let input = vec![word(AudioSource::Mic, 2_050, "mm")];
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+        assert!(!audio.lead.echo_path);
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+        assert_eq!(result.echo, [false]);
+    }
+
+    #[test]
+    fn a_short_loud_reply_inside_remote_speech_stays() {
+        let system = synthetic_audio(6_000, |frame| {
+            if frame < 500 {
+                0.3 + ((frame * 13) % 7) as f32 / 30.0
+            } else {
+                0.0
+            }
+        });
+        let mut mic = distorted_echo(6_000, 500, 0.3, 0.2);
+        add_local_signal(&mut mic, 2_400, 2_460, 1.0);
+        let reply = TimedWord {
+            source: AudioSource::Mic,
+            start_ms: 2_410,
+            end_ms: 2_450,
+            text: "ja".into(),
+        };
+        let mut input = words(&["one", "two"], AudioSource::Mic, 1_000);
+        input.push(reply);
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+        assert_eq!(result.echo, [true, true, false]);
+    }
+
+    #[test]
+    fn a_system_line_is_judged_where_its_sound_reaches_the_microphone() {
+        // Remote speech 1.0-2.0 s reaches the microphone 250 ms later while
+        // someone in the room talks 0.5-1.2 s.
+        let system = synthetic_audio(4_000, |frame| {
+            if (100..200).contains(&frame) {
+                0.3 + ((frame * 13) % 7) as f32 / 30.0
+            } else {
+                0.0
+            }
+        });
+        let mut mic = vec![0.0; system.len()];
+        let delay = 250 * SAMPLE_RATE as usize / 1_000;
+        for (index, sample) in system.iter().enumerate() {
+            if index + delay < mic.len() {
+                mic[index + delay] = sample * 0.1;
+            }
+        }
+        add_local_signal(&mut mic, 500, 1_200, 0.5);
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+        assert_eq!(audio.lead.delay_at(100), 25);
+        assert_eq!(
+            audio.lead_between(AudioSource::System, 1_000, 1_150),
+            Some(Lead::System)
+        );
+        assert_eq!(
+            audio.lead_between(AudioSource::Mic, 1_000, 1_150),
+            Some(Lead::Mic)
+        );
+    }
+
+    #[test]
+    fn uncorrelated_echo_follows_the_talking_system_but_a_reply_stays() {
+        // The remote side talks for 6 s; the microphone hears it through a
+        // distorting loudspeaker, so the envelopes correlate too weakly for
+        // calibration, and the local speaker replies loudly at 2.5 s, then
+        // alone at 7 s.
+        let system = synthetic_audio(9_000, |frame| {
+            if frame < 600 {
+                0.2 + ((frame * 13) % 7) as f32 / 30.0
+            } else {
+                0.0
+            }
+        });
+        let mut mic = distorted_echo(9_000, 600, 0.2, 0.15);
+        add_local_signal(&mut mic, 2_500, 2_900, 1.0);
+        add_local_signal(&mut mic, 7_000, 7_800, 0.3);
+        let mut input = words(&["one", "two", "three"], AudioSource::Mic, 600);
+        input.push(word(AudioSource::Mic, 2_550, "yes"));
+        input.extend(words(&["four", "five"], AudioSource::Mic, 3_800));
+        input.push(word(AudioSource::Mic, 7_200, "right"));
+        let audio = AudioEnvelopes::from_samples(&mic, &system);
+        let result = detect_leaked_mic_words(&input, Some(&audio));
+        assert_eq!(
+            result.echo,
+            [true, true, true, false, true, true, false],
+            "echo of the remote side, the reply and the lone remark stay"
+        );
+        assert!(
+            result
+                .detections
+                .iter()
+                .all(|detection| detection.evidence == "lead")
+        );
+        assert_eq!(
+            audio.lead_between(AudioSource::Mic, 7_000, 7_800),
+            Some(Lead::Mic)
+        );
+        assert_eq!(
+            audio.lead_between(AudioSource::Mic, 4_000, 5_000),
+            Some(Lead::System)
+        );
     }
 
     #[test]
@@ -1341,6 +1589,21 @@ mod tests {
         for (index, sample) in audio[start.min(end)..end].iter_mut().enumerate() {
             *sample += (index as f32 * 0.113).sin() * amplitude;
         }
+    }
+
+    /// The echo of `synthetic_audio` remote speech `base + ((frame * 13) % 7)
+    /// / 30` lasting `frames`, 50 ms late at `gain`, with level jitter from a
+    /// distorting loudspeaker.
+    fn distorted_echo(duration_ms: usize, frames: usize, base: f32, gain: f32) -> Vec<f32> {
+        synthetic_audio(duration_ms, |frame| {
+            if (5..frames + 5).contains(&frame) {
+                let source = frame - 5;
+                let level = base + ((source * 13) % 7) as f32 / 30.0;
+                level * gain * (1.0 + ((frame * 31) % 11) as f32 / 22.0)
+            } else {
+                0.0
+            }
+        })
     }
 
     fn synthetic_audio(duration_ms: usize, amplitude: impl Fn(usize) -> f32) -> Vec<f32> {

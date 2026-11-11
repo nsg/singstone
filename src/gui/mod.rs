@@ -10,6 +10,7 @@ mod queue;
 mod remote;
 mod timeline_layout;
 mod voice_map;
+mod weeks;
 mod wrap_layout;
 
 use crate::audio::{archive, devices, record};
@@ -82,6 +83,9 @@ const CSS: &str = r#"
 .live-bar { background: alpha(#e01b24, 0.10); padding: 7px 12px; }
 .pill-button { border-radius: 999px; padding: 8px 26px; font-weight: 600; }
 .navigation-sidebar row { border-radius: 10px; margin: 2px 6px; }
+.week-header { padding: 6px 14px 2px; }
+.week-header-follows { margin-top: 10px; }
+.week-header-title { font-size: 12px; font-weight: bold; }
 .shot-card { padding: 8px; border-radius: 12px; background: alpha(currentColor, 0.05); }
 .mono-button { font-family: monospace; font-size: 12px; }
 .timeline-pane-headers { padding: 2px 6px 6px; }
@@ -182,6 +186,7 @@ button.add-speaker:hover { background: alpha(@accent_color, 0.08); }
 #[derive(Clone)]
 struct SessionSummary {
     path: PathBuf,
+    archived: bool,
     title: String,
     started: String,
     duration_ms: u64,
@@ -812,13 +817,11 @@ fn build_window(app: &adw::Application) {
     session_list.set_selection_mode(gtk::SelectionMode::Single);
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Filter sessions…")
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(10)
-        .margin_end(10)
+        .hexpand(true)
         .build();
+    let show_archived = archived_toggle();
     let queue_panel = QueuePanel::new();
-    let sidebar = build_sidebar(&search, &session_list, &queue_panel);
+    let sidebar = build_sidebar(&search, &show_archived, &session_list, &queue_panel);
 
     let tidy_notice = tidy_notice();
     let toasts = adw::ToastOverlay::new();
@@ -894,6 +897,7 @@ fn build_window(app: &adw::Application) {
         &detail,
         &stack,
         &session_list,
+        &search,
         &session_paths,
         &processing_queue,
         &banner,
@@ -903,6 +907,7 @@ fn build_window(app: &adw::Application) {
         &window,
         &config,
         &search,
+        &show_archived,
         &session_list,
         &session_paths,
         &detail,
@@ -1126,6 +1131,7 @@ fn install_css() {
 
 fn build_sidebar(
     search: &gtk::SearchEntry,
+    show_archived: &gtk::ToggleButton,
     list: &gtk::ListBox,
     queue_panel: &QueuePanel,
 ) -> gtk::Box {
@@ -1135,7 +1141,14 @@ fn build_sidebar(
     title.set_margin_top(16);
     title.set_margin_bottom(8);
     root.append(&title);
-    root.append(search);
+    let filters = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    filters.set_margin_top(8);
+    filters.set_margin_bottom(8);
+    filters.set_margin_start(10);
+    filters.set_margin_end(10);
+    filters.append(search);
+    filters.append(show_archived);
+    root.append(&filters);
     let scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(list)
@@ -2077,7 +2090,7 @@ fn wire_settings(
             *config.borrow_mut() = updated;
             row.set_subtitle(&path.display().to_string());
             hint.set_label(&format!("Creates a new session in {}", path.display()));
-            populate_sessions(&sessions, &paths, &path, &search.text(), &queue);
+            populate_sessions(&sessions, &paths, &config.borrow(), &search.text(), &queue);
             if let Some(first) = sessions.row_at_index(0) {
                 sessions.select_row(Some(&first));
             }
@@ -2255,6 +2268,7 @@ fn wire_archive_cleanup(
     detail: &SessionDetail,
     stack: &adw::ViewStack,
     list: &gtk::ListBox,
+    search: &gtk::SearchEntry,
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     queue: &Rc<RefCell<ProcessingQueue>>,
     banner: &adw::Banner,
@@ -2264,11 +2278,14 @@ fn wire_archive_cleanup(
         let detail = detail.clone();
         let stack = stack.clone();
         let list = list.clone();
+        let search = search.clone();
         let paths = paths.clone();
         let queue = queue.clone();
         let banner = banner.clone();
         Rc::new(move || {
-            delete_expired_archives(&config, &detail, &stack, &list, &paths, &queue, &banner)
+            delete_expired_archives(
+                &config, &detail, &stack, &list, &search, &paths, &queue, &banner,
+            )
         })
     };
     cleanup();
@@ -2332,11 +2349,13 @@ fn wire_archive_cleanup(
 /// Deletes the folders of sessions archived longer ago than the configured
 /// retention. Waits for a later pass while sessions are processing or other
 /// work is running, and leaves alone the session on screen.
+#[allow(clippy::too_many_arguments)]
 fn delete_expired_archives(
     config: &Rc<RefCell<GuiConfig>>,
     detail: &SessionDetail,
     stack: &adw::ViewStack,
     list: &gtk::ListBox,
+    search: &gtk::SearchEntry,
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     queue: &Rc<RefCell<ProcessingQueue>>,
     banner: &adw::Banner,
@@ -2388,8 +2407,14 @@ fn delete_expired_archives(
             }
         }
     }
-    if deleted > 0 && paths.borrow().is_empty() && list.first_child().is_none() {
-        append_no_sessions(list);
+    if deleted > 0 {
+        refresh_list_notes(
+            list,
+            paths,
+            &config.borrow(),
+            &search.text(),
+            &queue.borrow(),
+        );
     }
     let sessions = |count| if count == 1 { "session" } else { "sessions" };
     let message = match (deleted, failed) {
@@ -2428,18 +2453,73 @@ fn remove_session_row(list: &gtk::ListBox, paths: &Rc<RefCell<Vec<PathBuf>>>, pa
     }
 }
 
+fn archived_toggle() -> gtk::ToggleButton {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    content.append(&gtk::Image::from_icon_name("package-x-generic-symbolic"));
+    content.append(&gtk::Label::new(Some("Archived")));
+    let toggle = gtk::ToggleButton::builder()
+        .child(&content)
+        .tooltip_text("Show archived sessions")
+        .build();
+    toggle.update_property(&[gtk::accessible::Property::Label("Show archived sessions")]);
+    toggle
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wire_session_browser(
     window: &adw::ApplicationWindow,
     config: &Rc<RefCell<GuiConfig>>,
     search: &gtk::SearchEntry,
+    show_archived: &gtk::ToggleButton,
     list: &gtk::ListBox,
     paths: &Rc<RefCell<Vec<PathBuf>>>,
     detail: &SessionDetail,
     stack: &adw::ViewStack,
     queue: &Rc<RefCell<ProcessingQueue>>,
 ) {
-    populate_sessions(list, paths, &config.borrow().meetings_dir, "", queue);
+    list.set_header_func(set_week_header);
+    // "This week" becomes "Last week" at midnight on Sunday, app open or not.
+    let today = Cell::new(local_today());
+    let list_for_clock = list.clone();
+    glib::timeout_add_seconds_local(60, move || {
+        let now = local_today();
+        if today.replace(now) != now {
+            list_for_clock.invalidate_headers();
+        }
+        glib::ControlFlow::Continue
+    });
+    show_archived.set_active(config.borrow().show_archived);
+    populate_sessions(list, paths, &config.borrow(), "", queue);
+    let list_for_toggle = list.clone();
+    let paths_for_toggle = paths.clone();
+    let config_for_toggle = config.clone();
+    let queue_for_toggle = queue.clone();
+    let search_for_toggle = search.clone();
+    let selected_for_toggle = detail.selected.clone();
+    show_archived.connect_toggled(move |toggle| {
+        config_for_toggle.borrow_mut().show_archived = toggle.is_active();
+        toggle.set_tooltip_text(Some(if toggle.is_active() {
+            "Hide archived sessions"
+        } else {
+            "Show archived sessions"
+        }));
+        populate_sessions(
+            &list_for_toggle,
+            &paths_for_toggle,
+            &config_for_toggle.borrow(),
+            &search_for_toggle.text(),
+            &queue_for_toggle,
+        );
+        let selected = selected_for_toggle.borrow().clone();
+        if let Some(index) = selected.and_then(|selected| {
+            paths_for_toggle
+                .borrow()
+                .iter()
+                .position(|path| *path == selected)
+        }) {
+            select_session_row(&list_for_toggle, index);
+        }
+    });
     let list_for_search = list.clone();
     let paths_for_search = paths.clone();
     let config_for_search = config.clone();
@@ -2448,7 +2528,7 @@ fn wire_session_browser(
         populate_sessions(
             &list_for_search,
             &paths_for_search,
-            &config_for_search.borrow().meetings_dir,
+            &config_for_search.borrow(),
             &entry.text(),
             &queue_for_search,
         );
@@ -2620,13 +2700,7 @@ fn wire_session_actions(
                 );
                 return;
             }
-            populate_sessions(
-                &list,
-                &paths,
-                &config.borrow().meetings_dir,
-                &search.text(),
-                &queue,
-            );
+            populate_sessions(&list, &paths, &config.borrow(), &search.text(), &queue);
             let index = paths.borrow().iter().position(|path| *path == session_path);
             match index {
                 Some(index) => select_session_row(&list, index),
@@ -2696,7 +2770,7 @@ fn wire_session_actions(
             populate_sessions(
                 &list,
                 &paths,
-                &config.borrow().meetings_dir,
+                &config.borrow(),
                 &search.text(),
                 &queue,
             );
@@ -2945,7 +3019,7 @@ fn wire_recording(
         populate_sessions(
             &list_for_poll,
             &paths_for_poll,
-            &config_for_poll.borrow().meetings_dir,
+            &config_for_poll.borrow(),
             &search_for_poll.text(),
             &queue_for_poll,
         );
@@ -4399,7 +4473,7 @@ fn wire_meeting_details(controller: &Rc<QueueController>, search: &gtk::SearchEn
                         populate_sessions(
                             &controller.list,
                             &controller.paths,
-                            &controller.config.borrow().meetings_dir,
+                            &controller.config.borrow(),
                             &search.text(),
                             &controller.queue,
                         );
@@ -4518,7 +4592,7 @@ fn wire_archiving(
                 populate_sessions(
                     &list,
                     &paths,
-                    &config.borrow().meetings_dir,
+                    &config.borrow(),
                     &search.text(),
                     &queue,
                 );
@@ -4620,13 +4694,7 @@ fn wire_splitting(
                 };
                 busy.set(false);
                 progress.close();
-                populate_sessions(
-                    &list,
-                    &paths,
-                    &config.borrow().meetings_dir,
-                    &search.text(),
-                    &queue,
-                );
+                populate_sessions(&list, &paths, &config.borrow(), &search.text(), &queue);
                 let show = match &result {
                     Ok(outcome) => outcome.parts[1].clone(),
                     Err(_) => session_path.clone(),
@@ -4750,13 +4818,7 @@ fn wire_merging(
             };
             busy.set(false);
             progress.close();
-            populate_sessions(
-                &list,
-                &paths,
-                &config.borrow().meetings_dir,
-                &search.text(),
-                &queue,
-            );
+            populate_sessions(&list, &paths, &config.borrow(), &search.text(), &queue);
             let show = match &result {
                 Ok(outcome) => outcome.session.clone(),
                 Err(_) => shown.clone(),
@@ -5964,32 +6026,128 @@ impl SessionDetail {
 fn populate_sessions(
     list: &gtk::ListBox,
     paths: &Rc<RefCell<Vec<PathBuf>>>,
-    root: &Path,
+    config: &GuiConfig,
     filter: &str,
     queue: &Rc<RefCell<ProcessingQueue>>,
 ) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
-    let needle = filter.to_lowercase();
-    let summaries = load_sessions(root, &queue.borrow())
-        .into_iter()
-        .filter(|item| item.title.to_lowercase().contains(&needle))
-        .collect::<Vec<_>>();
+    let (summaries, hidden) = listed_sessions(config, filter, &queue.borrow());
     *paths.borrow_mut() = summaries.iter().map(|item| item.path.clone()).collect();
     for summary in summaries {
         list.append(&session_row(&summary));
     }
-    if paths.borrow().is_empty() {
-        append_no_sessions(list);
+    append_list_notes(list, paths.borrow().is_empty(), hidden);
+}
+
+/// The sessions the sidebar lists, newest first, and how many archived ones
+/// it leaves out.
+fn listed_sessions(
+    config: &GuiConfig,
+    filter: &str,
+    queue: &ProcessingQueue,
+) -> (Vec<SessionSummary>, usize) {
+    let needle = filter.to_lowercase();
+    let (listed, hidden): (Vec<_>, Vec<_>) = load_sessions(&config.meetings_dir, queue)
+        .into_iter()
+        .filter(|item| item.title.to_lowercase().contains(&needle))
+        .partition(|item| config.show_archived || !item.archived);
+    (listed, hidden.len())
+}
+
+/// Rebuilds the notes below the session rows after rows were removed.
+fn refresh_list_notes(
+    list: &gtk::ListBox,
+    paths: &Rc<RefCell<Vec<PathBuf>>>,
+    config: &GuiConfig,
+    filter: &str,
+    queue: &ProcessingQueue,
+) {
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.has_css_class("session-list-note") {
+            list.remove(&widget);
+        }
+    }
+    let (_, hidden) = listed_sessions(config, filter, queue);
+    append_list_notes(list, paths.borrow().is_empty(), hidden);
+}
+
+fn append_list_notes(list: &gtk::ListBox, empty: bool, archived_hidden: usize) {
+    let note = |text: &str, margin_top: i32| {
+        let label = gtk::Label::new(Some(text));
+        label.add_css_class("dim-label");
+        label.set_margin_top(margin_top);
+        label.set_margin_bottom(12);
+        let row = gtk::ListBoxRow::builder()
+            .child(&label)
+            .selectable(false)
+            .activatable(false)
+            .build();
+        row.add_css_class("session-list-note");
+        list.append(&row);
+        label
+    };
+    if empty {
+        note(
+            if archived_hidden > 0 {
+                "No sessions to show"
+            } else {
+                "No sessions yet"
+            },
+            24,
+        );
+    }
+    if archived_hidden > 0 {
+        let text = if archived_hidden == 1 {
+            "1 archived session hidden".to_owned()
+        } else {
+            format!("{archived_hidden} archived sessions hidden")
+        };
+        note(&text, 12).add_css_class("caption");
     }
 }
 
-fn append_no_sessions(list: &gtk::ListBox) {
-    let empty = gtk::Label::new(Some("No sessions yet"));
-    empty.set_margin_top(24);
-    empty.add_css_class("dim-label");
-    list.append(&empty);
+/// Days since 1970-01-01 of today's local date.
+fn local_today() -> i64 {
+    let now = glib::DateTime::now_local().expect("local time");
+    weeks::civil_day(now.year(), now.month() as u32, now.day_of_month() as u32)
+}
+
+/// Opens each week's group with its name and a line; the row's widget name
+/// holds the date it was recorded.
+fn set_week_header(row: &gtk::ListBoxRow, before: Option<&gtk::ListBoxRow>) {
+    let week_of = |row: &gtk::ListBoxRow| weeks::local_day(&row.widget_name()).map(weeks::week_of);
+    let Some(week) = week_of(row) else {
+        row.set_header(None::<&gtk::Widget>);
+        return;
+    };
+    if before.and_then(week_of) == Some(week) {
+        row.set_header(None::<&gtk::Widget>);
+        return;
+    }
+    let (title, dates) = weeks::heading(week, local_today());
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.add_css_class("week-header");
+    if before.is_some() {
+        header.add_css_class("week-header-follows");
+    }
+    let name = gtk::Label::new(Some(&title));
+    name.add_css_class("week-header-title");
+    header.append(&name);
+    if let Some(dates) = dates {
+        let dates = gtk::Label::new(Some(&dates));
+        dates.add_css_class("dim-label");
+        dates.add_css_class("caption");
+        header.append(&dates);
+    }
+    let line = gtk::Separator::new(gtk::Orientation::Horizontal);
+    line.set_hexpand(true);
+    line.set_valign(gtk::Align::Center);
+    header.append(&line);
+    row.set_header(Some(&header));
 }
 
 fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {
@@ -6002,6 +6160,7 @@ fn load_sessions(root: &Path, queue: &ProcessingQueue) -> Vec<SessionSummary> {
             let manifest = session.read_manifest().ok();
             let (status, status_class) = session_path_status(&entry.path(), queue);
             Some(SessionSummary {
+                archived: session.is_archived(),
                 title: session.title(),
                 started: manifest
                     .as_ref()
@@ -6129,6 +6288,7 @@ fn session_path_status(path: &Path, queue: &ProcessingQueue) -> (&'static str, &
 
 fn session_row(summary: &SessionSummary) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
+    row.set_widget_name(summary.started.get(..10).unwrap_or_default());
     let body = gtk::Box::new(gtk::Orientation::Vertical, 4);
     body.set_margin_top(10);
     body.set_margin_bottom(10);

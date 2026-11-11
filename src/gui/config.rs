@@ -22,6 +22,9 @@ pub struct GuiConfig {
     pub dark_mode: Option<bool>,
     pub delete_old_archives: bool,
     pub archive_retention_days: u32,
+    /// Whether the sidebar lists archived sessions; every launch hides them.
+    #[serde(skip)]
+    pub show_archived: bool,
 }
 
 impl Default for GuiConfig {
@@ -48,6 +51,7 @@ impl Default for GuiConfig {
             dark_mode: None,
             delete_old_archives: false,
             archive_retention_days: 90,
+            show_archived: false,
         }
     }
 }

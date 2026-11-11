@@ -153,6 +153,12 @@ it **Done** in the session list. The label only marks the session as finished
 for your own overview: **Unmark done** reverts it, reprocessing clears it, and
 a session can be archived with or without it.
 
+The session list groups sessions by the week they were recorded in, Monday
+first: **This week**, **Last week**, **2 weeks ago** and so on, each with its
+dates, and older weeks by their dates alone. Archived sessions are hidden; a
+line at the bottom of the list counts them, and the **Archived** toggle next to
+the filter shows them until the app is closed.
+
 ## Features
 
 - Records a microphone, a PipeWire sink monitor, or both as aligned 16 kHz audio.
@@ -491,6 +497,7 @@ stays far below microphone noise. The raw files are deleted only after every
 track's FLAC copy has been written to disk and decoded back to the same
 samples; if any track fails, all raw files stay as they were. Archived
 sessions show an **Archived** label and still play, render and reprocess.
+The session list hides them unless the **Archived** toggle is on.
 Unprocessed sessions are only archived as the backup of a
 [split](#split-a-recording) or a [merge](#merge-recordings).
 

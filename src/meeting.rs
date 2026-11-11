@@ -133,18 +133,54 @@ pub fn set_title(path: &Path, title: &str) -> io::Result<()> {
     write_details_atomic(path, &details)
 }
 
-/// `source` is either one meeting-context JSON file or a folder of them.
-pub fn match_context_with_source(
-    source: &Path,
-    started_wallclock: &str,
-) -> Option<(MeetingContext, PathBuf)> {
-    let session_start = match parse_rfc3339(started_wallclock) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("warning: cannot match meeting context: session start is invalid: {error}");
-            return None;
+/// How long before a calendar meeting a recording may start and still be for it.
+const EARLY_START_SECONDS: i64 = 15 * 60;
+/// How long after a meeting's planned end a recording may start, for overruns.
+const LATE_START_SECONDS: i64 = 10 * 60;
+
+/// A calendar meeting that may be the one a recording is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeetingCandidate {
+    pub context: MeetingContext,
+    /// RFC 3339 start and end as written in the file; `end` falls back to an
+    /// hour after the start.
+    pub start: String,
+    pub end: Option<String>,
+    /// How many seconds of the recording fall inside the meeting.
+    pub overlap_seconds: u64,
+    pub source: PathBuf,
+}
+
+/// Every calendar meeting a recording may be for, best match first.
+///
+/// `stretches` are the parts recorded in one go, as an RFC 3339 start and a
+/// length; a merged recording has several. A meeting is a candidate when a
+/// stretch starts from a quarter of an hour before it until ten minutes after
+/// its end, or runs into it. The meeting that shares the largest part of its
+/// and the recording's combined time ranks first, so a recording started
+/// early or halfway through still picks the right one; without a known
+/// length, the closest start does. `source` is either one meeting-context
+/// JSON file or a folder of them.
+pub fn match_candidates(source: &Path, stretches: &[(&str, u64)]) -> Vec<MeetingCandidate> {
+    let mut recorded = Vec::new();
+    for (started, length_ms) in stretches {
+        match parse_rfc3339(started) {
+            Ok(start) => recorded.push((
+                start,
+                start.saturating_add(i64::try_from(length_ms / 1000).unwrap_or(i64::MAX)),
+            )),
+            Err(error) => {
+                eprintln!(
+                    "warning: cannot match meeting context: session start is invalid: {error}"
+                );
+                return Vec::new();
+            }
         }
-    };
+    }
+    if recorded.is_empty() {
+        return Vec::new();
+    }
+    let recorded_seconds: i64 = recorded.iter().map(|(start, end)| end - start).sum();
     let mut files = if source.is_file() {
         vec![source.to_path_buf()]
     } else {
@@ -164,48 +200,86 @@ pub fn match_context_with_source(
                     "warning: cannot read meeting context {}: {error}",
                     source.display()
                 );
-                return None;
+                return Vec::new();
             }
         }
     };
     files.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
 
-    let mut best: Option<(u64, MeetingContext, PathBuf)> = None;
+    let mut ranked: Vec<(Fit, MeetingCandidate)> = Vec::new();
     for path in files {
-        let entries = match read_context_file(&path) {
-            Some(entries) => entries,
-            None => continue,
+        let Some(entries) = read_context_file(&path) else {
+            continue;
         };
         for entry in entries.meetings {
-            let start = match parse_context_entry(&path, &entry) {
-                Some(start) => start,
-                None => continue,
+            let Some(start) = parse_context_entry(&path, &entry) else {
+                continue;
             };
             let end = entry
                 .end
                 .as_deref()
                 .and_then(|value| parse_rfc3339(value).ok())
                 .unwrap_or_else(|| start.saturating_add(60 * 60));
-            if session_start < start.saturating_sub(15 * 60) || session_start > end {
+            let starts_near = recorded.iter().any(|(stretch_start, _)| {
+                *stretch_start >= start.saturating_sub(EARLY_START_SECONDS)
+                    && *stretch_start <= end.saturating_add(LATE_START_SECONDS)
+            });
+            let overlap: i64 = recorded
+                .iter()
+                .map(|(stretch_start, stretch_end)| {
+                    (end.min(*stretch_end) - start.max(*stretch_start)).max(0)
+                })
+                .sum();
+            if !starts_near && overlap == 0 {
                 continue;
             }
-            let distance = session_start.abs_diff(start);
-            if best
-                .as_ref()
-                .is_none_or(|(best_distance, _, _)| distance < *best_distance)
-            {
-                best = Some((
-                    distance,
-                    MeetingContext {
-                        title: entry.title.trim().to_owned(),
+            let title = entry.title.trim().to_owned();
+            if ranked.iter().any(|(_, candidate)| {
+                candidate.context.title == title && candidate.start == entry.start
+            }) {
+                continue;
+            }
+            ranked.push((
+                Fit {
+                    overlap,
+                    union: recorded_seconds + (end - start) - overlap,
+                    distance: recorded
+                        .iter()
+                        .map(|(stretch_start, _)| stretch_start.abs_diff(start))
+                        .min()
+                        .unwrap_or(u64::MAX),
+                },
+                MeetingCandidate {
+                    context: MeetingContext {
+                        title,
                         attendees: normalize_names(entry.attendees),
                     },
-                    path.clone(),
-                ));
-            }
+                    start: entry.start,
+                    end: entry.end,
+                    overlap_seconds: overlap.unsigned_abs(),
+                    source: path.clone(),
+                },
+            ));
         }
     }
-    best.map(|(_, details, path)| (details, path))
+    ranked.sort_by(|(left, _), (right, _)| left.rank(right));
+    ranked.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
+struct Fit {
+    overlap: i64,
+    union: i64,
+    distance: u64,
+}
+
+impl Fit {
+    /// Larger shared fraction of the combined time first, then closer start.
+    fn rank(&self, other: &Self) -> std::cmp::Ordering {
+        let share = |fit: &Fit, by: &Fit| i128::from(fit.overlap) * i128::from(by.union.max(1));
+        share(other, self)
+            .cmp(&share(self, other))
+            .then(self.distance.cmp(&other.distance))
+    }
 }
 
 fn read_context_file(path: &Path) -> Option<MeetingContextFile> {
@@ -400,7 +474,7 @@ fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+pub(crate) fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let year = i64::from(year) - i64::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let year_of_era = year - era * 400;
@@ -461,7 +535,17 @@ mod tests {
     }
 
     fn match_context(source: &Path, started_wallclock: &str) -> Option<MeetingContext> {
-        match_context_with_source(source, started_wallclock).map(|(details, _)| details)
+        match_candidates(source, &[(started_wallclock, 0)])
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.context)
+    }
+
+    fn titles(source: &Path, started_wallclock: &str, duration_minutes: u64) -> Vec<String> {
+        match_candidates(source, &[(started_wallclock, duration_minutes * 60_000)])
+            .into_iter()
+            .map(|candidate| candidate.context.title)
+            .collect()
     }
 
     #[test]
@@ -478,10 +562,10 @@ mod tests {
             serde_json::json!([{"title":"Chosen","start":"2026-09-25T10:00:00Z"}]),
         );
         let file = dir.join("chosen.json");
-        let (details, source) =
-            match_context_with_source(&file, "2026-09-25T10:00:00Z").expect("match");
-        assert_eq!(details.title, "Chosen");
-        assert_eq!(source, file);
+        let candidates = match_candidates(&file, &[("2026-09-25T10:00:00Z", 0)]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].context.title, "Chosen");
+        assert_eq!(candidates[0].source, file);
         assert!(match_context(&dir.join("missing.json"), "2026-09-25T10:00:00Z").is_none());
         fs::remove_dir_all(dir).expect("remove fixture");
     }
@@ -498,10 +582,8 @@ mod tests {
             ]),
         );
         assert_eq!(
-            match_context(&dir, "2026-09-25T10:00:00Z")
-                .expect("match")
-                .title,
-            "Closest"
+            titles(&dir, "2026-09-25T10:00:00Z", 0),
+            ["Closest", "Earlier"]
         );
         assert!(match_context(&dir, "2026-09-25T09:14:59Z").is_none());
         fs::remove_dir_all(dir).expect("remove fixture");
@@ -520,10 +602,96 @@ mod tests {
                  "attendees":[" Me ","Me","","Anna"]}
             ]),
         );
-        let matched = match_context(&dir, "2026-09-25T11:00:00Z").expect("boundary match");
+        let matched = match_context(&dir, "2026-09-25T11:10:00Z").expect("overrun match");
         assert_eq!(matched.title, "Default end");
         assert_eq!(matched.attendees, ["Me", "Anna"]);
-        assert!(match_context(&dir, "2026-09-25T11:00:01Z").is_none());
+        assert!(match_context(&dir, "2026-09-25T11:10:01Z").is_none());
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
+    fn overlapping_meetings_are_all_offered_best_fit_first() {
+        let dir = test_dir("overlap");
+        write_context(
+            &dir,
+            "a.json",
+            serde_json::json!([
+                {"title":"Planning","start":"2026-09-25T10:00:00Z","end":"2026-09-25T11:00:00Z"},
+                {"title":"All-day offsite","start":"2026-09-25T08:00:00Z","end":"2026-09-25T17:00:00Z"},
+                {"title":"Later","start":"2026-09-25T13:00:00Z","end":"2026-09-25T14:00:00Z"}
+            ]),
+        );
+        write_context(
+            &dir,
+            "b.json",
+            serde_json::json!([
+                {"title":"Planning","start":"2026-09-25T10:00:00Z","end":"2026-09-25T11:00:00Z"},
+                {"title":"1:1 Anna","start":"2026-09-25T10:30:00Z","end":"2026-09-25T11:00:00Z"}
+            ]),
+        );
+        // On time: the meeting it fills wins over the all-day block.
+        assert_eq!(
+            titles(&dir, "2026-09-25T10:01:00Z", 58),
+            ["Planning", "1:1 Anna", "All-day offsite"]
+        );
+        let planning = &match_candidates(&dir, &[("2026-09-25T10:01:00Z", 58 * 60_000)])[0];
+        assert_eq!(planning.overlap_seconds, 58 * 60);
+        assert_eq!(planning.source, dir.join("a.json"));
+        // Started halfway through Planning, recording only the 1:1.
+        assert_eq!(titles(&dir, "2026-09-25T10:30:00Z", 30)[0], "1:1 Anna");
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
+    fn early_and_back_to_back_recordings_still_find_their_meeting() {
+        let dir = test_dir("fuzzy");
+        write_context(
+            &dir,
+            "context.json",
+            serde_json::json!([
+                {"title":"First","start":"2026-09-25T10:00:00Z","end":"2026-09-25T11:00:00Z"},
+                {"title":"Second","start":"2026-09-25T11:00:00Z","end":"2026-09-25T12:00:00Z"}
+            ]),
+        );
+        // Started 40 minutes early and ran into the meeting.
+        assert_eq!(titles(&dir, "2026-09-25T09:20:00Z", 70), ["First"]);
+        // Started late in the first meeting, mostly the second one.
+        assert_eq!(
+            titles(&dir, "2026-09-25T10:55:00Z", 60),
+            ["Second", "First"]
+        );
+        // Started right at the boundary: both are offered, the one it fills first.
+        assert_eq!(
+            titles(&dir, "2026-09-25T11:00:00Z", 55),
+            ["Second", "First"]
+        );
+        // Ended before the next one began: only the meeting it was in.
+        assert_eq!(titles(&dir, "2026-09-25T10:00:00Z", 30), ["First"]);
+        fs::remove_dir_all(dir).expect("remove fixture");
+    }
+
+    #[test]
+    fn merged_recordings_match_only_the_times_they_recorded() {
+        let dir = test_dir("merged");
+        write_context(
+            &dir,
+            "context.json",
+            serde_json::json!([
+                {"title":"Gap","start":"2026-09-25T09:30:00Z","end":"2026-09-25T09:45:00Z"},
+                {"title":"Recorded","start":"2026-09-25T10:15:00Z","end":"2026-09-25T10:45:00Z"}
+            ]),
+        );
+        let titles = match_candidates(
+            &dir,
+            &[
+                ("2026-09-25T09:00:00Z", 5 * 60_000),
+                ("2026-09-25T10:00:00Z", 60 * 60_000),
+            ],
+        )
+        .into_iter()
+        .map(|candidate| (candidate.context.title, candidate.overlap_seconds))
+        .collect::<Vec<_>>();
+        assert_eq!(titles, [("Recorded".to_owned(), 30 * 60)]);
         fs::remove_dir_all(dir).expect("remove fixture");
     }
 

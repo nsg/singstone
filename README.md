@@ -356,9 +356,17 @@ optional. Names are trimmed and duplicate or empty names are ignored. Bad
 files and bad entries are warned about and skipped without blocking
 processing.
 
-The session start must fall between 15 minutes before the meeting start and
-the meeting end. Without `end`, the window ends 60 minutes after the start.
-If several entries match, the closest start wins; ties use entry order. The
+A meeting is offered for a session when the recording starts between 15
+minutes before the meeting and 10 minutes after its end, or runs into it.
+Without `end`, a meeting lasts 60 minutes. A recording started early, late or
+halfway through a meeting still finds it. When several meetings are offered,
+for example overlapping invitations or back-to-back meetings, the dialog asks
+**Which meeting is this?** and lists each with its time, number of invitees
+and how much of the recording falls inside it, plus **None of these**. The
+meeting sharing the largest part of its and the recording's time is chosen to
+begin with; without a known length, the closest start; ties use entry order.
+Choosing another meeting fills in its title, unless you typed your own, and
+its attendees. The same meeting listed in several files is offered once. The
 attendee matching the configured local speaker name starts as "In the room";
 everyone else starts as "Remote". Existing session details take precedence
 over the context file. The setting also accepts a folder of `*.json` files;

@@ -3014,16 +3014,45 @@ const PLACE_REMOTE: u32 = 1;
 
 struct MeetingPrefill {
     details: MeetingDetails,
-    /// Calendar attendees still to be placed in the room or on the remote end.
+    /// Calendar meetings the recording may be for, best match first; the
+    /// dialog starts with the first and asks when there are several.
+    choices: Vec<CalendarChoice>,
+    /// Shown when no calendar meeting is chosen.
+    caption: Option<String>,
+    local_speaker: String,
+}
+
+#[derive(Clone)]
+struct CalendarChoice {
+    title: String,
+    /// Local start and end, such as "10:00–11:00".
+    time: String,
+    overlap_minutes: u64,
+    /// Attendees still to be placed in the room or on the remote end.
     attendees: Vec<(String, u32)>,
     attendee_note: Option<String>,
-    caption: Option<String>,
+    caption: String,
+}
+
+impl CalendarChoice {
+    fn subtitle(&self) -> String {
+        let mut parts = vec![self.time.clone()];
+        match self.attendees.len() {
+            0 => {}
+            1 => parts.push("1 invited".into()),
+            count => parts.push(format!("{count} invited")),
+        }
+        if self.overlap_minutes > 0 {
+            parts.push(format!("overlaps {} min", self.overlap_minutes));
+        }
+        parts.join(" · ")
+    }
 }
 
 struct MeetingDetailsDialog {
     dialog: adw::Dialog,
     title: adw::EntryRow,
-    attendee_rows: Vec<(String, adw::ComboRow)>,
+    attendee_rows: Rc<RefCell<Vec<(String, adw::ComboRow)>>>,
     local_names: adw::EntryRow,
     local_unknown: adw::SpinRow,
     remote_names: adw::EntryRow,
@@ -3033,9 +3062,9 @@ struct MeetingDetailsDialog {
 
 impl MeetingDetailsDialog {
     fn details(&self) -> MeetingDetails {
+        let rows = self.attendee_rows.borrow();
         let placed = |place: u32| {
-            self.attendee_rows
-                .iter()
+            rows.iter()
                 .filter(move |(_, row)| row.selected() == place)
                 .map(|(name, _)| name.clone())
         };
@@ -3057,9 +3086,64 @@ impl MeetingDetailsDialog {
     }
 }
 
+/// Fills `slot` with a row per invited person and returns the rows.
+fn fill_attendees(
+    slot: &gtk::Box,
+    choice: Option<&CalendarChoice>,
+) -> Vec<(String, adw::ComboRow)> {
+    clear_box(slot);
+    let Some(choice) = choice.filter(|choice| !choice.attendees.is_empty()) else {
+        slot.set_visible(false);
+        return Vec::new();
+    };
+    let group = adw::PreferencesGroup::builder()
+        .title("Attendees")
+        .description("Where was each invited person? Add anyone missing below.")
+        .build();
+    let mut rows = Vec::new();
+    for (name, place) in &choice.attendees {
+        let row = adw::ComboRow::builder()
+            .title(name)
+            .use_markup(false)
+            .build();
+        row.set_model(Some(&gtk::StringList::new(&[
+            "In the room",
+            "Remote",
+            "Did not attend",
+        ])));
+        row.set_selected(*place);
+        group.add(&row);
+        rows.push((name.clone(), row));
+    }
+    slot.append(&group);
+    if let Some(note) = &choice.attendee_note {
+        let label = gtk::Label::new(Some(note));
+        label.set_xalign(0.0);
+        label.set_wrap(true);
+        label.set_max_width_chars(60);
+        label.add_css_class("dim-label");
+        label.add_css_class("caption");
+        slot.append(&label);
+    }
+    slot.set_visible(true);
+    rows
+}
+
+fn names_title(has_attendees: bool) -> &'static str {
+    if has_attendees {
+        "Other names, comma separated"
+    } else {
+        "Names, comma separated"
+    }
+}
+
+fn set_caption(label: &gtk::Label, text: Option<&str>) {
+    label.set_label(text.unwrap_or_default());
+    label.set_visible(text.is_some());
+}
+
 fn meeting_details_dialog(prefill: &MeetingPrefill, primary_label: &str) -> MeetingDetailsDialog {
     let details = &prefill.details;
-    let prefill_caption = prefill.caption.as_deref();
     let dialog = adw::Dialog::builder()
         .title("Meeting details")
         .content_width(520)
@@ -3072,6 +3156,17 @@ fn meeting_details_dialog(prefill: &MeetingPrefill, primary_label: &str) -> Meet
     body.set_margin_start(24);
     body.set_margin_end(24);
 
+    let choice_group = adw::PreferencesGroup::builder()
+        .title("Which meeting is this?")
+        .description("Several meetings in your calendar fall around this recording.")
+        .build();
+    body.append(&choice_group);
+    choice_group.set_visible(prefill.choices.len() > 1);
+    if prefill.choices.len() > 1 {
+        // Switching meetings changes the content; keep the dialog from resizing.
+        body.set_width_request(460);
+    }
+
     let title_group = adw::PreferencesGroup::new();
     let title = adw::EntryRow::builder()
         .title("Meeting title")
@@ -3080,45 +3175,19 @@ fn meeting_details_dialog(prefill: &MeetingPrefill, primary_label: &str) -> Meet
     title_group.add(&title);
     body.append(&title_group);
 
-    let mut attendee_rows = Vec::new();
-    if !prefill.attendees.is_empty() {
-        let attendee_group = adw::PreferencesGroup::builder()
-            .title("Attendees")
-            .description("Where was each invited person? Add anyone missing below.")
-            .build();
-        for (name, place) in &prefill.attendees {
-            let row = adw::ComboRow::builder().title(name).build();
-            row.set_model(Some(&gtk::StringList::new(&[
-                "In the room",
-                "Remote",
-                "Did not attend",
-            ])));
-            row.set_selected(*place);
-            attendee_group.add(&row);
-            attendee_rows.push((name.clone(), row));
-        }
-        body.append(&attendee_group);
-        if let Some(note) = &prefill.attendee_note {
-            let label = gtk::Label::new(Some(note));
-            label.set_xalign(0.0);
-            label.set_wrap(true);
-            label.set_max_width_chars(60);
-            label.add_css_class("dim-label");
-            label.add_css_class("caption");
-            body.append(&label);
-        }
-    }
-    let names_title = if attendee_rows.is_empty() {
-        "Names, comma separated"
-    } else {
-        "Other names, comma separated"
-    };
+    let attendee_slot = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    body.append(&attendee_slot);
+    let attendee_rows = Rc::new(RefCell::new(fill_attendees(
+        &attendee_slot,
+        prefill.choices.first(),
+    )));
+    let names = names_title(!attendee_rows.borrow().is_empty());
 
     let local_group = adw::PreferencesGroup::builder()
         .title("In the room (microphone)")
         .build();
     let local_names = adw::EntryRow::builder()
-        .title(names_title)
+        .title(names)
         .text(details.local.known.join(", "))
         .build();
     local_group.add(&local_names);
@@ -3132,7 +3201,7 @@ fn meeting_details_dialog(prefill: &MeetingPrefill, primary_label: &str) -> Meet
         .title("Remote (system audio)")
         .build();
     let remote_names = adw::EntryRow::builder()
-        .title(names_title)
+        .title(names)
         .text(details.remote.known.join(", "))
         .build();
     remote_group.add(&remote_names);
@@ -3142,13 +3211,123 @@ fn meeting_details_dialog(prefill: &MeetingPrefill, primary_label: &str) -> Meet
     remote_group.add(&remote_unknown);
     body.append(&remote_group);
 
-    if let Some(caption) = prefill_caption {
-        let caption = gtk::Label::new(Some(caption));
-        caption.set_xalign(0.0);
-        caption.add_css_class("dim-label");
-        caption.add_css_class("caption");
-        body.append(&caption);
+    let caption = gtk::Label::new(None);
+    caption.set_xalign(0.0);
+    caption.add_css_class("dim-label");
+    caption.add_css_class("caption");
+    set_caption(
+        &caption,
+        prefill
+            .choices
+            .first()
+            .map(|choice| choice.caption.as_str())
+            .or(prefill.caption.as_deref()),
+    );
+    body.append(&caption);
+
+    if prefill.choices.len() > 1 {
+        let chosen = Rc::new(Cell::new(Some(0usize)));
+        let choices = Rc::new(prefill.choices.clone());
+        let me = prefill.local_speaker.trim().to_owned();
+        // What the user typed stays when another meeting is chosen; only text
+        // the dialog filled in itself is replaced.
+        let quiet = Rc::new(Cell::new(false));
+        let title_typed = Rc::new(Cell::new(details.title != choices[0].title));
+        let me_filled = Rc::new(Cell::new(!me.is_empty() && local_names.text() == me));
+        {
+            let quiet = quiet.clone();
+            let title_typed = title_typed.clone();
+            title.connect_changed(move |_| {
+                if !quiet.get() {
+                    title_typed.set(true);
+                }
+            });
+        }
+        {
+            let quiet = quiet.clone();
+            let me_filled = me_filled.clone();
+            local_names.connect_changed(move |_| {
+                if !quiet.get() {
+                    me_filled.set(false);
+                }
+            });
+        }
+        let set_quietly = {
+            let quiet = quiet.clone();
+            move |entry: &adw::EntryRow, text: &str| {
+                quiet.set(true);
+                entry.set_text(text);
+                quiet.set(false);
+            }
+        };
+        let mut group_leader: Option<gtk::CheckButton> = None;
+        let options = (0..choices.len()).map(Some).chain([None]);
+        for option in options {
+            let (row_title, subtitle) = match option {
+                Some(index) => (choices[index].title.clone(), choices[index].subtitle()),
+                None => ("None of these".into(), "Enter the details by hand".into()),
+            };
+            let check = gtk::CheckButton::new();
+            check.set_valign(gtk::Align::Center);
+            check.set_active(option == Some(0));
+            if let Some(leader) = &group_leader {
+                check.set_group(Some(leader));
+            } else {
+                group_leader = Some(check.clone());
+            }
+            let row = adw::ActionRow::builder()
+                .title(row_title)
+                .subtitle(subtitle)
+                .use_markup(false)
+                .activatable_widget(&check)
+                .build();
+            row.add_prefix(&check);
+            choice_group.add(&row);
+
+            let chosen = chosen.clone();
+            let choices = choices.clone();
+            let title = title.clone();
+            let attendee_slot = attendee_slot.clone();
+            let attendee_rows = attendee_rows.clone();
+            let local_names = local_names.clone();
+            let remote_names = remote_names.clone();
+            let caption = caption.clone();
+            let fallback_caption = prefill.caption.clone();
+            let me = me.clone();
+            let title_typed = title_typed.clone();
+            let me_filled = me_filled.clone();
+            let set_quietly = set_quietly.clone();
+            check.connect_toggled(move |check| {
+                if !check.is_active() || chosen.get() == option {
+                    return;
+                }
+                chosen.set(option);
+                let next = option.map(|index| &choices[index]);
+                if !title_typed.get() {
+                    set_quietly(&title, next.map_or("", |next| next.title.as_str()));
+                }
+                *attendee_rows.borrow_mut() = fill_attendees(&attendee_slot, next);
+                let names = names_title(!attendee_rows.borrow().is_empty());
+                local_names.set_title(names);
+                remote_names.set_title(names);
+                // Without an invite list to place yourself in, you are in the room.
+                let wants_me = !me.is_empty() && next.is_none_or(|next| next.attendees.is_empty());
+                if wants_me && local_names.text().trim().is_empty() {
+                    set_quietly(&local_names, &me);
+                    me_filled.set(true);
+                } else if !wants_me && me_filled.get() {
+                    set_quietly(&local_names, "");
+                    me_filled.set(false);
+                }
+                set_caption(
+                    &caption,
+                    next.map(|next| next.caption.as_str())
+                        .or(fallback_caption.as_deref()),
+                );
+            });
+        }
     }
+
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     actions.set_halign(gtk::Align::End);
     let cancel = gtk::Button::with_label("Cancel");
@@ -3196,6 +3375,7 @@ fn meeting_prefill(
     config: &GuiConfig,
 ) -> Result<MeetingPrefill, Box<dyn std::error::Error>> {
     let session = Session::open(session_path)?;
+    let local_speaker = config.local_speaker.clone();
     // Renaming an unprocessed session stores a title without attendees; keep
     // that title but prefill the attendees as for a session without details.
     // Once processed, an empty roster is what the user confirmed.
@@ -3204,56 +3384,52 @@ fn meeting_prefill(
         Some(details) if confirmed || details.local_count() > 0 || details.remote_count() > 0 => {
             return Ok(MeetingPrefill {
                 details,
-                attendees: Vec::new(),
-                attendee_note: None,
+                choices: Vec::new(),
                 caption: Some("Previous details".into()),
+                local_speaker,
             });
         }
         stored => stored
             .map(|details| details.title)
             .filter(|title| !title.is_empty()),
     };
-    let me = config.local_speaker.trim();
     let manifest = session.read_manifest()?;
-    if let Some(context_file) = config.context_file.as_deref()
-        && let Some((context, source)) =
-            meeting::match_context_with_source(context_file, &manifest.started_wallclock)
-    {
-        let filename = source.file_name().map_or_else(
-            || source.display().to_string(),
-            |name| name.to_string_lossy().into(),
-        );
-        let invited_me = context.attendees.iter().any(|name| name == me);
-        let attendees = context
-            .attendees
-            .into_iter()
-            .map(|name| {
-                let place = if name == me {
-                    PLACE_LOCAL
-                } else {
-                    PLACE_REMOTE
-                };
-                (name, place)
-            })
-            .collect();
-        let attendee_note = (!invited_me && !me.is_empty()).then(|| {
-            format!(
-                "Your name in Settings, {me}, is not on the invite list; pick your own row as \"In the room\"."
+    let choices = config
+        .context_file
+        .as_deref()
+        .map(|context_file| {
+            let stretches = recorded_stretches(&session, &manifest);
+            let stretches = stretches
+                .iter()
+                .map(|(started, length_ms)| (started.as_str(), *length_ms))
+                .collect::<Vec<_>>();
+            meeting::match_candidates(context_file, &stretches)
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|candidate| {
+            calendar_choice(
+                candidate,
+                config.local_speaker.trim(),
+                &manifest.started_wallclock,
             )
-        });
-        return Ok(MeetingPrefill {
-            details: MeetingDetails::new(
-                renamed.unwrap_or(context.title),
-                Attendees::default(),
-                Attendees::default(),
-            ),
-            attendees,
-            attendee_note,
-            caption: Some(format!("From meeting-context file {filename}")),
-        });
-    }
-    Ok(MeetingPrefill {
-        details: MeetingDetails::new(
+        })
+        .collect::<Vec<_>>();
+    let details = match choices.first() {
+        Some(best) if !best.attendees.is_empty() => MeetingDetails::new(
+            renamed.unwrap_or_else(|| best.title.clone()),
+            Attendees::default(),
+            Attendees::default(),
+        ),
+        Some(best) => MeetingDetails::new(
+            renamed.unwrap_or_else(|| best.title.clone()),
+            Attendees {
+                known: vec![config.local_speaker.clone()],
+                unknown: 0,
+            },
+            Attendees::default(),
+        ),
+        None => MeetingDetails::new(
             renamed.unwrap_or_default(),
             Attendees {
                 known: vec![config.local_speaker.clone()],
@@ -3261,10 +3437,103 @@ fn meeting_prefill(
             },
             Attendees::default(),
         ),
-        attendees: Vec::new(),
-        attendee_note: None,
+    };
+    Ok(MeetingPrefill {
+        details,
+        choices,
         caption: None,
+        local_speaker,
     })
+}
+
+/// The parts of the meeting recorded in one go, as start and length: the
+/// marked meeting, or the whole recording, on its wall clock.
+fn recorded_stretches(session: &Session, manifest: &Manifest) -> Vec<(String, u64)> {
+    let recorded = process::recorded_duration_ms(session, manifest);
+    let span = process::read_meeting_span(session).unwrap_or_default();
+    let from = span.start_ms.unwrap_or(0).min(recorded);
+    let until = span.end_ms.unwrap_or(recorded).min(recorded).max(from);
+    session
+        .wallclock_map(manifest)
+        .ok()
+        .and_then(|map| map.slice(from, until))
+        .map(|map| {
+            map.segments()
+                .iter()
+                .map(|segment| (segment.started_wallclock.clone(), segment.length_ms))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![(manifest.started_wallclock.clone(), until - from)])
+}
+
+fn calendar_choice(
+    candidate: meeting::MeetingCandidate,
+    me: &str,
+    started_wallclock: &str,
+) -> CalendarChoice {
+    let filename = candidate.source.file_name().map_or_else(
+        || candidate.source.display().to_string(),
+        |name| name.to_string_lossy().into(),
+    );
+    let context = candidate.context;
+    let invited_me = context.attendees.iter().any(|name| name == me);
+    let attendees = context
+        .attendees
+        .into_iter()
+        .map(|name| {
+            let place = if name == me {
+                PLACE_LOCAL
+            } else {
+                PLACE_REMOTE
+            };
+            (name, place)
+        })
+        .collect::<Vec<_>>();
+    let attendee_note = (!invited_me && !me.is_empty() && !attendees.is_empty()).then(|| {
+        format!(
+            "Your name in Settings, {me}, is not on the invite list; pick your own row as \"In the room\"."
+        )
+    });
+    CalendarChoice {
+        title: context.title,
+        time: meeting_time_range(
+            &candidate.start,
+            candidate.end.as_deref(),
+            started_wallclock,
+        ),
+        overlap_minutes: candidate.overlap_seconds.div_ceil(60),
+        attendees,
+        attendee_note,
+        caption: format!("From meeting-context file {filename}"),
+    }
+}
+
+/// A calendar meeting's start and end on the clock the recording was made by,
+/// as the session list shows it.
+fn meeting_time_range(start: &str, end: Option<&str>, started_wallclock: &str) -> String {
+    let zone = glib::DateTime::from_iso8601(started_wallclock, None)
+        .ok()
+        .map(|started| glib::TimeZone::from_offset(started.utc_offset().as_seconds() as i32));
+    let local = |value: &str| {
+        let time = glib::DateTime::from_iso8601(value, None).ok()?;
+        match &zone {
+            Some(zone) => time.to_timezone(zone).ok(),
+            None => time.to_local().ok(),
+        }
+    };
+    let Some(start) = local(start) else {
+        return String::new();
+    };
+    let end = end
+        .and_then(local)
+        .or_else(|| start.add_hours(1).ok())
+        .unwrap_or_else(|| start.clone());
+    let clock = |time: &glib::DateTime| {
+        time.format("%H:%M")
+            .map(|text| text.to_string())
+            .unwrap_or_default()
+    };
+    format!("{}–{}", clock(&start), clock(&end))
 }
 
 struct RunningProcessing {

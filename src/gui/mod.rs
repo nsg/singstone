@@ -28,8 +28,8 @@ use crate::split;
 use crate::testcase::LineRef;
 use crate::transcription::{self, TranscriptionProgress, backend};
 use crate::types::{
-    AudioSource, DEFAULT_SPEAKER_THRESHOLD, Manifest, MeetingSpan, SAMPLE_RATE, ScreenshotEntry,
-    SessionState, Utterance,
+    AudioSource, DEFAULT_SPEAKER_THRESHOLD, Lead, Manifest, MeetingSpan, SAMPLE_RATE,
+    ScreenshotEntry, SessionState, Utterance,
 };
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -98,6 +98,11 @@ const CSS: &str = r#"
 .transcript-icon { min-width: 18px; min-height: 18px; padding: 0; }
 .transcript-card .pill { padding-left: 3px; padding-right: 3px; }
 .echo-row { opacity: 0.55; }
+.transcript-card.lead-own.lead-start { border-left: 4px solid @accent_color; }
+.transcript-card.lead-own.lead-end { border-right: 4px solid @accent_color; }
+.transcript-card.lead-both.lead-start { border-left: 4px solid alpha(@accent_color, 0.45); }
+.transcript-card.lead-both.lead-end { border-right: 4px solid alpha(@accent_color, 0.45); }
+.transcript-card.lead-other { border: 1px dashed alpha(currentColor, 0.45); }
 .outside-line { opacity: 0.55; }
 .keep-bar { margin-top: 2px; }
 .keep-chip { border: 1px solid alpha(@accent_color, 0.28); border-radius: 999px; padding: 0 0 0 8px; color: @accent_color; background: alpha(@accent_bg_color, 0.12); }
@@ -6704,6 +6709,21 @@ fn timeline_marker(start_ms: u64) -> gtk::Overlay {
     marker
 }
 
+/// How a line's side relates to the side processing heard at that time.
+fn lead_mark(utterance: &Utterance) -> Option<(&'static str, &'static str)> {
+    let mic = utterance.source == AudioSource::Mic;
+    Some(match (utterance.lead?, mic) {
+        (Lead::Both, _) => ("lead-both", "Both sides were talking"),
+        (Lead::Mic, true) => ("lead-own", "Heard on the microphone"),
+        (Lead::System, false) => ("lead-own", "Heard on the system audio"),
+        (Lead::System, true) => (
+            "lead-other",
+            "The system audio was talking; the microphone likely heard its echo",
+        ),
+        (Lead::Mic, false) => ("lead-other", "The microphone was talking here"),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn transcript_card(
     utterance: &Utterance,
@@ -6721,6 +6741,11 @@ fn transcript_card(
     card.add_css_class("transcript-card");
     if utterance.echo {
         card.add_css_class("echo-row");
+    }
+    if let Some((class, tooltip)) = lead_mark(utterance) {
+        card.add_css_class(class);
+        card.add_css_class(if mirrored { "lead-end" } else { "lead-start" });
+        card.set_tooltip_text(Some(tooltip));
     }
     let avatar = gtk::Image::from_icon_name("avatar-default-symbolic");
     avatar.set_pixel_size(18);
@@ -7808,6 +7833,7 @@ mod tests {
             locked: false,
             echo: false,
             group: None,
+            lead: None,
         }
     }
 

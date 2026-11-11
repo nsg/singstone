@@ -1147,6 +1147,7 @@ mod tests {
             locked: false,
             echo: false,
             group: None,
+            lead: None,
         };
         let segment = |source, start_ms, end_ms, cluster| SpeakerSegment {
             source,

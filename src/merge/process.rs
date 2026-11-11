@@ -2523,7 +2523,7 @@ fn render_artifacts_with_segments_and_hook(
         .copied()
         .filter(|range| hidden.hidden.contains(&range.source))
         .collect::<Vec<_>>();
-    let all_utterances = utterances::build_kept_utterances(
+    let mut all_utterances = utterances::build_kept_utterances(
         &words,
         &detection.echo,
         &segments,
@@ -2535,6 +2535,12 @@ fn render_artifacts_with_segments_and_hook(
         diarize_mic,
         DEFAULT_NEAREST_TOLERANCE_MS,
     );
+    if let Some(audio) = &audio {
+        for (utterance, _) in &mut all_utterances {
+            utterance.lead =
+                audio.lead_between(utterance.source, utterance.start_ms, utterance.end_ms);
+        }
+    }
     // The turns of a cut line stay together, where its first turn starts,
     // whichever of them are shown.
     let group_starts = turn_groups
@@ -3553,6 +3559,7 @@ mod tests {
             locked: false,
             echo: false,
             group: None,
+            lead: None,
         }];
         let segments = [SpeakerSegment {
             source: AudioSource::System,
@@ -3745,6 +3752,7 @@ mod tests {
                 locked: false,
                 echo: false,
                 group: None,
+                lead: None,
             }],
         );
         round_trip(
@@ -5224,6 +5232,7 @@ mod tests {
             locked: false,
             echo: false,
             group: None,
+            lead: None,
         };
 
         let proposal =
@@ -5353,6 +5362,7 @@ mod tests {
             locked: true,
             echo: false,
             group: None,
+            lead: None,
         };
 
         assert!(line_is_learned(&line, &chunks, &[], &database));
@@ -5780,6 +5790,7 @@ mod tests {
             locked: false,
             echo,
             group: None,
+            lead: None,
         };
         assert!(rules.keeps_speaker_of("Me", &line("mic_2", false)));
         assert!(!rules.keeps_speaker_of("Me", &line("mic_2", true)));

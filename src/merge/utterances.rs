@@ -178,6 +178,7 @@ pub fn build_kept_utterances(
                         locked,
                         echo: word_echo,
                         group: place.map(|(group, _)| group.id()),
+                        lead: None,
                     },
                     word_kept,
                 ));

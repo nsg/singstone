@@ -246,6 +246,7 @@ mod tests {
             locked: false,
             echo: false,
             group: None,
+            lead: None,
         }
     }
 

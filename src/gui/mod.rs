@@ -257,6 +257,10 @@ struct SessionDetail {
     delete_button: gtk::Button,
     hide_mic: gtk::ToggleButton,
     hide_system: gtk::ToggleButton,
+    assign_all: gtk::Box,
+    attendees_only: gtk::CheckButton,
+    /// The session and attendee restriction the checkbox state was set for.
+    attendees_only_for: Rc<RefCell<Option<(PathBuf, bool)>>>,
     loading_hidden_sources: Rc<Cell<bool>>,
     keep_bar: gtk::Box,
     hidden_shown: Rc<Cell<bool>>,
@@ -1556,6 +1560,16 @@ fn build_session_detail(
     ));
     hide_system.set_visible(false);
     transcript_toggles.append(&hide_system);
+    let assign_all = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    assign_all.set_visible(false);
+    let assign_all_button = gtk::Button::with_label("Name all voices");
+    assign_all_button.set_tooltip_text(Some(
+        "Give every unnamed voice the closest-matching speaker, however close. Names you set stay, and no voice is learned.",
+    ));
+    assign_all.append(&assign_all_button);
+    let attendees_only = gtk::CheckButton::with_label("Only attendees");
+    assign_all.append(&attendees_only);
+    transcript_toggles.append(&assign_all);
     transcript_frame.append(&transcript_header);
     let keep_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     keep_bar.set_layout_manager(Some(WrapLayout::new(6, 4)));
@@ -1637,6 +1651,9 @@ fn build_session_detail(
         delete_button,
         hide_mic,
         hide_system,
+        assign_all,
+        attendees_only,
+        attendees_only_for: Rc::new(RefCell::new(None)),
         loading_hidden_sources: Rc::new(Cell::new(false)),
         keep_bar,
         hidden_shown: Rc::new(Cell::new(false)),
@@ -1672,6 +1689,8 @@ fn build_session_detail(
             }
         });
     }
+    let detail_for_assign = detail.clone();
+    assign_all_button.connect_clicked(move |_| start_assign_all(&detail_for_assign));
     detail
 }
 
@@ -5555,6 +5574,7 @@ impl SessionDetail {
         if self.selected.borrow().as_deref() != Some(path) {
             self.outside_expanded.set((false, false));
             self.hidden_shown.set(false);
+            *self.attendees_only_for.borrow_mut() = None;
         }
         *self.selected.borrow_mut() = Some(path.to_owned());
         let title = session.title();
@@ -5593,6 +5613,7 @@ impl SessionDetail {
             .set_visible(can_hide_sources && manifest.system.enabled);
         self.keep_bar
             .set_visible(can_hide_sources && !rules.hidden.is_empty());
+        self.assign_all.set_visible(false);
 
         let screenshots: Vec<ScreenshotEntry> =
             jsonl::read_all(&session.screenshots_index_path()).unwrap_or_default();
@@ -5688,6 +5709,13 @@ impl SessionDetail {
                         }
                     },
                 );
+            }
+            if manifest.state != SessionState::Recording
+                && utterances.iter().any(|utterance| {
+                    is_anonymous_speaker(utterance) && has_assignable_id(utterance)
+                })
+            {
+                self.show_assign_all(path, &session);
             }
             let frequent = Rc::new(frequent_speakers(&utterances, 3));
             let colors = Rc::new(cut::person_colors(&utterances));
@@ -6116,6 +6144,7 @@ impl SessionDetail {
         }));
         self.hide_mic.set_sensitive(!running);
         self.hide_system.set_sensitive(!running);
+        self.assign_all.set_sensitive(!running);
         self.player.set_split_blocked(split_blocked(
             processed,
             queue_state,
@@ -6127,6 +6156,25 @@ impl SessionDetail {
             queue_state,
             self.cancel_requested.get(),
         ));
+    }
+
+    /// Shows "Name all voices"; the checkbox applies only when the meeting
+    /// names attendees, and starts ticked then for each session.
+    fn show_assign_all(&self, path: &Path, session: &Session) {
+        let meeting = meeting::read_details(&session.meeting_path()).unwrap_or_default();
+        let restricts = process::attendees_restrict_candidates(meeting.as_ref());
+        let state = (path.to_owned(), restricts);
+        if self.attendees_only_for.borrow().as_ref() != Some(&state) {
+            self.attendees_only.set_active(restricts);
+            *self.attendees_only_for.borrow_mut() = Some(state);
+        }
+        self.attendees_only.set_sensitive(restricts);
+        self.attendees_only.set_tooltip_text(Some(if restricts {
+            "Pick only among the meeting's named attendees. Microphone voices may also be remote attendees heard through the speakers."
+        } else {
+            "Name the attendees in the meeting details to pick only among them"
+        }));
+        self.assign_all.set_visible(true);
     }
 
     fn refresh_queue_state(&self) {
@@ -6162,6 +6210,7 @@ impl SessionDetail {
         self.transcript_header.set_visible(true);
         self.transcript_scroll.set_visible(true);
         *self.selected.borrow_mut() = None;
+        *self.attendees_only_for.borrow_mut() = None;
         self.title.set_label("Select a session");
         self.subtitle
             .set_label("Recorded meetings appear in the sidebar.");
@@ -6178,6 +6227,7 @@ impl SessionDetail {
             self.delete_button.upcast_ref(),
             self.hide_mic.upcast_ref(),
             self.hide_system.upcast_ref(),
+            self.assign_all.upcast_ref(),
             self.keep_bar.upcast_ref(),
         ] {
             widget.set_visible(false);
@@ -7404,6 +7454,69 @@ fn start_assignment(
         }
         glib::ControlFlow::Break
     });
+}
+
+fn start_assign_all(detail: &SessionDetail) {
+    if detail.busy.get() {
+        return;
+    }
+    let Some(session) = detail.selected.borrow().clone() else {
+        return;
+    };
+    if detail.queue.borrow().state(&session) == Some(JobState::Running) {
+        show_error(
+            &detail.window,
+            "Session is processing",
+            "Name the voices once processing has finished.",
+        );
+        return;
+    }
+    let attendees_only = detail.attendees_only.is_sensitive() && detail.attendees_only.is_active();
+    detail.busy.set(true);
+    let progress = progress_window(
+        &detail.window,
+        "Naming voices",
+        "Matching the unnamed voices against your speakers…",
+    );
+    let result = Arc::new(Mutex::new(None));
+    let thread_result = result.clone();
+    std::thread::spawn(move || {
+        let value = process::assign_all_speakers(ProcessArgs::for_session(session), attendees_only)
+            .map_err(|error| error.to_string());
+        *thread_result.lock().expect("assign all result mutex") = Some(value);
+    });
+    let detail = detail.clone();
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        let Some(result) = result.lock().expect("assign all result mutex").take() else {
+            return glib::ControlFlow::Continue;
+        };
+        detail.busy.set(false);
+        progress.close();
+        reload_session(&detail);
+        match result {
+            Ok(outcome) => detail
+                .toasts
+                .add_toast(adw::Toast::new(&assign_all_message(outcome))),
+            Err(error) => show_error(&detail.window, "Could not name the voices", &error),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn assign_all_message(outcome: process::AssignAllOutcome) -> String {
+    let voices = |count: usize| {
+        if count == 1 {
+            "1 voice".to_owned()
+        } else {
+            format!("{count} voices")
+        }
+    };
+    match (outcome.named, outcome.unmatched) {
+        (0, 0) => "Every voice already has a name".to_owned(),
+        (0, unmatched) => format!("No speaker matched {}", voices(unmatched)),
+        (named, 0) => format!("Named {}", voices(named)),
+        (named, unmatched) => format!("Named {}; {unmatched} had no match", voices(named)),
+    }
 }
 
 fn progress_window(parent: &adw::ApplicationWindow, title: &str, text: &str) -> gtk::Window {

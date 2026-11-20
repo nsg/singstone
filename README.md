@@ -65,6 +65,18 @@ recognizes as the same voice. Those later lines stay unlocked, so a later
 choice can rename them. Earlier lines are never changed. A lock icon marks a
 line you named, and a fingerprint icon marks a line whose voice was learned.
 
+Recognition only names a voice it is sure of. When anonymous lines remain,
+**Name all voices** above the transcript gives every unnamed voice the closest
+learned speaker, however weak the match, and names all of that voice's lines.
+Voices recognition already named and lines you named stay as they are, no voice
+is learned, and reprocessing replaces these guesses like any recognized name.
+**Only attendees**, ticked by default when the meeting details name people,
+picks system voices only among the remote attendees, and microphone voices
+among everyone named, since the microphone can pick up remote people through
+the loudspeaker. A side with no named attendees is not limited. A voice that no
+candidate matches, for example an attendee with no learned voice, stays
+anonymous, and the notice says how many did.
+
 When one line holds several people talking back and forth, press its scissors
 button to cut it into turns. Click between two words to place a cut, or click
 a cut to remove it; Tab to a gap and press Enter to cut from the keyboard, and

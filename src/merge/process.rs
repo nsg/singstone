@@ -2196,39 +2196,7 @@ fn recognize_speakers(
     }
     let mut result = RecognitionResult::default();
     for source in [AudioSource::System, AudioSource::Mic] {
-        let source_chunks = chunks
-            .iter()
-            .filter(|chunk| {
-                chunk.source == source
-                    && chunk.end_ms.saturating_sub(chunk.start_ms) >= MIN_LEARN_MS
-            })
-            .collect::<Vec<_>>();
-        let mut cluster_embeddings = BTreeMap::<u32, Vec<Vec<f32>>>::new();
-        let mut overlapped = BTreeMap::<u32, Vec<Vec<f32>>>::new();
-        for chunk in &source_chunks {
-            let other_voices_ms = chunks
-                .iter()
-                .filter(|other| other.source == source && other.cluster != chunk.cluster)
-                .map(|other| {
-                    other
-                        .end_ms
-                        .min(chunk.end_ms)
-                        .saturating_sub(other.start_ms.max(chunk.start_ms))
-                })
-                .sum::<u64>();
-            let target = if other_voices_ms >= MAX_RECOGNITION_OTHER_VOICE_MS {
-                &mut overlapped
-            } else {
-                &mut cluster_embeddings
-            };
-            target
-                .entry(chunk.cluster)
-                .or_default()
-                .push(chunk.embedding.clone());
-        }
-        for (cluster, embeddings) in overlapped {
-            cluster_embeddings.entry(cluster).or_insert(embeddings);
-        }
+        let cluster_embeddings = cluster_queries(&chunks, source, MIN_LEARN_MS);
         if cluster_embeddings.is_empty() {
             continue;
         }
@@ -2306,6 +2274,222 @@ fn allowed_candidate_names(
         }
         _ => None,
     }
+}
+
+/// Per cluster of `source`, the vectors of its chunks of at least `min_ms`:
+/// those with little of other voices in them, or the overlapped ones when the
+/// cluster has no clear chunk.
+fn cluster_queries(
+    chunks: &[EmbeddingChunk],
+    source: AudioSource,
+    min_ms: u64,
+) -> BTreeMap<u32, Vec<Vec<f32>>> {
+    let mut clear = BTreeMap::<u32, Vec<Vec<f32>>>::new();
+    let mut overlapped = BTreeMap::<u32, Vec<Vec<f32>>>::new();
+    for chunk in chunks.iter().filter(|chunk| {
+        chunk.source == source && chunk.end_ms.saturating_sub(chunk.start_ms) >= min_ms
+    }) {
+        let other_voices_ms = chunks
+            .iter()
+            .filter(|other| other.source == source && other.cluster != chunk.cluster)
+            .map(|other| {
+                other
+                    .end_ms
+                    .min(chunk.end_ms)
+                    .saturating_sub(other.start_ms.max(chunk.start_ms))
+            })
+            .sum::<u64>();
+        let target = if other_voices_ms >= MAX_RECOGNITION_OTHER_VOICE_MS {
+            &mut overlapped
+        } else {
+            &mut clear
+        };
+        target
+            .entry(chunk.cluster)
+            .or_default()
+            .push(chunk.embedding.clone());
+    }
+    for (cluster, embeddings) in overlapped {
+        clear.entry(cluster).or_insert(embeddings);
+    }
+    clear
+}
+
+/// [`cluster_queries`] as recognition gathers them, falling back to the short
+/// chunks of a cluster that has no chunk long enough to learn from.
+fn closest_match_queries(
+    chunks: &[EmbeddingChunk],
+    source: AudioSource,
+) -> BTreeMap<u32, Vec<Vec<f32>>> {
+    let mut queries = cluster_queries(chunks, source, MIN_LEARN_MS);
+    for (cluster, embeddings) in cluster_queries(chunks, source, 0) {
+        queries.entry(cluster).or_insert(embeddings);
+    }
+    queries
+}
+
+/// How many still anonymous voices [`assign_all_speakers`] named, and how many
+/// it left anonymous because no candidate scored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssignAllOutcome {
+    pub named: usize,
+    pub unmatched: usize,
+}
+
+/// The people a voice of `source` may be when only attendees are candidates,
+/// or `None` when that side names nobody and every speaker is a candidate.
+/// The microphone may carry echo of remote people, so they count there too.
+fn attendee_candidates(meeting: &MeetingDetails, source: AudioSource) -> Option<Vec<String>> {
+    let names = match source {
+        AudioSource::System => meeting.remote.known.clone(),
+        AudioSource::Mic if meeting.local.known.is_empty() => return None,
+        AudioSource::Mic => meeting
+            .local
+            .known
+            .iter()
+            .chain(&meeting.remote.known)
+            .cloned()
+            .collect(),
+    };
+    (!names.is_empty()).then_some(names)
+}
+
+/// Whether limiting candidates to attendees changes anything for either side.
+pub fn attendees_restrict_candidates(meeting: Option<&MeetingDetails>) -> bool {
+    meeting.is_some_and(|meeting| {
+        [AudioSource::System, AudioSource::Mic]
+            .into_iter()
+            .any(|source| attendee_candidates(meeting, source).is_some())
+    })
+}
+
+/// Gives every voice that recognition left anonymous the closest-matching
+/// speaker in the database, with no threshold and no uniqueness, and renders.
+/// Named voices and lines named by hand stay as they are, and the database is
+/// only read: these are automatic matches that reprocessing replaces.
+pub fn assign_all_speakers(
+    args: ProcessArgs,
+    attendees_only: bool,
+) -> Result<AssignAllOutcome, Box<dyn std::error::Error>> {
+    let (session, _) = open_session(&args.session)?;
+    let artifact = read_current_assignments(&session)?;
+    if artifact
+        .assignments
+        .iter()
+        .all(|assignment| assignment.speaker.is_some())
+    {
+        return Ok(AssignAllOutcome::default());
+    }
+    let segments: Vec<SpeakerSegment> =
+        read_jsonl_artifact(&session.diarization_path(), "diarization input")?;
+    let learning = prepare_correction_learning(&args, &session, &segments)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no speaker embedding model is configured",
+        )
+    })?;
+    let database = load_correction_database(&learning.database_path, &learning.identity)?;
+    validate_recognition_database(&database, &learning.identity)?;
+    let meeting = if attendees_only {
+        meeting::read_details(&session.meeting_path())?
+    } else {
+        None
+    };
+    assign_closest_matches(
+        &session,
+        artifact,
+        &learning.chunks,
+        &database,
+        meeting.as_ref(),
+    )
+}
+
+fn assign_closest_matches(
+    session: &Session,
+    mut artifact: SpeakerAssignments,
+    chunks: &[EmbeddingChunk],
+    database: &SpeakerDatabase,
+    attendees: Option<&MeetingDetails>,
+) -> Result<AssignAllOutcome, Box<dyn std::error::Error>> {
+    let outcome =
+        fill_anonymous_assignments(&mut artifact.assignments, chunks, database, attendees);
+    if outcome.named > 0 {
+        write_render_input_and_render(session, &session.speaker_assignments_path(), |path| {
+            write_json_atomic(path, &artifact)
+        })?;
+    }
+    Ok(outcome)
+}
+
+fn fill_anonymous_assignments(
+    assignments: &mut [SpeakerAssignment],
+    chunks: &[EmbeddingChunk],
+    database: &SpeakerDatabase,
+    attendees: Option<&MeetingDetails>,
+) -> AssignAllOutcome {
+    let mut queries = HashMap::new();
+    let mut outcome = AssignAllOutcome::default();
+    for assignment in assignments
+        .iter_mut()
+        .filter(|assignment| assignment.speaker.is_none())
+    {
+        let source = assignment.source;
+        let allowed = attendees
+            .and_then(|meeting| attendee_candidates(meeting, source))
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| database.resolve_name(name))
+                    .collect::<HashSet<_>>()
+            });
+        let best = queries
+            .entry(source)
+            .or_insert_with(|| closest_match_queries(chunks, source))
+            .get(&assignment.cluster)
+            .and_then(|query| best_candidate(database, query, allowed.as_ref()));
+        match best {
+            Some((name, score)) => {
+                assignment.best_candidate = Some(name.clone());
+                assignment.score = Some(score);
+                assignment.speaker = Some(name);
+                outcome.named += 1;
+            }
+            None => outcome.unmatched += 1,
+        }
+    }
+    outcome
+}
+
+/// The speaker assignments of the current diarization, which naming voices
+/// builds on; missing or stale ones need reprocessing.
+fn read_current_assignments(session: &Session) -> io::Result<SpeakerAssignments> {
+    let reprocess = |problem: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{problem}. Reprocess the session first."),
+        )
+    };
+    let artifact: SpeakerAssignments = match read_json(&session.speaker_assignments_path()) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(reprocess("The session has no speaker assignments"));
+        }
+        result => result?,
+    };
+    if artifact.format_version != SPEAKER_ASSIGNMENTS_FORMAT_VERSION {
+        return Err(reprocess(&format!(
+            "The speaker assignments have unsupported format version {}",
+            artifact.format_version
+        )));
+    }
+    let current = artifact.provenance.diarization_file == "diarization.jsonl"
+        && models::sha256_file(&session.diarization_path())?
+            .eq_ignore_ascii_case(&artifact.provenance.diarization_sha256);
+    if !current {
+        return Err(reprocess(
+            "The speaker assignments were made for another diarization",
+        ));
+    }
+    Ok(artifact)
 }
 
 fn write_transcription_metadata(
@@ -4360,6 +4544,278 @@ mod tests {
         let assignments: SpeakerAssignments =
             read_json(&session.speaker_assignments_path()).expect("read assignments");
         assert_eq!(assignments.assignments[0].speaker, None);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    fn assign_all_database(names: &[(&str, Option<Vec<f32>>)]) -> SpeakerDatabase {
+        let mut database = SpeakerDatabase::empty(EmbeddingModelIdentity {
+            name: "m".into(),
+            sha256: "x".into(),
+            dimension: 2,
+        });
+        for (name, vector) in names {
+            database.speakers.insert(
+                (*name).into(),
+                vector
+                    .clone()
+                    .map_or_else(SpeakerRecord::default, |vector| {
+                        SpeakerRecord::settled(vec![vector])
+                    }),
+            );
+        }
+        database.refresh_centroids();
+        database
+    }
+
+    fn chunk(
+        source: AudioSource,
+        cluster: u32,
+        start_ms: u64,
+        end_ms: u64,
+        embedding: [f32; 2],
+    ) -> EmbeddingChunk {
+        EmbeddingChunk {
+            source,
+            start_ms,
+            end_ms,
+            cluster,
+            embedding: embedding.to_vec(),
+        }
+    }
+
+    #[test]
+    fn attendee_candidates_restrict_each_side_only_when_it_names_someone() {
+        let meeting = |local: &[&str], remote: &[&str]| {
+            let attendees = |names: &[&str]| crate::meeting::Attendees {
+                known: names.iter().map(|name| (*name).into()).collect(),
+                unknown: 0,
+            };
+            MeetingDetails::new(String::new(), attendees(local), attendees(remote))
+        };
+        let names = |names: &[&str]| Some(names.iter().map(|name| (*name).into()).collect());
+
+        let both = meeting(&["Laura"], &["Bob"]);
+        assert_eq!(
+            attendee_candidates(&both, AudioSource::System),
+            names(&["Bob"])
+        );
+        assert_eq!(
+            attendee_candidates(&both, AudioSource::Mic),
+            names(&["Laura", "Bob"])
+        );
+        let remote_only = meeting(&[], &["Bob"]);
+        assert_eq!(attendee_candidates(&remote_only, AudioSource::Mic), None);
+        assert_eq!(
+            attendee_candidates(&remote_only, AudioSource::System),
+            names(&["Bob"])
+        );
+        let local_only = meeting(&["Laura"], &[]);
+        assert_eq!(attendee_candidates(&local_only, AudioSource::System), None);
+        assert_eq!(
+            attendee_candidates(&local_only, AudioSource::Mic),
+            names(&["Laura"])
+        );
+        assert!(attendees_restrict_candidates(Some(&remote_only)));
+        assert!(attendees_restrict_candidates(Some(&local_only)));
+        assert!(!attendees_restrict_candidates(Some(&meeting(&[], &[]))));
+        assert!(!attendees_restrict_candidates(None));
+    }
+
+    #[test]
+    fn closest_matches_pick_among_attendees_without_threshold() {
+        let database = assign_all_database(&[
+            ("Alice", Some(vec![1.0, 0.0])),
+            ("Bob", Some(vec![0.0, 1.0])),
+            ("Dana", None),
+        ]);
+        let anonymous = |source, cluster| SpeakerAssignment {
+            source,
+            cluster,
+            best_candidate: None,
+            score: None,
+            speaker: None,
+        };
+        let mut assignments = vec![
+            anonymous(AudioSource::System, 0),
+            anonymous(AudioSource::System, 1),
+            anonymous(AudioSource::Mic, 0),
+        ];
+        let chunks = [
+            // Too short to learn from, but the cluster has nothing longer.
+            chunk(AudioSource::System, 0, 0, 500, [1.0, 0.0]),
+            // The short chunk is left out when a long one exists.
+            chunk(AudioSource::Mic, 0, 0, 2_000, [1.0, 0.0]),
+            chunk(AudioSource::Mic, 0, 3_000, 3_500, [0.0, 1.0]),
+        ];
+        let meeting = MeetingDetails::new(
+            String::new(),
+            crate::meeting::Attendees {
+                known: vec!["Dana".into()],
+                unknown: 0,
+            },
+            crate::meeting::Attendees {
+                known: vec!["bob".into()],
+                unknown: 0,
+            },
+        );
+
+        let outcome =
+            fill_anonymous_assignments(&mut assignments, &chunks, &database, Some(&meeting));
+
+        assert_eq!(
+            outcome,
+            AssignAllOutcome {
+                named: 2,
+                unmatched: 1
+            }
+        );
+        let speakers = assignments
+            .iter()
+            .map(|assignment| assignment.speaker.as_deref())
+            .collect::<Vec<_>>();
+        // Dana has no voice, and cluster 1 has no chunk to score.
+        assert_eq!(speakers, [Some("Bob"), None, Some("Bob")]);
+        assert_eq!(assignments[2].best_candidate.as_deref(), Some("Bob"));
+        assert!(assignments[2].score.expect("score").abs() < 1e-6);
+    }
+
+    #[test]
+    fn naming_all_voices_fills_only_anonymous_voices_and_keeps_lines_named_by_hand() {
+        let (root, session) = assignment_fixture("assign-all", None);
+        let word = |start_ms: u64, text: &str| TimedWord {
+            source: AudioSource::System,
+            start_ms,
+            end_ms: start_ms + 300,
+            text: text.into(),
+        };
+        jsonl::write_all_atomic(
+            &session.words_path(),
+            &[
+                word(100, "morning"),
+                word(2_100, "hello"),
+                word(6_100, "bye"),
+            ],
+        )
+        .expect("write words");
+        let segment = |cluster, start_ms, end_ms| SpeakerSegment {
+            source: AudioSource::System,
+            start_ms,
+            end_ms,
+            cluster,
+        };
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[
+                segment(0, 0, 1_000),
+                segment(1, 2_000, 3_000),
+                segment(1, 6_000, 7_000),
+            ],
+        )
+        .expect("write diarization");
+        let mut artifact: SpeakerAssignments =
+            read_json(&session.speaker_assignments_path()).expect("read assignments");
+        artifact.provenance.diarization_sha256 =
+            models::sha256_file(&session.diarization_path()).expect("hash diarization");
+        artifact.assignments = [(0, Some("Alice")), (1, None)]
+            .into_iter()
+            .map(|(cluster, speaker)| SpeakerAssignment {
+                source: AudioSource::System,
+                cluster,
+                best_candidate: speaker.map(str::to_owned),
+                score: speaker.map(|_| 0.9),
+                speaker: speaker.map(str::to_owned),
+            })
+            .collect();
+        write_json_atomic(&session.speaker_assignments_path(), &artifact)
+            .expect("write assignments");
+        write_corrections(&session, &[(AudioSource::System, 2_100, 2_400, "Carol")]);
+        let corrections = fs::read(session.speaker_corrections_path()).expect("read corrections");
+        // Both voices sound like Bob, but Alice was already recognized.
+        let chunks = [
+            chunk(AudioSource::System, 0, 0, 1_000, [0.0, 1.0]),
+            chunk(AudioSource::System, 1, 2_000, 3_000, [0.0, 1.0]),
+        ];
+        let database = assign_all_database(&[
+            ("Alice", Some(vec![1.0, 0.0])),
+            ("Bob", Some(vec![0.0, 1.0])),
+        ]);
+
+        let outcome = assign_closest_matches(
+            &session,
+            read_current_assignments(&session).expect("current assignments"),
+            &chunks,
+            &database,
+            None,
+        )
+        .expect("name all voices");
+
+        assert_eq!(outcome.named, 1);
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["Alice: morning", "Carol: hello", "Bob: bye"]
+        );
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read transcript");
+        assert!(transcript[1].locked);
+        assert!(!transcript[2].locked);
+        assert_eq!(
+            fs::read(session.speaker_corrections_path()).expect("read corrections"),
+            corrections
+        );
+        let assignments: SpeakerAssignments =
+            read_json(&session.speaker_assignments_path()).expect("read assignments");
+        assert_eq!(assignments.assignments[0], artifact.assignments[0]);
+        assert_eq!(assignments.assignments[1].speaker.as_deref(), Some("Bob"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn naming_all_voices_needs_current_assignments() {
+        let (root, session) = assignment_fixture("assign-all-stale", None);
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[SpeakerSegment {
+                source: AudioSource::System,
+                start_ms: 0,
+                end_ms: 31,
+                cluster: 7,
+            }],
+        )
+        .expect("edit diarization");
+        let stale = assign_all_speakers(stage_process_args(session.dir.clone()), false)
+            .expect_err("stale assignments");
+        assert!(stale.to_string().contains("Reprocess the session first"));
+        fs::remove_file(session.speaker_assignments_path()).expect("remove assignments");
+        let missing = assign_all_speakers(stage_process_args(session.dir.clone()), false)
+            .expect_err("missing assignments");
+        assert!(missing.to_string().contains("Reprocess the session first"));
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn naming_all_voices_leaves_the_database_file_untouched() {
+        let Some((root, session, args, database_path)) = learning_fixture("assign-all-database")
+        else {
+            return;
+        };
+        let mut database = SpeakerDatabase::load(&database_path).expect("read database");
+        let mut vector = vec![0.0; database.embedding_model.dimension];
+        vector[1] = 1.0;
+        database
+            .speakers
+            .insert("Laura".into(), SpeakerRecord::settled(vec![vector]));
+        database.refresh_centroids();
+        database.save(&database_path).expect("write database");
+        let before = fs::read(&database_path).expect("read database bytes");
+
+        let outcome = assign_all_speakers(args, false).expect("name all voices");
+
+        assert_eq!(outcome.named, 1);
+        assert_eq!(line_texts(&session.transcript_path()), ["Laura: hello"]);
+        assert_eq!(
+            fs::read(&database_path).expect("read database bytes"),
+            before
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

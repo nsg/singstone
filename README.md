@@ -627,8 +627,10 @@ microphone by default; pass `--diarize-mic=false` to opt out. See
 ## Build the Snap
 
 [`snap/snapcraft.yaml`](snap/snapcraft.yaml) is the complete build recipe. It
-builds ONNX Runtime and sherpa-onnx from pinned upstream commits and builds
-Singstone with its locked Rust dependencies. The package contains the trusted
+builds sherpa-onnx from a pinned upstream commit and builds Singstone with its
+locked Rust dependencies. ONNX Runtime is temporarily reused from the previous
+release's own build while Microsoft's repository is offline; the recipe
+explains why. The package contains the trusted
 model manifest and notices, but not the model weights.
 
 ```bash

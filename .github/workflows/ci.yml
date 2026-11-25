@@ -69,60 +69,10 @@ jobs:
           done
           exit 1
 
-      - name: Compute ONNX Runtime cache key
-        id: onnxruntime-cache-key
-        run: |
-          recipe_hash=$(
-            ruby -ryaml -rjson -rdigest -e '
-              project = YAML.safe_load_file("snap/snapcraft.yaml", aliases: true)
-              payload = {
-                "base" => project.fetch("base"),
-                "platforms" => project.fetch("platforms"),
-                "part" => project.fetch("parts").fetch("onnxruntime"),
-              }
-              print Digest::SHA256.hexdigest(JSON.generate(payload))
-            '
-          )
-          snapcraft_revision=$(snap list snapcraft | awk '$1 == "snapcraft" {print $3}')
-          test -n "$recipe_hash"
-          test -n "$snapcraft_revision"
-          printf 'key=onnxruntime-build-v1-%s-%s-snapcraft-%s-%s\n' \
-            '${{ runner.os }}' '${{ runner.arch }}' \
-            "$snapcraft_revision" "$recipe_hash" >> "$GITHUB_OUTPUT"
-
-      - name: Restore ONNX Runtime build cache
-        id: onnxruntime-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            parts/onnxruntime/install
-            parts/onnxruntime/state/pull
-            parts/onnxruntime/state/build
-          key: ${{ steps.onnxruntime-cache-key.outputs.key }}
-
-      - name: Build ONNX Runtime
-        run: sudo snapcraft build onnxruntime --destructive-mode
-
-      - name: Validate ONNX Runtime cache payload
-        run: |
-          test -f parts/onnxruntime/install/lib/libonnxruntime.so.1.28.2
-          test -f parts/onnxruntime/state/pull
-          test -f parts/onnxruntime/state/build
-          sudo chown -R "$USER:$USER" \
-            parts/onnxruntime/install \
-            parts/onnxruntime/state
-
-      - name: Save ONNX Runtime build cache
-        if: steps.onnxruntime-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            parts/onnxruntime/install
-            parts/onnxruntime/state/pull
-            parts/onnxruntime/state/build
-          key: ${{ steps.onnxruntime-cache-key.outputs.key }}
-
-      - name: Build and pack remaining snap
+      # ONNX Runtime is unpacked from a checksum-pinned archive of our previous
+      # release instead of built from source; snap/snapcraft.yaml explains why.
+      # The source build and its build cache return when that part does.
+      - name: Build and pack snap
         run: |
           sudo snapcraft pack --destructive-mode
           sudo chown "$USER:$USER" ./*.snap
@@ -153,6 +103,10 @@ jobs:
             usr/share/singstone/licenses/kb-whisper-small.LICENSE; do
             grep -Eq "squashfs-root/$payload(\\.|$)" <<<"$file_list"
           done
+
+          # The ONNX Runtime the previous release shipped, unchanged.
+          unsquashfs -cat "$snap_path" lib/libonnxruntime.so.1.28.2 | sha256sum \
+            | grep -q '^066a9e91730f134ff30474c5e7708c2d8c73e70bd6d00269b42b7aeb270344ec '
 
           installed_models=$(unsquashfs -cat "$snap_path" \
             usr/share/singstone/models.lock)

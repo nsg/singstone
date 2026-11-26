@@ -258,6 +258,7 @@ struct SessionDetail {
     hide_mic: gtk::ToggleButton,
     hide_system: gtk::ToggleButton,
     assign_all: gtk::Box,
+    clear_names: gtk::Button,
     attendees_only: gtk::CheckButton,
     /// The session and attendee restriction the checkbox state was set for.
     attendees_only_for: Rc<RefCell<Option<(PathBuf, bool)>>>,
@@ -1570,6 +1571,12 @@ fn build_session_detail(
     let attendees_only = gtk::CheckButton::with_label("Only attendees");
     assign_all.append(&attendees_only);
     transcript_toggles.append(&assign_all);
+    let clear_names = gtk::Button::with_label("Clear all voices");
+    clear_names.set_tooltip_text(Some(
+        "Make every voice in this recording anonymous again, including names you set, to start naming over. Learned voices stay learned.",
+    ));
+    clear_names.set_visible(false);
+    transcript_toggles.append(&clear_names);
     transcript_frame.append(&transcript_header);
     let keep_bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     keep_bar.set_layout_manager(Some(WrapLayout::new(6, 4)));
@@ -1652,6 +1659,7 @@ fn build_session_detail(
         hide_mic,
         hide_system,
         assign_all,
+        clear_names: clear_names.clone(),
         attendees_only,
         attendees_only_for: Rc::new(RefCell::new(None)),
         loading_hidden_sources: Rc::new(Cell::new(false)),
@@ -1691,6 +1699,8 @@ fn build_session_detail(
     }
     let detail_for_assign = detail.clone();
     assign_all_button.connect_clicked(move |_| start_assign_all(&detail_for_assign));
+    let detail_for_clear = detail.clone();
+    clear_names.connect_clicked(move |_| confirm_clear_names(&detail_for_clear));
     detail
 }
 
@@ -5614,6 +5624,7 @@ impl SessionDetail {
         self.keep_bar
             .set_visible(can_hide_sources && !rules.hidden.is_empty());
         self.assign_all.set_visible(false);
+        self.clear_names.set_visible(false);
 
         let screenshots: Vec<ScreenshotEntry> =
             jsonl::read_all(&session.screenshots_index_path()).unwrap_or_default();
@@ -5657,6 +5668,7 @@ impl SessionDetail {
             };
             let hidden_count = hidden_lines.len();
             let shown_count = utterances.len();
+            let names_voices = utterances.iter().chain(&hidden_lines).any(names_a_voice);
             if self.hidden_shown.get() {
                 utterances.extend(hidden_lines);
             }
@@ -5717,6 +5729,8 @@ impl SessionDetail {
             {
                 self.show_assign_all(path, &session);
             }
+            self.clear_names
+                .set_visible(manifest.state != SessionState::Recording && names_voices);
             let frequent = Rc::new(frequent_speakers(&utterances, 3));
             let colors = Rc::new(cut::person_colors(&utterances));
             let groups = process::read_speaker_turns(&session)
@@ -6145,6 +6159,7 @@ impl SessionDetail {
         self.hide_mic.set_sensitive(!running);
         self.hide_system.set_sensitive(!running);
         self.assign_all.set_sensitive(!running);
+        self.clear_names.set_sensitive(!running);
         self.player.set_split_blocked(split_blocked(
             processed,
             queue_state,
@@ -6228,6 +6243,7 @@ impl SessionDetail {
             self.hide_mic.upcast_ref(),
             self.hide_system.upcast_ref(),
             self.assign_all.upcast_ref(),
+            self.clear_names.upcast_ref(),
             self.keep_bar.upcast_ref(),
         ] {
             widget.set_visible(false);
@@ -7030,6 +7046,13 @@ fn is_anonymous_speaker(utterance: &Utterance) -> bool {
     utterance.speaker.starts_with("SPEAKER_") || utterance.speaker == "unknown"
 }
 
+/// Whether "Clear all voices" would make the line anonymous: a name that
+/// recognition, naming all voices or the user gave it.
+fn names_a_voice(utterance: &Utterance) -> bool {
+    !is_anonymous_speaker(utterance)
+        && (utterance.locked || utterance.group.is_some() || has_assignable_id(utterance))
+}
+
 fn has_assignable_id(utterance: &Utterance) -> bool {
     parse_assignable_id(&utterance.speaker_id).is_some()
 }
@@ -7498,6 +7521,72 @@ fn start_assign_all(detail: &SessionDetail) {
                 .toasts
                 .add_toast(adw::Toast::new(&assign_all_message(outcome))),
             Err(error) => show_error(&detail.window, "Could not name the voices", &error),
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+fn confirm_clear_names(detail: &SessionDetail) {
+    let dialog = adw::AlertDialog::new(
+        Some("Clear all voices?"),
+        Some(
+            "Every voice in this recording becomes anonymous, including the lines you named and the names of cut turns. The cuts stay, and voices Singstone has learned stay learned. Reprocessing recognizes the voices again.",
+        ),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("clear", "Clear")]);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+    let detail_for_response = detail.clone();
+    dialog.connect_response(Some("clear"), move |_, _| {
+        start_clear_names(&detail_for_response)
+    });
+    dialog.present(Some(&detail.window));
+}
+
+fn start_clear_names(detail: &SessionDetail) {
+    if detail.busy.get() {
+        return;
+    }
+    let Some(session) = detail.selected.borrow().clone() else {
+        return;
+    };
+    if detail.queue.borrow().state(&session) == Some(JobState::Running) {
+        show_error(
+            &detail.window,
+            "Session is processing",
+            "Clear the voices once processing has finished.",
+        );
+        return;
+    }
+    detail.busy.set(true);
+    let progress = progress_window(
+        &detail.window,
+        "Clearing voices",
+        "Making every voice anonymous…",
+    );
+    let result = Arc::new(Mutex::new(None));
+    let thread_result = result.clone();
+    std::thread::spawn(move || {
+        let value = process::clear_speaker_names(&session).map_err(|error| error.to_string());
+        *thread_result.lock().expect("clear names result mutex") = Some(value);
+    });
+    let detail = detail.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        let Some(result) = result.lock().expect("clear names result mutex").take() else {
+            return glib::ControlFlow::Continue;
+        };
+        detail.busy.set(false);
+        progress.close();
+        reload_session(&detail);
+        match result {
+            Ok(true) => detail
+                .toasts
+                .add_toast(adw::Toast::new("Cleared every voice name")),
+            Ok(false) => detail
+                .toasts
+                .add_toast(adw::Toast::new("No voice has a name")),
+            Err(error) => show_error(&detail.window, "Could not clear the voices", &error),
         }
         glib::ControlFlow::Break
     });

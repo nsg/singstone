@@ -2460,6 +2460,72 @@ fn fill_anonymous_assignments(
     outcome
 }
 
+/// Leaves every voice of the session anonymous so that naming can start over:
+/// recognized and closest-match names, lines named by hand or carried forward,
+/// and names given to cut turns, whose cuts stay. The speaker database is not
+/// touched, so learned voices stay learned. Tells whether any name was cleared.
+pub fn clear_speaker_names(session: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    let (session, _) = open_session(session)?;
+    let assignments_path = session.speaker_assignments_path();
+    let mut assignments: Option<SpeakerAssignments> = match read_json(&assignments_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        result => Some(result?),
+    };
+    if let Some(artifact) = &assignments
+        && artifact.format_version != SPEAKER_ASSIGNMENTS_FORMAT_VERSION
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported speaker assignments format version {}",
+                artifact.format_version
+            ),
+        )
+        .into());
+    }
+    let mut turns = read_speaker_turns(&session)?;
+    let corrections = read_speaker_corrections(&session)?;
+    let named_voices = assignments.as_mut().map_or(0, |artifact| {
+        artifact
+            .assignments
+            .iter_mut()
+            .filter_map(|assignment| assignment.speaker.take())
+            .count()
+    });
+    let named_turns = turns
+        .groups
+        .iter_mut()
+        .flat_map(|group| &mut group.turns)
+        .filter_map(|turn| turn.speaker.take())
+        .count();
+    let named_lines = corrections.corrections.len();
+    if named_voices + named_turns + named_lines == 0 {
+        return Ok(false);
+    }
+    let turns_path = session.speaker_turns_path();
+    let corrections_path = session.speaker_corrections_path();
+    write_render_inputs_and_render(
+        &session,
+        &[
+            assignments_path.clone(),
+            turns_path.clone(),
+            corrections_path.clone(),
+        ],
+        || {
+            if named_voices > 0
+                && let Some(artifact) = &assignments
+            {
+                write_json_atomic(&assignments_path, artifact)?;
+            }
+            if named_turns > 0 {
+                write_json_atomic(&turns_path, &turns)?;
+            }
+            remove_if_present(&corrections_path)
+        },
+    )?;
+    Ok(true)
+}
+
 /// The speaker assignments of the current diarization, which naming voices
 /// builds on; missing or stale ones need reprocessing.
 fn read_current_assignments(session: &Session) -> io::Result<SpeakerAssignments> {
@@ -4816,6 +4882,118 @@ mod tests {
             fs::read(&database_path).expect("read database bytes"),
             before
         );
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn clearing_voice_names_leaves_every_line_anonymous_and_keeps_cuts() {
+        let (root, session) = assignment_fixture("clear-names", None);
+        let word = |start_ms: u64, text: &str| TimedWord {
+            source: AudioSource::System,
+            start_ms,
+            end_ms: start_ms + 300,
+            text: text.into(),
+        };
+        jsonl::write_all_atomic(
+            &session.words_path(),
+            &[
+                word(100, "morning"),
+                word(2_100, "hello"),
+                word(6_100, "bye"),
+                word(6_600, "now"),
+            ],
+        )
+        .expect("write words");
+        let segment = |cluster, start_ms, end_ms| SpeakerSegment {
+            source: AudioSource::System,
+            start_ms,
+            end_ms,
+            cluster,
+        };
+        jsonl::write_all_atomic(
+            &session.diarization_path(),
+            &[
+                segment(0, 0, 1_000),
+                segment(1, 2_000, 3_000),
+                segment(1, 6_000, 7_000),
+            ],
+        )
+        .expect("write diarization");
+        let mut artifact: SpeakerAssignments =
+            read_json(&session.speaker_assignments_path()).expect("read assignments");
+        artifact.provenance.diarization_sha256 =
+            models::sha256_file(&session.diarization_path()).expect("hash diarization");
+        artifact.assignments = [(0, "Alice"), (1, "Bob")]
+            .into_iter()
+            .map(|(cluster, speaker)| SpeakerAssignment {
+                source: AudioSource::System,
+                cluster,
+                best_candidate: Some(speaker.into()),
+                score: Some(0.9),
+                speaker: Some(speaker.into()),
+            })
+            .collect();
+        write_json_atomic(&session.speaker_assignments_path(), &artifact)
+            .expect("write assignments");
+        write_corrections(&session, &[(AudioSource::System, 2_100, 2_400, "Carol")]);
+        let turns = SpeakerTurns {
+            format_version: SPEAKER_TURNS_FORMAT_VERSION,
+            groups: vec![TurnGroup {
+                source: AudioSource::System,
+                start_ms: 6_100,
+                end_ms: 6_900,
+                turns: vec![
+                    crate::types::Turn {
+                        start_ms: 6_100,
+                        speaker: None,
+                    },
+                    crate::types::Turn {
+                        start_ms: 6_600,
+                        speaker: Some("Dana".into()),
+                    },
+                ],
+            }],
+        };
+        write_json_atomic(&session.speaker_turns_path(), &turns).expect("write turns");
+        render(&session);
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            ["Alice: morning", "Carol: hello", "Bob: bye", "Dana: now"]
+        );
+
+        assert!(clear_speaker_names(&session.dir).expect("clear names"));
+
+        assert_eq!(
+            line_texts(&session.transcript_path()),
+            [
+                "SPEAKER_00: morning",
+                "SPEAKER_01: hello",
+                "SPEAKER_01: bye",
+                "SPEAKER_01: now"
+            ]
+        );
+        assert!(!session.speaker_corrections_path().exists());
+        let assignments: SpeakerAssignments =
+            read_json(&session.speaker_assignments_path()).expect("read assignments");
+        assert!(
+            assignments
+                .assignments
+                .iter()
+                .all(|assignment| assignment.speaker.is_none())
+        );
+        let kept = read_speaker_turns(&session).expect("read turns");
+        assert_eq!(kept.groups.len(), 1);
+        assert!(
+            kept.groups[0]
+                .turns
+                .iter()
+                .all(|turn| turn.speaker.is_none())
+        );
+        let transcript: Vec<Utterance> =
+            jsonl::read_all(&session.transcript_path()).expect("read transcript");
+        assert!(transcript.iter().all(|line| !line.locked));
+
+        assert!(!clear_speaker_names(&session.dir).expect("clear again"));
         fs::remove_dir_all(root).expect("remove fixture");
     }
 

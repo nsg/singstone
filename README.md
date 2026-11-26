@@ -77,6 +77,12 @@ the loudspeaker. A side with no named attendees is not limited. A voice that no
 candidate matches, for example an attendee with no learned voice, stays
 anonymous, and the notice says how many did.
 
+To start naming over, for example after **Name all voices** picked badly,
+press **Clear all voices** and confirm. Every voice in the recording becomes
+anonymous again: recognized names, closest matches, lines you named, and the
+names of cut turns, while the cuts themselves stay. Voices Singstone has
+learned stay learned, and reprocessing recognizes the voices again.
+
 When one line holds several people talking back and forth, press its scissors
 button to cut it into turns. Click between two words to place a cut, or click
 a cut to remove it; Tab to a gap and press Enter to cut from the keyboard, and

@@ -5669,6 +5669,10 @@ impl SessionDetail {
             let hidden_count = hidden_lines.len();
             let shown_count = utterances.len();
             let names_voices = utterances.iter().chain(&hidden_lines).any(names_a_voice);
+            let unnamed_voices = utterances
+                .iter()
+                .chain(&hidden_lines)
+                .any(|utterance| is_anonymous_speaker(utterance) && has_assignable_id(utterance));
             if self.hidden_shown.get() {
                 utterances.extend(hidden_lines);
             }
@@ -5722,11 +5726,7 @@ impl SessionDetail {
                     },
                 );
             }
-            if manifest.state != SessionState::Recording
-                && utterances.iter().any(|utterance| {
-                    is_anonymous_speaker(utterance) && has_assignable_id(utterance)
-                })
-            {
+            if manifest.state != SessionState::Recording && unnamed_voices {
                 self.show_assign_all(path, &session);
             }
             self.clear_names

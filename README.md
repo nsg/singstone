@@ -56,7 +56,10 @@ kept and nothing needs reprocessing.
 ![Processed transcript with microphone lines left of a timeline, system audio lines right of it, and dimmed echo lines](docs/images/transcript.png)
 
 Type a speaker name to filter learned voices and names already used in the
-meeting, then choose a suggestion or assign a new name.
+meeting, then choose a suggestion or assign a new name. People named in the
+meeting details come first, so invited people who are new to Singstone can be
+picked without typing; they are marked **Attendee, not saved yet** until a
+voice is learned under their name.
 
 ![Speaker assignment dialog filtering suggestions to Laura](docs/images/assign-autocomplete.png)
 

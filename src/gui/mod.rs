@@ -36,7 +36,7 @@ use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::process::ExitStatusExt;
@@ -7161,7 +7161,10 @@ fn show_assignment_dialog(
     suggestions.add_css_class("boxed-list");
     suggestions.set_activate_on_single_click(true);
     suggestions.set_selection_mode(gtk::SelectionMode::Single);
-    let suggestion_names = assignment_suggestion_names(detail);
+    let source = match target {
+        AssignTarget::Line { source, .. } | AssignTarget::Turn { source, .. } => source,
+    };
+    let suggestion_names = assignment_suggestions_for(detail, source);
     update_assignment_suggestions(&suggestions, &suggestion_names, "");
     content.append(&suggestions);
 
@@ -7297,43 +7300,98 @@ fn speakers_database_path() -> PathBuf {
         .unwrap_or_else(database::default_path)
 }
 
-fn assignment_suggestion_names(detail: &SessionDetail) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut seen = BTreeMap::new();
-    let database_path = speakers_database_path();
-    if let Ok(database) = SpeakerDatabase::load(&database_path) {
-        for name in database.speakers.into_keys() {
-            if seen.insert(canonical_name_key(&name), ()).is_none() {
-                names.push(name);
-            }
-        }
-    }
-    if let Some(session_dir) = detail.selected.borrow().as_ref()
-        && let Ok(session) = Session::open(session_dir)
-        && let Ok(utterances) = jsonl::read_all::<Utterance>(&session.transcript_path())
-    {
-        for utterance in utterances {
-            if is_anonymous_speaker(&utterance) {
-                continue;
-            }
-            let name = utterance.speaker;
-            if seen.insert(canonical_name_key(&name), ()).is_none() {
-                names.push(name);
-            }
-        }
-    }
-    names
+/// A name the assignment dialog offers. A calendar attendee who is not in the
+/// speaker database gets there only once the user picks them for a voice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssignmentSuggestion {
+    name: String,
+    unsaved_attendee: bool,
 }
 
-fn update_assignment_suggestions(list: &gtk::ListBox, names: &[String], typed: &str) {
+fn assignment_suggestions_for(
+    detail: &SessionDetail,
+    source: AudioSource,
+) -> Vec<AssignmentSuggestion> {
+    let database = SpeakerDatabase::load(&speakers_database_path())
+        .map(|database| database.speakers.into_keys().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let session = detail
+        .selected
+        .borrow()
+        .as_ref()
+        .and_then(|session_dir| Session::open(session_dir).ok());
+    let attendees = session
+        .as_ref()
+        .and_then(|session| {
+            meeting::read_details(&session.meeting_path())
+                .ok()
+                .flatten()
+        })
+        .map(|meeting| attendees_for_source(&meeting, source))
+        .unwrap_or_default();
+    let me = session
+        .as_ref()
+        .and_then(|session| session.read_manifest().ok())
+        .map(|manifest| canonical_name_key(&manifest.local_speaker));
+    let attendees = attendees
+        .into_iter()
+        .filter(|name| me.as_ref() != Some(&canonical_name_key(name)))
+        .collect::<Vec<_>>();
+    let transcript = session
+        .and_then(|session| jsonl::read_all::<Utterance>(&session.transcript_path()).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|utterance| !is_anonymous_speaker(utterance))
+        .map(|utterance| utterance.speaker)
+        .collect::<Vec<_>>();
+    assignment_suggestions(&attendees, &database, &transcript)
+}
+
+/// The meeting's named attendees, the side the voice was heard on first.
+fn attendees_for_source(meeting: &MeetingDetails, source: AudioSource) -> Vec<String> {
+    let (first, second) = match source {
+        AudioSource::Mic => (&meeting.local.known, &meeting.remote.known),
+        AudioSource::System => (&meeting.remote.known, &meeting.local.known),
+    };
+    first.iter().chain(second).cloned().collect()
+}
+
+/// Attendees come first, so they show before the list is cut short.
+fn assignment_suggestions(
+    attendees: &[String],
+    database: &[String],
+    transcript: &[String],
+) -> Vec<AssignmentSuggestion> {
+    let saved = database
+        .iter()
+        .map(|name| canonical_name_key(name))
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    let attendees = attendees.iter().map(|name| (name, true));
+    let others = database.iter().chain(transcript).map(|name| (name, false));
+    attendees
+        .chain(others)
+        .filter(|(name, _)| !name.trim().is_empty() && seen.insert(canonical_name_key(name)))
+        .map(|(name, attendee)| AssignmentSuggestion {
+            name: name.clone(),
+            unsaved_attendee: attendee && !saved.contains(&canonical_name_key(name)),
+        })
+        .collect()
+}
+
+fn update_assignment_suggestions(
+    list: &gtk::ListBox,
+    suggestions: &[AssignmentSuggestion],
+    typed: &str,
+) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
     let typed_key = canonical_name_key(typed);
-    let mut matches = names
+    let mut matches = suggestions
         .iter()
-        .filter_map(|name| {
-            let key = canonical_name_key(name);
+        .filter_map(|suggestion| {
+            let key = canonical_name_key(&suggestion.name);
             let rank = if key == typed_key {
                 0
             } else if key.starts_with(&typed_key) {
@@ -7343,27 +7401,41 @@ fn update_assignment_suggestions(list: &gtk::ListBox, names: &[String], typed: &
             } else {
                 return None;
             };
-            Some((rank, name))
+            Some((rank, suggestion))
         })
         .collect::<Vec<_>>();
     matches.sort_by_key(|(rank, _)| *rank);
-    for (_, name) in matches.into_iter().take(8) {
-        let label = gtk::Label::new(Some(name));
+    for (_, suggestion) in matches.into_iter().take(8) {
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        content.set_margin_top(6);
+        content.set_margin_bottom(6);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+        let label = gtk::Label::new(Some(&suggestion.name));
         label.set_xalign(0.0);
-        label.set_margin_top(6);
-        label.set_margin_bottom(6);
-        label.set_margin_start(8);
-        label.set_margin_end(8);
-        list.append(&label);
+        label.set_hexpand(true);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        content.append(&label);
+        if suggestion.unsaved_attendee {
+            let note = gtk::Label::new(Some("Attendee, not saved yet"));
+            note.add_css_class("dim-label");
+            note.add_css_class("caption");
+            note.set_tooltip_text(Some(
+                "Invited to the calendar meeting, not in the speaker database yet.",
+            ));
+            content.append(&note);
+        }
+        let row = gtk::ListBoxRow::new();
+        row.set_widget_name(&suggestion.name);
+        row.set_child(Some(&content));
+        list.append(&row);
     }
     list.set_visible(list.first_child().is_some());
 }
 
 fn assignment_suggestion_name(row: &gtk::ListBoxRow) -> Option<String> {
-    row.child()?
-        .downcast::<gtk::Label>()
-        .ok()
-        .map(|label| label.text().to_string())
+    let name = row.widget_name();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn submit_assignment(
@@ -8037,6 +8109,53 @@ mod tests {
             group: None,
             lead: None,
         }
+    }
+
+    #[test]
+    fn assignment_suggestions_list_attendees_first_and_mark_unsaved_ones() {
+        let names = |list: &[&str]| {
+            list.iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let meeting = MeetingDetails::new(
+            String::new(),
+            Attendees {
+                known: names(&["Me", "Anna"]),
+                unknown: 0,
+            },
+            Attendees {
+                known: names(&["Bo", "Cecilia"]),
+                unknown: 1,
+            },
+        );
+        let attendees = attendees_for_source(&meeting, AudioSource::System);
+        assert_eq!(attendees, names(&["Bo", "Cecilia", "Me", "Anna"]));
+        assert_eq!(
+            attendees_for_source(&meeting, AudioSource::Mic),
+            names(&["Me", "Anna", "Bo", "Cecilia"])
+        );
+
+        let suggestions = assignment_suggestions(
+            &attendees,
+            &names(&["Anna", "Dag", "cecilia"]),
+            &names(&["Me", "Erik", "Bo"]),
+        );
+        let shown = suggestions
+            .iter()
+            .map(|suggestion| (suggestion.name.as_str(), suggestion.unsaved_attendee))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            [
+                ("Bo", true),
+                ("Cecilia", false),
+                ("Me", true),
+                ("Anna", false),
+                ("Dag", false),
+                ("Erik", false),
+            ]
+        );
     }
 
     #[test]
